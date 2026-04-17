@@ -755,11 +755,12 @@ impl ParallelWorkflowEngine {
         self.module_execution_store = Some(store);
     }
 
-    /// Replace the default module fetcher. Callers outside the controller
-    /// who don't have a [`ModuleRegistry`] (e.g. a test harness with a
-    /// hardcoded module map) use this to inject their own impl. In-tree
-    /// callers using `with_services` / `with_registry` get a
-    /// `ModuleRegistry`-backed default and don't need this.
+    /// Replace the default module fetcher. Consumers plug in whatever
+    /// backing store they prefer (Postgres catalog, OCI registry,
+    /// in-memory test map) behind the [`ModuleFetcher`] trait. The
+    /// Talos controller ships a `ModuleRegistry`-backed default via
+    /// its `build_controller_engine` builder; direct users of this
+    /// crate call `set_module_fetcher` themselves.
     pub fn set_module_fetcher(&mut self, fetcher: Arc<dyn ModuleFetcher>) {
         self.module_fetcher = Some(fetcher);
     }
@@ -929,14 +930,12 @@ impl ParallelWorkflowEngine {
         Ok(())
     }
 
-    /// Replace the default graph store. Callers outside the controller who
-    /// don't have a [`WorkflowRepository`] (e.g. a test harness using an
-    /// in-memory map, or an out-of-tree consumer with a different backing
-    /// store) use this to inject their own impl. In-tree callers using
-    /// `with_services` / `with_registry` get a Postgres-backed default and
-    /// don't need this.
-    ///
-    /// [`WorkflowRepository`]: crate::workflow_repository::WorkflowRepository
+    /// Replace the default graph store. Consumers plug in whatever
+    /// backing store resolves sub-workflow graph JSON — Postgres,
+    /// S3, an in-memory map for tests — behind the
+    /// [`WorkflowGraphStore`] trait. The Talos controller ships a
+    /// Postgres-backed default via `build_controller_engine`; direct
+    /// users of this crate call this themselves.
     pub fn set_graph_store(&mut self, store: Arc<dyn WorkflowGraphStore>) {
         self.graph_store = Some(store);
     }
@@ -2630,8 +2629,9 @@ impl ParallelWorkflowEngine {
     /// 2. Build an engine, register a synthetic `__trigger__` node, wire it to
     ///    every root so root nodes execute instead of being pre-seeded.
     /// 3. `run_with_seed` with `trigger_input` as the trigger's output.
-    /// 4. Call [`collapse_subworkflow_output`] to flatten the results into the
-    ///    shape callers expect (single-terminal → its unwrapped output).
+    /// 4. Call [`Self::collapse_subworkflow_output`] to flatten the
+    ///    results into the shape callers expect (single-terminal → its
+    ///    unwrapped output).
     ///
     /// Returns `Ok(JsonValue)` with the collapsed output, or [`SubflowError`]
     /// which each caller converts into their own error envelope via
