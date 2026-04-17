@@ -22,10 +22,18 @@ storage, secrets, and observability.
 - **Linear-chain detection** → pipeline batch dispatch through one
   transport round-trip instead of per-node.
 - **Speculative module prefetch** while the parent node still runs.
-- **Sub-workflow primitives**: Judge, Ensemble, ForEach, FanIn,
-  AgentLoop, ReActLoop, ReflectiveRetry, LlmDispatch, DynamicDispatch,
-  CapabilityDispatch, ConfidenceGate, WhileLoop, RepeatLoop, Wait,
-  ErrorHandler, Synthesize, Collect, Verify.
+- **Sub-workflow primitives.** The engine's built-in
+  [`SystemNodeKind`](https://docs.rs/talos-workflow-engine-core/0.1/talos_workflow_engine_core/enum.SystemNodeKind.html)
+  enum covers 19 variants — from generic flow control (`ForEach`,
+  `FanIn`, `WhileLoop`, `RepeatLoop`, `Wait`, `ErrorHandler`,
+  `Synthesize`, `Collect`, `Verify`, `SubWorkflow`, `Loop`,
+  `DynamicDispatch`, `CapabilityDispatch`) to LLM/agent shapes
+  (`Judge`, `Ensemble`, `LlmDispatch`, `AgentLoop`, `ReActLoop`,
+  `ReflectiveRetry`, `ConfidenceGate`). The LLM variants live
+  behind the default-on `llm-primitives` feature. The React-Flow
+  `graph_json` parser accepts a subset of these kinds as string
+  tags (see [docs/graph-json-schema.md](./docs/graph-json-schema.md));
+  the remainder are available via programmatic graph construction.
 - **Checkpoint / resume**: pause on `Wait` nodes or cancellation,
   resume later with per-node outputs hydrated.
 - **Retry with classifier** → transient / permanent decisions and

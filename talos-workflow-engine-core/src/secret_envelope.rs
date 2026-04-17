@@ -19,7 +19,7 @@
 //!   field on failure. The engine's dispatch guard rails assume a
 //!   non-empty ciphertext implies a real seal.
 //!
-//! The reference `AesGcmHmacEnvelope` shipped in the
+//! The reference `AesGcmSecretEnvelope` shipped in the
 //! `talos-workflow-job-protocol` crate satisfies all of the above.
 //! Consumers whose workers speak a different wire format implement
 //! this trait themselves; consumers who don't need encryption (a
