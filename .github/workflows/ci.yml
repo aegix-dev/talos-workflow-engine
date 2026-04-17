@@ -17,10 +17,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, "1.80"]  # 1.80 = MSRV
+        rust: [stable, "1.88"]  # 1.88 = MSRV
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2

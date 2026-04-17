@@ -61,11 +61,8 @@ fn default_priority() -> u8 {
 //   bypass the deny-list.
 // - Add only paths that are genuinely host-only. User-facing secrets
 //   (OAuth tokens, per-integration keys) do NOT belong here.
-pub const LLM_PROVIDER_VAULT_PATHS: &[&str] = &[
-    "anthropic/api_key",
-    "openai/api_key",
-    "gemini/api_key",
-];
+pub const LLM_PROVIDER_VAULT_PATHS: &[&str] =
+    &["anthropic/api_key", "openai/api_key", "gemini/api_key"];
 
 /// True iff `path` is one of the canonical LLM provider vault paths that
 /// are reserved for host-internal consumption. Consumers use this as:
@@ -83,11 +80,10 @@ pub fn is_llm_provider_vault_path(path: &str) -> bool {
 ///
 /// Recognized patterns:
 /// - LLM provider keys: every entry of [`LLM_PROVIDER_VAULT_PATHS`]
-/// - OAuth refresh tokens: `oauth/<provider>/<user_id>/<provider_key>/refresh_token`
-///   (matches `controller/src/oauth/credentials.rs::refresh_token_path`).
-///   Access tokens are NOT considered controller-internal because workflow
-///   modules legitimately read them via `vault://` in node config (e.g.
-///   pa-meeting-fetch reads `oauth/google_calendar/.../access_token`).
+/// - OAuth refresh tokens:
+///   `oauth/<provider>/<user_id>/<provider_key>/refresh_token`.
+///   Access tokens are NOT considered host-internal because workflow
+///   modules legitimately read them via `vault://` in node config.
 ///
 /// Hygiene checks must use this rather than `is_llm_provider_vault_path`
 /// alone — flagging an OAuth refresh_token as orphan would suggest an
@@ -114,12 +110,18 @@ pub fn is_controller_internal_vault_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod llm_provider_path_tests {
-    use super::{is_controller_internal_vault_path, is_llm_provider_vault_path, LLM_PROVIDER_VAULT_PATHS};
+    use super::{
+        is_controller_internal_vault_path, is_llm_provider_vault_path, LLM_PROVIDER_VAULT_PATHS,
+    };
 
     #[test]
     fn canonical_paths_are_recognised() {
         for p in LLM_PROVIDER_VAULT_PATHS {
-            assert!(is_llm_provider_vault_path(p), "canonical path {} not recognised", p);
+            assert!(
+                is_llm_provider_vault_path(p),
+                "canonical path {} not recognised",
+                p
+            );
         }
     }
 
@@ -173,7 +175,9 @@ mod llm_provider_path_tests {
         // Missing intermediate segments — these wouldn't be produced by the
         // canonical builder, so they're genuine orphans worth surfacing.
         assert!(!is_controller_internal_vault_path("oauth/refresh_token"));
-        assert!(!is_controller_internal_vault_path("oauth/provider/refresh_token"));
+        assert!(!is_controller_internal_vault_path(
+            "oauth/provider/refresh_token"
+        ));
         assert!(!is_controller_internal_vault_path(
             "oauth/provider/user/refresh_token"
         ));
@@ -248,18 +252,27 @@ mod vault_matcher_tests {
 
     #[test]
     fn exact_match_allowed() {
-        assert!(vault_path_permitted(&s(&["anthropic/api_key"]), "anthropic/api_key"));
+        assert!(vault_path_permitted(
+            &s(&["anthropic/api_key"]),
+            "anthropic/api_key"
+        ));
     }
 
     #[test]
     fn prefix_match_allowed() {
-        assert!(vault_path_permitted(&s(&["oauth/gmail"]), "oauth/gmail/user/access"));
+        assert!(vault_path_permitted(
+            &s(&["oauth/gmail"]),
+            "oauth/gmail/user/access"
+        ));
         assert!(vault_path_permitted(&s(&["oauth/gmail"]), "oauth/gmail"));
     }
 
     #[test]
     fn glob_suffix_allowed() {
-        assert!(vault_path_permitted(&s(&["oauth/gmail/*"]), "oauth/gmail/user/access"));
+        assert!(vault_path_permitted(
+            &s(&["oauth/gmail/*"]),
+            "oauth/gmail/user/access"
+        ));
     }
 
     #[test]
@@ -270,7 +283,10 @@ mod vault_matcher_tests {
 
     #[test]
     fn partial_prefix_denied() {
-        assert!(!vault_path_permitted(&s(&["oauth/gmail"]), "oauth/atlassian/token"));
+        assert!(!vault_path_permitted(
+            &s(&["oauth/gmail"]),
+            "oauth/atlassian/token"
+        ));
     }
 }
 

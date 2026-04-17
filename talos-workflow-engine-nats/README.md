@@ -60,12 +60,33 @@ async-nats             = "0.37"
 
 ```rust,ignore
 use std::sync::Arc;
+use talos_workflow_engine_core::{ExpressionEvaluator, RetryClassifier};
 use talos_workflow_engine_nats::{NatsNodeDispatcher, NatsTransport};
 
-let client = async_nats::connect("nats://127.0.0.1:4222").await?;
+// The transport wraps an `Arc<async_nats::Client>` (share it across
+// dispatchers if you have multiple).
+let client = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await?);
 let transport = Arc::new(NatsTransport::new(client));
-let dispatcher = Arc::new(NatsNodeDispatcher::new(transport, /* signing key, config... */));
-// adapters.with_node_dispatcher(dispatcher);
+
+// NatsNodeDispatcher::new takes 5 args: transport, optional event
+// sink, optional HMAC shared key, and two required policy traits.
+// Both policy traits are `Arc<dyn …>`; for tests, pull defaults from
+// `talos-workflow-engine-test-utils` (e.g. `StubExpressionEvaluator`,
+// `NothingTransientClassifier`). Production consumers supply their
+// own Rhai-backed evaluator and error classifier.
+let retry_classifier: Arc<dyn RetryClassifier> = Arc::new(MyClassifier);
+let expr_evaluator: Arc<dyn ExpressionEvaluator> = Arc::new(MyEvaluator);
+let worker_shared_key = Some(Arc::new(load_shared_key_bytes()));
+
+let dispatcher = Arc::new(NatsNodeDispatcher::new(
+    transport,
+    /* event_sink    */ None,
+    /* shared key    */ worker_shared_key,
+    /* retry class.  */ retry_classifier,
+    /* expr evaluator*/ expr_evaluator,
+));
+// Wire into the engine: `engine.set_*` the adapter traits, then call
+// `engine.run_with_transport(dispatcher, shared_key, exec_id).await?`.
 ```
 
 ## Worker side
@@ -74,7 +95,7 @@ This crate only implements the **dispatcher** side. A compatible worker
 subscribes to the subjects above, verifies the signed job, runs the
 module, and publishes a response. A reference worker implementation is
 not part of this repository; the wire format is defined by the
-`job-protocol` crate.
+`talos-workflow-job-protocol` crate.
 
 ## Stability
 

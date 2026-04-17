@@ -9,8 +9,8 @@ This document (recognized by `AGENTS.md` tooling conventions and
 intended for both human contributors and AI pair-programmers) captures
 the non-obvious rules specific to this crate — the wire-format
 contract, retry-loop subtleties, topic routing conventions, and
-security invariants. For general engine-extraction rules see
-`crates/talos-workflow-engine/AGENTS.md`.
+security invariants. For general engine rules see
+`../talos-workflow-engine/AGENTS.md`.
 
 [`NodeDispatcher`]: talos_workflow_engine_core::NodeDispatcher
 [`JobTransport`]: talos_workflow_engine_core::JobTransport

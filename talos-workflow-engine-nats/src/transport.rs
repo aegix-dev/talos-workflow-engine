@@ -51,11 +51,7 @@ impl std::fmt::Debug for NatsTransport {
 
 #[async_trait]
 impl JobTransport for NatsTransport {
-    async fn request(
-        &self,
-        topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, BoxError> {
+    async fn request(&self, topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
         let reply = self
             .client
             .request(topic.to_string(), payload.into())

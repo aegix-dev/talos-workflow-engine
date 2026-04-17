@@ -2,7 +2,7 @@
 name = "talos-workflow-engine-test-utils"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "In-memory and capture implementations of every talos-workflow-engine-core trait, for unit-testing executors without a database, secrets manager, or transport."
 license = "MIT OR Apache-2.0"
 readme = "README.md"

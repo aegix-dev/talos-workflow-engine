@@ -88,7 +88,10 @@ impl std::fmt::Debug for ModuleArtifact {
         f.debug_struct("ModuleArtifact")
             .field("module_id", &self.module_id)
             .field("content_hash", &self.content_hash)
-            .field("wasm_bytes", &format_args!("<{} bytes>", self.wasm_bytes.len()))
+            .field(
+                "wasm_bytes",
+                &format_args!("<{} bytes>", self.wasm_bytes.len()),
+            )
             .field("oci_url", &self.oci_url)
             .field("max_fuel", &self.max_fuel)
             .field("capability_world", &self.capability_world)

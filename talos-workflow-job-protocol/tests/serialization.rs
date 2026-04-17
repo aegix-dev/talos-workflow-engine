@@ -1,10 +1,10 @@
 //! Basic serialization / deserialization tests for the shared job protocol.
 
+use serde_json::json;
 use talos_workflow_job_protocol::{
     EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
     PipelineStep, PipelineStepResult,
 };
-use serde_json::json;
 use uuid::Uuid;
 
 #[test]

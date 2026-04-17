@@ -71,9 +71,5 @@ use crate::BoxError;
 pub trait JobTransport: Send + Sync {
     /// Send `payload` to the worker pool at `topic` and await a reply.
     /// See the trait-level docs for the full contract.
-    async fn request(
-        &self,
-        topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, BoxError>;
+    async fn request(&self, topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError>;
 }

@@ -141,8 +141,12 @@ mod tests {
         });
         let refs = extract_vault_refs(&cfg);
         assert_eq!(refs.len(), 2);
-        assert!(refs.iter().any(|(k, p)| k == "AUTH_HEADER" && p == "oauth/gmail/token"));
-        assert!(refs.iter().any(|(k, p)| k == "API_KEY" && p == "anthropic/api_key"));
+        assert!(refs
+            .iter()
+            .any(|(k, p)| k == "AUTH_HEADER" && p == "oauth/gmail/token"));
+        assert!(refs
+            .iter()
+            .any(|(k, p)| k == "API_KEY" && p == "anthropic/api_key"));
     }
 
     #[test]
@@ -168,10 +172,16 @@ mod tests {
         });
         let refs = vec![("AUTH_HEADER".to_string(), "oauth/gmail/token".to_string())];
         let mut resolved = HashMap::new();
-        resolved.insert("oauth/gmail/token".to_string(), "actual-token-value".to_string());
+        resolved.insert(
+            "oauth/gmail/token".to_string(),
+            "actual-token-value".to_string(),
+        );
 
         replace_vault_values(&mut payload, &resolved, &refs).unwrap();
-        assert_eq!(payload["AUTH_HEADER"].as_str().unwrap(), "actual-token-value");
+        assert_eq!(
+            payload["AUTH_HEADER"].as_str().unwrap(),
+            "actual-token-value"
+        );
         assert_eq!(payload["URL"].as_str().unwrap(), "https://example.com");
     }
 
@@ -188,7 +198,10 @@ mod tests {
         resolved.insert("oauth/gmail/token".to_string(), "actual-token".to_string());
 
         replace_vault_values(&mut payload, &resolved, &refs).unwrap();
-        assert_eq!(payload["config"]["AUTH_HEADER"].as_str().unwrap(), "actual-token");
+        assert_eq!(
+            payload["config"]["AUTH_HEADER"].as_str().unwrap(),
+            "actual-token"
+        );
         assert_eq!(payload["config"]["MAX"].as_str().unwrap(), "10");
     }
 

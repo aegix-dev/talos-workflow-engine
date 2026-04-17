@@ -103,10 +103,5 @@ pub trait NodeLifecycleHook: Send + Sync {
     ///
     /// Default impl: no-op. Consumers without per-step semantics
     /// rely on `on_node_completed` alone.
-    fn on_pipeline_step_completed(
-        &self,
-        _actor_id: Option<Uuid>,
-        _step_output: &JsonValue,
-    ) {
-    }
+    fn on_pipeline_step_completed(&self, _actor_id: Option<Uuid>, _step_output: &JsonValue) {}
 }

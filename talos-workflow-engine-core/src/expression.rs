@@ -60,6 +60,5 @@ pub trait ExpressionEvaluator: Send + Sync {
     /// Evaluate `expression` and return the result as an arbitrary
     /// `JsonValue`. Used by `Synthesize` nodes to transform collected
     /// parent outputs into a new node-output shape.
-    fn eval_json(&self, expression: &str, context: &JsonValue)
-        -> Result<JsonValue, BoxError>;
+    fn eval_json(&self, expression: &str, context: &JsonValue) -> Result<JsonValue, BoxError>;
 }

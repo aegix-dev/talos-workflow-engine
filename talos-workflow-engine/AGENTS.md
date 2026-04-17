@@ -43,16 +43,16 @@ Every lookup, every side effect, every decision flows through a
 Verify before committing:
 
 ```bash
-grep -c "crate::" crates/talos-workflow-engine/src/engine.rs   # expect 0 (ignore tests)
+grep -c "crate::" talos-workflow-engine/src/engine.rs   # expect 0 (ignore tests)
 ```
 
 `crate::` prefixes in the engine body mean we're reaching into this
 crate's own modules — fine. `use crate::registry::`, `use
-crate::secrets::` — that's a controller type leaking in. Block it.
+crate::secrets::` — that's a consumer-specific type leaking in. Block it.
 
 If a new feature requires data the engine doesn't currently have access
 to, add a method to the relevant core trait (with a default body if
-possible — see `talos-workflow-engine-core/CLAUDE.md`). Don't reach around the
+possible — see `talos-workflow-engine-core/AGENTS.md`). Don't reach around the
 trait surface by pulling in a concrete type.
 
 ## The dispatch-path rule (the 2026-04-16 loop-node lesson)
@@ -130,7 +130,7 @@ It's absent from `Cargo.toml` for good reason — re-introducing it
 would recouple the engine to NATS.
 
 New transports belong in their own crates. See `talos-workflow-engine-nats`
-as the reference shape and its own `CLAUDE.md` for the NATS-specific
+as the reference shape and its own `AGENTS.md` for the NATS-specific
 quirks (topic routing, signing, retry loop, edge-routing nil-UUID
 mapping).
 
@@ -218,18 +218,17 @@ former sets `true`, the latter `false`.
 ## Constructor policy
 
 The engine struct has **no `registry` field**. All production-path
-convenience constructors were deleted in commit `5272dde` — they now
-live in `controller/src/engine/builder.rs` as free functions:
+convenience constructors were removed: consumers are expected to
+build an engine themselves by calling `ParallelWorkflowEngine::new()`
+and wiring each adapter through the public `set_*` methods (or via
+`AdapterSet::into_engine`). Typical consumer-side helpers include:
 
-- `build_controller_engine(registry, secrets_manager, user_id)` — the
-  common path.
-- `build_controller_engine_with_resolver(...)` — pre-built resolver.
-- `build_controller_engine_registry_only(registry)` — replay/resume.
+- A "common path" builder that wires registry + secrets + user id.
+- A pre-built-resolver variant for tests / replay.
+- A registry-only variant for replay/resume.
 
-Each builder sets the adapter trait objects via the engine's public
-`set_*` methods. **Do not** add a constructor here that takes a
-concrete controller type. If a convenience is needed, it belongs in
-the controller builders, not here.
+**Do not** add a constructor here that takes a consumer-specific
+concrete type. Convenience wrappers belong in the consumer crate.
 
 The only constructor in this crate is `ParallelWorkflowEngine::new()` —
 returns a bare engine with all `Option<Arc<dyn ...>>` fields `None`.

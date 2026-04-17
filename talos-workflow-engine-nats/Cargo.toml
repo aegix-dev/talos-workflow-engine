@@ -2,7 +2,7 @@
 name = "talos-workflow-engine-nats"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "NATS-backed NodeDispatcher + JobTransport for the talos-workflow-engine crate. Implements a signed-NATS job protocol for dispatching workflow nodes to a pool of workers."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -14,10 +14,7 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 [dependencies]
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1" }
 talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.1" }
-# Match the controller's async-nats version (0.37). Bumping here
-# without bumping the controller would produce two incompatible
-# `async_nats::Client` types in the same build.
-async-nats = "0.37"
+async-nats = "0.47"
 async-trait = "0.1"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.1" }
 serde_json = "1"

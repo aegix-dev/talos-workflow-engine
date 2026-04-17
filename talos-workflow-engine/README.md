@@ -54,21 +54,29 @@ talos-workflow-engine-core   = "0.1"
 
 ```rust,ignore
 use std::sync::Arc;
-use talos_workflow_engine::{AdapterSet, ParallelWorkflowEngine};
+use uuid::Uuid;
+use talos_workflow_engine::ParallelWorkflowEngine;
 
-let adapters = AdapterSet::builder()
-    // plug in your impls of core traits:
-    //   .with_event_sink(...)
-    //   .with_graph_store(...)
-    //   .with_checkpoint_store(...)
-    //   .with_secrets_resolver(...)
-    //   .with_module_fetcher(...)
-    //   .with_module_execution_store(...)
-    //   .with_node_dispatcher(...)
-    .build();
+// Build an engine and wire each adapter as an `Arc<dyn Trait>`.
+// All `set_*` methods are `&mut self`; every adapter is optional except
+// `secrets_resolver`, which the engine requires at run time.
+let mut engine = ParallelWorkflowEngine::new();
+engine.set_secrets_resolver(Arc::new(MyResolver::new()));
+engine.set_graph_store(Arc::new(MyGraphStore::new()));
+engine.set_module_fetcher(Arc::new(MyFetcher::new()));
+engine.set_event_sink(Arc::new(MyEventSink::new()));
+// ...set_output_sanitizer, set_retry_classifier,
+//    set_expression_evaluator, set_module_execution_store,
+//    set_approval_gate, set_node_hook as needed.
 
-let engine = ParallelWorkflowEngine::new(adapters);
-// let result = engine.run(workflow_id, trigger_input).await?;
+// Load a DAG serialized as the engine's graph_json shape.
+engine.load_from_graph_json(&graph_json)?;
+
+// Dispatch through a transport. Use `talos-workflow-engine-nats` for
+// NATS, or supply your own `NodeDispatcher` impl.
+let ctx = engine
+    .run_with_transport(dispatcher, worker_shared_key, Uuid::new_v4())
+    .await?;
 ```
 
 For a full worked example, see `talos-workflow-engine-nats` (NATS transport) and
@@ -76,10 +84,14 @@ For a full worked example, see `talos-workflow-engine-nats` (NATS transport) and
 
 ## Adapter wiring
 
-`AdapterSet` bundles every trait impl the engine needs. Missing adapters
-surface at engine-build time, not at the first dispatch. Use
-`talos-workflow-engine-test-utils` for cheap defaults when writing unit tests
-against the engine.
+An `Arc<dyn Trait>` is held for each external-I/O boundary; missing
+adapters surface at run time with a structured error (the
+`SecretsResolver` in particular is required on the public execution
+paths and fails closed if unset). For sub-workflow dispatch, capture a
+snapshot with [`ParallelWorkflowEngine::adapter_set`] and rehydrate
+fresh sub-engines via [`AdapterSet::into_engine`]. For unit tests, pull
+in `talos-workflow-engine-test-utils` for in-memory defaults of every
+trait.
 
 ## Stability
 

@@ -16,9 +16,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
-use uuid::Uuid;
 use talos_workflow_engine::ParallelWorkflowEngine;
 use talos_workflow_engine_core::{NodeDispatcher, WorkflowContext};
+use uuid::Uuid;
 
 /// Dispatch the engine via a pre-built `NodeDispatcher`. The usual
 /// caller builds a [`NatsNodeDispatcher`](crate::NatsNodeDispatcher)

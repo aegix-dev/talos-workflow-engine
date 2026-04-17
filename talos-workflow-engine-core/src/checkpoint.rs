@@ -30,10 +30,7 @@ use crate::BoxError;
 pub trait CheckpointStore: Send + Sync {
     /// Load the per-node output map previously persisted for
     /// `execution_id`. Returns an empty map when no checkpoint exists.
-    async fn load(
-        &self,
-        execution_id: Uuid,
-    ) -> Result<HashMap<Uuid, JsonValue>, BoxError>;
+    async fn load(&self, execution_id: Uuid) -> Result<HashMap<Uuid, JsonValue>, BoxError>;
 
     /// Persist a snapshot of per-node outputs for `execution_id` so a
     /// future resume can pick up from here. `snapshot` is a JSON object
@@ -42,9 +39,5 @@ pub trait CheckpointStore: Send + Sync {
     /// back. Impls that encrypt at rest (reference implementations
     /// typically do, with AES-256-GCM) own the key material and never
     /// expose it through this trait.
-    async fn save(
-        &self,
-        execution_id: Uuid,
-        snapshot: &JsonValue,
-    ) -> Result<(), BoxError>;
+    async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError>;
 }

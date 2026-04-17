@@ -14,25 +14,24 @@ database, secrets manager, or transport.
   - `InMemoryCheckpointStore` — per-execution checkpoint state.
   - `InMemoryModuleFetcher` — returns a preconfigured `ModuleArtifact`
     for any id; optional rate-limit map.
-  - `InMemoryModuleExecutionStore` — minimal audit-log store.
   - `InMemorySecretsResolver` — layered module / path / LLM-key maps.
 - **`capture`** — record-and-assert impls you use when you want to
   verify what the engine *did*:
   - `CaptureEventSink` — every emitted event in a `Vec`.
-  - `CaptureLifecycleHook` — every `on_node_completed` /
+  - `CaptureNodeLifecycleHook` — every `on_node_completed` /
     `on_node_failed` / `on_pipeline_step_completed` call.
   - `CaptureModuleExecutionStore` — every `record_started` /
     `record_completed` / `resolve_wasm_module_id` call.
-- **`dispatch`** — scriptable dispatcher + transport for testing engine
-  logic without a real worker:
-  - `ScriptedNodeDispatcher` — returns preconfigured responses keyed
-    on node or module id; optionally errors to exercise retry paths.
-  - `ScriptedJobTransport` — raw bytes-in / bytes-out scripting.
-- **`approval`** — `AlwaysApprove`, `AlwaysDeny`, `AlwaysPending`
-  `ApprovalGate` impls for each branch.
+- **`dispatch`** — scriptable dispatcher for testing engine logic
+  without a real worker:
+  - `ScriptedDispatcher` — returns preconfigured responses keyed on
+    module id; also supports error scripting to exercise retry paths.
+- **`approval`** — `AlwaysApproveGate`, `AlwaysDenyGate`,
+  `AlwaysPendingGate` `ApprovalGate` impls for each branch.
 - **`noop`** — trivial defaults for traits most tests don't care about:
-  `StubExpressionEvaluator`, `NoopOutputSanitizer`,
-  `NoopRetryClassifier`.
+  `PassthroughSanitizer`, `PassthroughExecutionSanitizer`,
+  `StubExpressionEvaluator`, `EverythingTransientClassifier`,
+  `NothingTransientClassifier`.
 
 ## Quickstart
 

@@ -2,7 +2,7 @@
 name = "talos-workflow-engine-core"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Core data model and traits for a portable workflow execution engine (DAG, edges, retry/join/system-node taxonomy)."
 license = "MIT OR Apache-2.0"
 readme = "README.md"

@@ -166,11 +166,7 @@ impl ExpressionEvaluator for StubExpressionEvaluator {
         self.bool_value
     }
 
-    fn try_eval_bool(
-        &self,
-        _expression: &str,
-        _context: &JsonValue,
-    ) -> Result<bool, BoxError> {
+    fn try_eval_bool(&self, _expression: &str, _context: &JsonValue) -> Result<bool, BoxError> {
         Ok(self.bool_value)
     }
 
@@ -178,11 +174,7 @@ impl ExpressionEvaluator for StubExpressionEvaluator {
         self.i64_value
     }
 
-    fn eval_json(
-        &self,
-        _expression: &str,
-        _context: &JsonValue,
-    ) -> Result<JsonValue, BoxError> {
+    fn eval_json(&self, _expression: &str, _context: &JsonValue) -> Result<JsonValue, BoxError> {
         Ok(self.json_value.clone())
     }
 }

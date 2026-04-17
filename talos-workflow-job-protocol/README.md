@@ -53,13 +53,35 @@ talos-workflow-job-protocol = "0.1"
 ```
 
 ```rust,ignore
-use talos_workflow_job_protocol::{JobRequest, sign_job_request};
+use talos_workflow_job_protocol::{JobRequest, JobResult, JobStatus};
 
-let mut req: JobRequest = /* ... */;
-sign_job_request(&mut req, worker_shared_key);
+// Producer: fill in a JobRequest, then sign in-place before publishing.
+let mut req: JobRequest = build_job_request();
+req.sign(&worker_shared_key).expect("sign ok");
 let bytes = serde_json::to_vec(&req)?;
 // publish `bytes` on your transport
+
+// Consumer: deserialize, verify against the same shared key and a
+// freshness window in seconds (typical: 60).
+let req: JobRequest = serde_json::from_slice(&bytes)?;
+req.verify(&worker_shared_key, 60).expect("verify ok");
+
+// Reply path: workers populate a `JobResult` and sign it. `sign`
+// generates `result_nonce` from the current time plus random bytes.
+let mut result = JobResult {
+    job_id: req.job_id,
+    status: JobStatus::Success,
+    output_payload: serde_json::json!({ "ok": true }),
+    logs: vec![],
+    execution_time_ms: 12,
+    signature: vec![],
+    result_nonce: String::new(),
+};
+result.sign(&worker_shared_key).expect("sign ok");
 ```
+
+Same `sign` / `verify` method pair exists on `PipelineJobRequest`,
+`PipelineJobResult`, and the heartbeat/status-update payloads.
 
 The crate is pure types + signing / verification helpers. It doesn't
 pick a transport, doesn't pick a serialization format (callers

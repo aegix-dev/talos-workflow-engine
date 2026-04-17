@@ -67,13 +67,11 @@ use talos_workflow_engine_core::{
     WorkflowContext, WorkflowGraphStore,
 };
 
-// Checkpoint encryption + persistence live in
-// `crate::engine::checkpoint_store::ControllerCheckpointStore`, which
-// implements the `talos_workflow_engine_core::CheckpointStore` trait. Engine
-// code used to own `encrypt_checkpoint` / `decrypt_checkpoint` free
-// functions and a `load_checkpoint` method bound to a `&PgPool`; those
-// were the last raw-sqlx surface in this file. See the adapter module
-// for both the storage format and the env-var fallback behavior.
+// Checkpoint encryption + persistence is the responsibility of the
+// consumer's `CheckpointStore` impl (see
+// `talos_workflow_engine_core::CheckpointStore`). The engine itself
+// holds only an `Arc<dyn CheckpointStore>` and never talks to a
+// database directly.
 
 /// Create a temporary sandboxed directory for a workflow execution.
 /// Returns an Arc-wrapped cap-std Dir for secure file access.
@@ -106,8 +104,8 @@ struct SandboxGuard {
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
-        let sandbox_path =
-            std::path::PathBuf::from("/tmp/workflow-engine-sandboxes").join(self.execution_id.to_string());
+        let sandbox_path = std::path::PathBuf::from("/tmp/workflow-engine-sandboxes")
+            .join(self.execution_id.to_string());
         if let Err(e) = std::fs::remove_dir_all(&sandbox_path) {
             tracing::warn!(
                 "Failed to cleanup execution sandbox {}: {}",
@@ -216,8 +214,8 @@ pub fn detect_linear_chains(graph: &DiGraph<Uuid, EdgeLogic>) -> Vec<Vec<NodeInd
 // Canonical LLM provider vault paths live in `talos_workflow_job_protocol::LLM_PROVIDER_VAULT_PATHS`.
 // Import from there directly — this crate no longer re-exports to keep one
 // single source of truth discoverable by `grep LLM_PROVIDER_VAULT_PATHS`.
-// LLM-key pre-fetch now flows through `SecretsResolver::resolve_llm_keys`;
-// the controller's impl ultimately delegates to `SecretsManager::get_llm_vault_keys`.
+// LLM-key pre-fetch flows through `SecretsResolver::resolve_llm_keys`.
+// Consumers implement the trait to delegate to their own secrets backend.
 
 /// Structured errors from [`ParallelWorkflowEngine::execute_subworkflow_graph`].
 /// Callers convert these into their own error envelopes via
@@ -247,9 +245,7 @@ impl SubflowError {
             SubflowError::NoRegistry => {
                 format!("Registry not available for {} node", context)
             }
-            SubflowError::NoUserId => {
-                "user_id required for sub-workflow execution".to_string()
-            }
+            SubflowError::NoUserId => "user_id required for sub-workflow execution".to_string(),
             SubflowError::NoSecretsResolver => {
                 format!("secrets resolver unavailable for {} execution", context)
             }
@@ -292,19 +288,31 @@ impl JudgeVerdict {
         let mut malformed = 0u8;
         let score = match verdict.get("score").and_then(|v| v.as_f64()) {
             Some(v) => v,
-            None => { malformed += 1; 0.0 }
+            None => {
+                malformed += 1;
+                0.0
+            }
         };
         let passed = match verdict.get("passed").and_then(|v| v.as_bool()) {
             Some(v) => v,
-            None => { malformed += 1; false }
+            None => {
+                malformed += 1;
+                false
+            }
         };
         let reasoning = match verdict.get("reasoning").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
-            None => { malformed += 1; String::new() }
+            None => {
+                malformed += 1;
+                String::new()
+            }
         };
         let feedback = match verdict.get("feedback").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
-            None => { malformed += 1; String::new() }
+            None => {
+                malformed += 1;
+                String::new()
+            }
         };
         if malformed > 0 {
             tracing::warn!(
@@ -313,7 +321,13 @@ impl JudgeVerdict {
                  Expected {{score: f64, passed: bool, reasoning: string, feedback: string}}."
             );
         }
-        Self { score, passed, reasoning, feedback, malformed_field_count: malformed }
+        Self {
+            score,
+            passed,
+            reasoning,
+            feedback,
+            malformed_field_count: malformed,
+        }
     }
 }
 
@@ -422,8 +436,7 @@ pub struct ParallelWorkflowEngine {
     /// "completed" / "failed" / "timeout" / "cancelled" row after the
     /// worker replies. In production writes to the `module_executions`
     /// Postgres table; tests plug in a capture impl.
-    module_execution_store:
-        Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
+    module_execution_store: Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
     /// Pluggable human-in-the-loop approval gate. Nodes whose module
     /// declares `requires_approval_for: [...]` route through this
     /// before dispatch to check / create a pending approval row.
@@ -556,8 +569,10 @@ fn read_node_retry_policy(node: &JsonValue) -> Option<RetryPolicy> {
 ///
 /// Thin wrapper over `crate::vault_resolver::extract_vault_refs`
 /// that drops the config-key side of each tuple. The engine doesn't need
-/// per-key tracking because payload substitution happens in the worker
-/// (via EncryptedSecrets), not the controller — see lines 5759-5781.
+/// per-key tracking because payload substitution happens on the worker
+/// side via [`EncryptedSecrets`].
+///
+/// [`EncryptedSecrets`]: talos_workflow_job_protocol::EncryptedSecrets
 fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
     crate::vault_resolver::extract_vault_refs(config)
         .into_iter()
@@ -645,7 +660,8 @@ pub(crate) async fn build_encrypted_secrets_for(
     if secrets_map.is_empty() {
         return talos_workflow_job_protocol::EncryptedSecrets::default();
     }
-    talos_workflow_job_protocol::EncryptedSecrets::encrypt(&secrets_map, worker_shared_key).unwrap_or_default()
+    talos_workflow_job_protocol::EncryptedSecrets::encrypt(&secrets_map, worker_shared_key)
+        .unwrap_or_default()
 }
 
 /// Validate config values against `pattern` constraints in the config_schema.
@@ -676,7 +692,11 @@ pub fn validate_config_patterns(
                         }
                     }
                     Err(_) => {
-                        tracing::warn!(key, pattern, "Invalid regex pattern in config_schema — skipping validation");
+                        tracing::warn!(
+                            key,
+                            pattern,
+                            "Invalid regex pattern in config_schema — skipping validation"
+                        );
                     }
                 }
             }
@@ -741,10 +761,7 @@ impl ParallelWorkflowEngine {
     /// Replace the default approval gate. Out-of-tree consumers plug
     /// in their own impl (auto-approve for tests, a remote
     /// approval service for SaaS deployments).
-    pub fn set_approval_gate(
-        &mut self,
-        gate: Arc<dyn talos_workflow_engine_core::ApprovalGate>,
-    ) {
+    pub fn set_approval_gate(&mut self, gate: Arc<dyn talos_workflow_engine_core::ApprovalGate>) {
         self.approval_gate = Some(gate);
     }
 
@@ -848,7 +865,10 @@ impl ParallelWorkflowEngine {
             .and_then(|n| n.as_array())
             .unwrap_or(&empty_vec);
 
-        if let Some(timeout) = graph.get("execution_timeout_secs").and_then(JsonValue::as_u64) {
+        if let Some(timeout) = graph
+            .get("execution_timeout_secs")
+            .and_then(JsonValue::as_u64)
+        {
             self.execution_timeout_secs = timeout;
         }
 
@@ -997,9 +1017,9 @@ impl ParallelWorkflowEngine {
         self.user_id = Some(id);
     }
 
-    /// Snapshot of the configured event sink. Used by controller-side
-    /// `run` wrappers that build a `NodeDispatcher` on the fly and need
-    /// to thread the engine's sink through it.
+    /// Snapshot of the configured event sink. Useful when a consumer
+    /// builds a `NodeDispatcher` on the fly and needs to thread the
+    /// engine's sink through it.
     #[must_use]
     pub fn event_sink_arc(&self) -> Option<Arc<dyn EventSink>> {
         self.event_sink.clone()
@@ -1007,7 +1027,9 @@ impl ParallelWorkflowEngine {
 
     /// Snapshot of the configured retry classifier.
     #[must_use]
-    pub fn retry_classifier_arc(&self) -> Option<Arc<dyn talos_workflow_engine_core::RetryClassifier>> {
+    pub fn retry_classifier_arc(
+        &self,
+    ) -> Option<Arc<dyn talos_workflow_engine_core::RetryClassifier>> {
         self.retry_classifier.clone()
     }
 
@@ -1077,7 +1099,9 @@ impl ParallelWorkflowEngine {
     /// stateless `redact_str` in that case.
     ///
     /// [`ExecutionSanitizer`]: talos_workflow_engine_core::ExecutionSanitizer
-    fn new_execution_sanitizer(&self) -> Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>> {
+    fn new_execution_sanitizer(
+        &self,
+    ) -> Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>> {
         let sanitizer = self.output_sanitizer.as_ref()?;
         let configs: Vec<JsonValue> = self.node_configs.values().cloned().collect();
         Some(sanitizer.new_execution(&configs))
@@ -1155,10 +1179,14 @@ impl ParallelWorkflowEngine {
                 Some(SystemNodeKind::SubWorkflow { workflow_id, .. }) => {
                     ids.insert(*workflow_id);
                 }
-                Some(SystemNodeKind::AgentLoop { body_workflow_id, .. }) => {
+                Some(SystemNodeKind::AgentLoop {
+                    body_workflow_id, ..
+                }) => {
                     ids.insert(*body_workflow_id);
                 }
-                Some(SystemNodeKind::Judge { judge_workflow_id, .. }) => {
+                Some(SystemNodeKind::Judge {
+                    judge_workflow_id, ..
+                }) => {
                     ids.insert(*judge_workflow_id);
                 }
                 Some(SystemNodeKind::Ensemble {
@@ -1193,7 +1221,9 @@ impl ParallelWorkflowEngine {
                         ids.insert(*fb);
                     }
                 }
-                Some(SystemNodeKind::ReActLoop { body_workflow_id, .. }) => {
+                Some(SystemNodeKind::ReActLoop {
+                    body_workflow_id, ..
+                }) => {
                     ids.insert(*body_workflow_id);
                 }
                 _ => {}
@@ -1237,11 +1267,7 @@ impl ParallelWorkflowEngine {
     /// Look up a sub-workflow's graph JSON, checking the pre-populated cache first.
     /// Falls back to an individual DB query on cache miss (e.g., DynamicDispatch
     /// targets that are resolved at runtime).
-    async fn get_sub_workflow_graph(
-        &self,
-        sub_wf_id: Uuid,
-        user_id: Uuid,
-    ) -> Option<JsonValue> {
+    async fn get_sub_workflow_graph(&self, sub_wf_id: Uuid, user_id: Uuid) -> Option<JsonValue> {
         // Fast path: cache hit.
         if let Some(cached) = self.sub_workflow_cache.get(&sub_wf_id) {
             return Some(cached.clone());
@@ -1342,7 +1368,10 @@ impl ParallelWorkflowEngine {
                         // Extract continue_on_error into node_configs under __continue_on_error.
                         // Check inside data first, then fall back to node top-level since
                         // add_node_to_workflow stores continue_on_error at the node's top level.
-                        if data.get("continue_on_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                        if data
+                            .get("continue_on_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
                             || node
                                 .get("continue_on_error")
                                 .and_then(|v| v.as_bool())
@@ -1511,55 +1540,115 @@ impl ParallelWorkflowEngine {
                             })
                         } else if k == "judge" {
                             let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let judge_workflow_id = data.get("judge_workflow_id")
+                            let judge_workflow_id = data
+                                .get("judge_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                                 .unwrap_or_else(uuid::Uuid::nil);
-                            let rubric = data.get("rubric").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
-                            let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                            Some(SystemNodeKind::Judge { judge_workflow_id, rubric, pass_threshold, timeout_secs })
+                            let rubric = data
+                                .get("rubric")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let pass_threshold =
+                                data.get("pass_threshold").and_then(|v| v.as_f64());
+                            let timeout_secs = data
+                                .get("timeout_secs")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(60);
+                            Some(SystemNodeKind::Judge {
+                                judge_workflow_id,
+                                rubric,
+                                pass_threshold,
+                                timeout_secs,
+                            })
                         } else if k == "ensemble" {
                             let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let child_workflow_id = data.get("child_workflow_id")
+                            let child_workflow_id = data
+                                .get("child_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                                 .unwrap_or_else(uuid::Uuid::nil);
-                            let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(3).min(10).max(2) as u32;
-                            let consensus = data.get("consensus").and_then(|v| v.as_str()).unwrap_or("majority_vote").to_string();
-                            let judge_workflow_id = data.get("judge_workflow_id")
+                            let count = data
+                                .get("count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(3)
+                                .min(10)
+                                .max(2) as u32;
+                            let consensus = data
+                                .get("consensus")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("majority_vote")
+                                .to_string();
+                            let judge_workflow_id = data
+                                .get("judge_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                            let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                            Some(SystemNodeKind::Ensemble { child_workflow_id, count, consensus, judge_workflow_id, timeout_secs })
+                            let timeout_secs = data
+                                .get("timeout_secs")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(60);
+                            Some(SystemNodeKind::Ensemble {
+                                child_workflow_id,
+                                count,
+                                consensus,
+                                judge_workflow_id,
+                                timeout_secs,
+                            })
                         } else if k == "confidence_gate" {
                             let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let threshold = data.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.7).clamp(0.0, 1.0);
-                            let confidence_path = data.get("confidence_path")
+                            let threshold = data
+                                .get("threshold")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.7)
+                                .clamp(0.0, 1.0);
+                            let confidence_path = data
+                                .get("confidence_path")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("__confidence__")
                                 .to_string();
-                            let on_low_confidence = data.get("on_low_confidence")
+                            let on_low_confidence = data
+                                .get("on_low_confidence")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("pause")
                                 .to_string();
-                            Some(SystemNodeKind::ConfidenceGate { threshold, confidence_path, on_low_confidence })
+                            Some(SystemNodeKind::ConfidenceGate {
+                                threshold,
+                                confidence_path,
+                                on_low_confidence,
+                            })
                         } else if k == "reflective_retry" {
                             let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let child_workflow_id = data.get("child_workflow_id")
+                            let child_workflow_id = data
+                                .get("child_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                                 .unwrap_or_else(uuid::Uuid::nil);
-                            let reflection_workflow_id = data.get("reflection_workflow_id")
+                            let reflection_workflow_id = data
+                                .get("reflection_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                                 .unwrap_or_else(uuid::Uuid::nil);
-                            let max_retries = data.get("max_retries").and_then(|v| v.as_u64()).unwrap_or(2).min(5).max(1) as u32;
-                            let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                            Some(SystemNodeKind::ReflectiveRetry { child_workflow_id, reflection_workflow_id, max_retries, timeout_secs })
+                            let max_retries = data
+                                .get("max_retries")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(2)
+                                .min(5)
+                                .max(1) as u32;
+                            let timeout_secs = data
+                                .get("timeout_secs")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(60);
+                            Some(SystemNodeKind::ReflectiveRetry {
+                                child_workflow_id,
+                                reflection_workflow_id,
+                                max_retries,
+                                timeout_secs,
+                            })
                         } else if k == "llm_dispatch" {
                             let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let classifier_workflow_id = data.get("classifier_workflow_id")
+                            let classifier_workflow_id = data
+                                .get("classifier_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                                 .unwrap_or_else(uuid::Uuid::nil);
@@ -1576,11 +1665,20 @@ impl ParallelWorkflowEngine {
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            let fallback_workflow_id = data.get("fallback_workflow_id")
+                            let fallback_workflow_id = data
+                                .get("fallback_workflow_id")
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                            let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                            Some(SystemNodeKind::LlmDispatch { classifier_workflow_id, routes, fallback_workflow_id, timeout_secs })
+                            let timeout_secs = data
+                                .get("timeout_secs")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(60);
+                            Some(SystemNodeKind::LlmDispatch {
+                                classifier_workflow_id,
+                                routes,
+                                fallback_workflow_id,
+                                timeout_secs,
+                            })
                         } else {
                             None
                         }
@@ -1686,7 +1784,10 @@ impl ParallelWorkflowEngine {
                     // Extract continue_on_error into node_configs under __continue_on_error.
                     // Check inside data first, then fall back to node top-level since
                     // add_node_to_workflow stores continue_on_error at the node's top level.
-                    if data.get("continue_on_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                    if data
+                        .get("continue_on_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
                         || node
                             .get("continue_on_error")
                             .and_then(|v| v.as_bool())
@@ -1809,55 +1910,114 @@ impl ParallelWorkflowEngine {
                         })
                     } else if k == "judge" {
                         let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let judge_workflow_id = data.get("judge_workflow_id")
+                        let judge_workflow_id = data
+                            .get("judge_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok())
                             .unwrap_or_else(uuid::Uuid::nil);
-                        let rubric = data.get("rubric").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let rubric = data
+                            .get("rubric")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
-                        let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                        Some(SystemNodeKind::Judge { judge_workflow_id, rubric, pass_threshold, timeout_secs })
+                        let timeout_secs = data
+                            .get("timeout_secs")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(60);
+                        Some(SystemNodeKind::Judge {
+                            judge_workflow_id,
+                            rubric,
+                            pass_threshold,
+                            timeout_secs,
+                        })
                     } else if k == "ensemble" {
                         let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let child_workflow_id = data.get("child_workflow_id")
+                        let child_workflow_id = data
+                            .get("child_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok())
                             .unwrap_or_else(uuid::Uuid::nil);
-                        let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(3).min(10).max(2) as u32;
-                        let consensus = data.get("consensus").and_then(|v| v.as_str()).unwrap_or("majority_vote").to_string();
-                        let judge_workflow_id = data.get("judge_workflow_id")
+                        let count = data
+                            .get("count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(3)
+                            .min(10)
+                            .max(2) as u32;
+                        let consensus = data
+                            .get("consensus")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("majority_vote")
+                            .to_string();
+                        let judge_workflow_id = data
+                            .get("judge_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                        let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                        Some(SystemNodeKind::Ensemble { child_workflow_id, count, consensus, judge_workflow_id, timeout_secs })
+                        let timeout_secs = data
+                            .get("timeout_secs")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(60);
+                        Some(SystemNodeKind::Ensemble {
+                            child_workflow_id,
+                            count,
+                            consensus,
+                            judge_workflow_id,
+                            timeout_secs,
+                        })
                     } else if k == "confidence_gate" {
                         let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let threshold = data.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.7).clamp(0.0, 1.0);
-                        let confidence_path = data.get("confidence_path")
+                        let threshold = data
+                            .get("threshold")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.7)
+                            .clamp(0.0, 1.0);
+                        let confidence_path = data
+                            .get("confidence_path")
                             .and_then(|v| v.as_str())
                             .unwrap_or("__confidence__")
                             .to_string();
-                        let on_low_confidence = data.get("on_low_confidence")
+                        let on_low_confidence = data
+                            .get("on_low_confidence")
                             .and_then(|v| v.as_str())
                             .unwrap_or("pause")
                             .to_string();
-                        Some(SystemNodeKind::ConfidenceGate { threshold, confidence_path, on_low_confidence })
+                        Some(SystemNodeKind::ConfidenceGate {
+                            threshold,
+                            confidence_path,
+                            on_low_confidence,
+                        })
                     } else if k == "reflective_retry" {
                         let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let child_workflow_id = data.get("child_workflow_id")
+                        let child_workflow_id = data
+                            .get("child_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok())
                             .unwrap_or_else(uuid::Uuid::nil);
-                        let reflection_workflow_id = data.get("reflection_workflow_id")
+                        let reflection_workflow_id = data
+                            .get("reflection_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok())
                             .unwrap_or_else(uuid::Uuid::nil);
-                        let max_retries = data.get("max_retries").and_then(|v| v.as_u64()).unwrap_or(2).min(5).max(1) as u32;
-                        let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                        Some(SystemNodeKind::ReflectiveRetry { child_workflow_id, reflection_workflow_id, max_retries, timeout_secs })
+                        let max_retries = data
+                            .get("max_retries")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(2)
+                            .min(5)
+                            .max(1) as u32;
+                        let timeout_secs = data
+                            .get("timeout_secs")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(60);
+                        Some(SystemNodeKind::ReflectiveRetry {
+                            child_workflow_id,
+                            reflection_workflow_id,
+                            max_retries,
+                            timeout_secs,
+                        })
                     } else if k == "llm_dispatch" {
                         let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let classifier_workflow_id = data.get("classifier_workflow_id")
+                        let classifier_workflow_id = data
+                            .get("classifier_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok())
                             .unwrap_or_else(uuid::Uuid::nil);
@@ -1874,11 +2034,20 @@ impl ParallelWorkflowEngine {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let fallback_workflow_id = data.get("fallback_workflow_id")
+                        let fallback_workflow_id = data
+                            .get("fallback_workflow_id")
                             .and_then(|v| v.as_str())
                             .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                        let timeout_secs = data.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
-                        Some(SystemNodeKind::LlmDispatch { classifier_workflow_id, routes, fallback_workflow_id, timeout_secs })
+                        let timeout_secs = data
+                            .get("timeout_secs")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(60);
+                        Some(SystemNodeKind::LlmDispatch {
+                            classifier_workflow_id,
+                            routes,
+                            fallback_workflow_id,
+                            timeout_secs,
+                        })
                     } else {
                         None
                     }
@@ -1957,14 +2126,15 @@ impl ParallelWorkflowEngine {
         Ok(())
     }
 
-    // Checkpoint load moved to `talos_workflow_engine_core::CheckpointStore`.
-    // Callers that used to invoke `engine.load_checkpoint(execution_id, &pool)`
-    // now construct a `ControllerCheckpointStore` and call `store.load(id)`
-    // directly, then feed the result into `run_with_seed`.
+    // Checkpoint load is handled by the consumer's `CheckpointStore`
+    // impl (see `talos_workflow_engine_core::CheckpointStore`). Callers
+    // invoke `store.load(id)` themselves and feed the result into
+    // `run_with_seed`.
 
     /// Extract module UUIDs referenced in a graph_json string.
     ///
-    /// Used to maintain the `workflow_module_refs` junction table.
+    /// Useful for consumers that maintain a workflow → module junction
+    /// table in their own storage.
     pub fn extract_module_ids(graph_json: &str) -> Vec<Uuid> {
         let graph: serde_json::Value = match serde_json::from_str(graph_json) {
             Ok(v) => v,
@@ -2136,7 +2306,11 @@ impl ParallelWorkflowEngine {
                 let mut best_result: Option<JsonValue> = None;
                 let mut best_score = f64::NEG_INFINITY;
                 for candidate in &all_results {
-                    if candidate.get("__error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if candidate
+                        .get("__error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     let judge_input = serde_json::json!({ "content": candidate, "rubric": "" });
@@ -2167,7 +2341,11 @@ impl ParallelWorkflowEngine {
                 Self::emit_quality_gate_event(
                     "ensemble_best_of_n",
                     best_score > f64::NEG_INFINITY,
-                    if best_score > f64::NEG_INFINITY { Some(best_score) } else { None },
+                    if best_score > f64::NEG_INFINITY {
+                        Some(best_score)
+                    } else {
+                        None
+                    },
                     Some(run_count),
                     None,
                 );
@@ -2223,7 +2401,10 @@ impl ParallelWorkflowEngine {
             "__ensemble_method__".to_string(),
             serde_json::json!(consensus_strategy),
         );
-        out.insert("__ensemble_size__".to_string(), serde_json::json!(run_count));
+        out.insert(
+            "__ensemble_size__".to_string(),
+            serde_json::json!(run_count),
+        );
         serde_json::Value::Object(out)
     }
 
@@ -2342,7 +2523,11 @@ impl ParallelWorkflowEngine {
         };
 
         // 3. Execute the target workflow and annotate the result.
-        let context_label = if is_fallback { "LlmDispatch fallback" } else { "LlmDispatch target" };
+        let context_label = if is_fallback {
+            "LlmDispatch fallback"
+        } else {
+            "LlmDispatch target"
+        };
         match self
             .execute_subworkflow_graph(
                 target_wf_id,
@@ -2419,14 +2604,12 @@ impl ParallelWorkflowEngine {
                 Err(e) => e.into_error_envelope("ReflectiveRetry child"),
             };
 
-            if !child_out.get("__error").and_then(|v| v.as_bool()).unwrap_or(false) {
-                Self::emit_quality_gate_event(
-                    "reflective_retry",
-                    true,
-                    None,
-                    Some(attempt),
-                    None,
-                );
+            if !child_out
+                .get("__error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                Self::emit_quality_gate_event("reflective_retry", true, None, Some(attempt), None);
                 let mut out = if let Some(obj) = child_out.as_object() {
                     obj.clone()
                 } else {
@@ -2580,7 +2763,11 @@ impl ParallelWorkflowEngine {
             Ok(collapsed) => {
                 let verdict = JudgeVerdict::from_collapsed(&collapsed);
                 let JudgeVerdict {
-                    score, passed: passed_raw, reasoning, feedback, malformed_field_count,
+                    score,
+                    passed: passed_raw,
+                    reasoning,
+                    feedback,
+                    malformed_field_count,
                 } = verdict;
                 let passed = if let Some(threshold) = pass_threshold {
                     passed_raw && score >= threshold
@@ -2606,8 +2793,14 @@ impl ParallelWorkflowEngine {
                     };
                     out.insert("__judge_score__".to_string(), serde_json::json!(score));
                     out.insert("__judge_passed__".to_string(), serde_json::json!(true));
-                    out.insert("__judge_reasoning__".to_string(), serde_json::json!(reasoning));
-                    out.insert("__judge_feedback__".to_string(), serde_json::json!(feedback));
+                    out.insert(
+                        "__judge_reasoning__".to_string(),
+                        serde_json::json!(reasoning),
+                    );
+                    out.insert(
+                        "__judge_feedback__".to_string(),
+                        serde_json::json!(feedback),
+                    );
                     serde_json::Value::Object(out)
                 } else {
                     serde_json::json!({
@@ -2648,7 +2841,9 @@ impl ParallelWorkflowEngine {
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<Arc<Vec<u8>>>,
     ) -> Result<JsonValue, SubflowError> {
-        self.module_fetcher.as_ref().ok_or(SubflowError::NoRegistry)?;
+        self.module_fetcher
+            .as_ref()
+            .ok_or(SubflowError::NoRegistry)?;
         let user_id = self.user_id.ok_or(SubflowError::NoUserId)?;
         self.secrets_resolver
             .as_ref()
@@ -2703,7 +2898,12 @@ impl ParallelWorkflowEngine {
         initial_results.insert(trigger_node_id, trigger_input);
 
         let ctx = sub_engine
-            .run_with_seed_with_transport(dispatcher, worker_shared_key, initial_results, Uuid::new_v4())
+            .run_with_seed_with_transport(
+                dispatcher,
+                worker_shared_key,
+                initial_results,
+                Uuid::new_v4(),
+            )
             .await
             .map_err(|e| SubflowError::ExecutionFailed(e.to_string()))?;
 
@@ -2715,7 +2915,8 @@ impl ParallelWorkflowEngine {
         sub_engine: &ParallelWorkflowEngine,
     ) -> JsonValue {
         // Index uuid -> NodeIndex once (O(V)) so per-node lookups stay O(1).
-        let mut uuid_to_idx: HashMap<Uuid, NodeIndex> = HashMap::with_capacity(sub_engine.graph.node_count());
+        let mut uuid_to_idx: HashMap<Uuid, NodeIndex> =
+            HashMap::with_capacity(sub_engine.graph.node_count());
         for idx in sub_engine.graph.node_indices() {
             uuid_to_idx.insert(sub_engine.graph[idx], idx);
         }
@@ -2725,7 +2926,11 @@ impl ParallelWorkflowEngine {
         let mut terminals: Vec<(String, JsonValue)> = Vec::new();
         let mut non_terminals: Vec<(String, JsonValue)> = Vec::new();
         for (nid, output) in ctx_results {
-            if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if output
+                .get("__skipped")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 continue;
             }
             let label = sub_engine
@@ -2738,11 +2943,13 @@ impl ParallelWorkflowEngine {
             }
             let unwrapped = Self::unwrap_output(output).clone();
             let is_terminal = match uuid_to_idx.get(nid) {
-                Some(idx) => sub_engine
-                    .graph
-                    .neighbors_directed(*idx, Direction::Outgoing)
-                    .count()
-                    == 0,
+                Some(idx) => {
+                    sub_engine
+                        .graph
+                        .neighbors_directed(*idx, Direction::Outgoing)
+                        .count()
+                        == 0
+                }
                 // Node present in results but not in the graph — treat as non-terminal
                 // so it can't accidentally shadow the real leaf.
                 None => false,
@@ -2871,10 +3078,9 @@ impl ParallelWorkflowEngine {
             // instead.
             #[cfg(debug_assertions)]
             {
-                let bytes = std::fs::read(
-                    "example-node/target/wasm32-wasi/release/my_first_node.wasm",
-                )
-                .map_err(|e| format!("failed to read wasm module: {}", e))?;
+                let bytes =
+                    std::fs::read("example-node/target/wasm32-wasi/release/my_first_node.wasm")
+                        .map_err(|e| format!("failed to read wasm module: {}", e))?;
                 return Ok(talos_workflow_engine_core::ModuleArtifact {
                     module_id: self.resolve_module_id(node_id),
                     content_hash: "example".to_string(),
@@ -3127,16 +3333,12 @@ impl ParallelWorkflowEngine {
     ) -> (JsonValue, bool) {
         let node_id = self.graph[node_idx];
         let parent_output = self.gather_inputs(node_idx, results);
-        let passed =
-            self.eval_bool(condition, &parent_output);
+        let passed = self.eval_bool(condition, &parent_output);
 
         let verify_result = if passed {
             let mut out = parent_output;
             if let Some(obj) = out.as_object_mut() {
-                obj.insert(
-                    "__verified__".to_string(),
-                    serde_json::json!(true),
-                );
+                obj.insert("__verified__".to_string(), serde_json::json!(true));
                 obj.insert(
                     "__check_label__".to_string(),
                     serde_json::Value::String(check_label.to_string()),
@@ -3146,10 +3348,7 @@ impl ParallelWorkflowEngine {
         } else if on_failure == "passthrough" {
             let mut out = parent_output;
             if let Some(obj) = out.as_object_mut() {
-                obj.insert(
-                    "__verified__".to_string(),
-                    serde_json::json!(false),
-                );
+                obj.insert("__verified__".to_string(), serde_json::json!(false));
                 obj.insert(
                     "__verification_failed__".to_string(),
                     serde_json::json!(true),
@@ -3363,10 +3562,10 @@ impl ParallelWorkflowEngine {
     /// are dispatched as a single `execute_pipeline()` call, eliminating per-node
     /// dispatcher round-trips and intermediate result serialisation.
     ///
-    /// This is the engine's primary public API. In-tree callers hold an
-    /// `Arc<async_nats::Client>` and build the NATS-backed dispatcher
-    /// via a controller-side helper; out-of-tree consumers supply their
-    /// own `NodeDispatcher` impl.
+    /// This is the engine's primary public API. Callers using the
+    /// `talos-workflow-engine-nats` crate build a `NatsNodeDispatcher`;
+    /// consumers with a different transport supply their own
+    /// `NodeDispatcher` impl.
     ///
     /// [`NodeDispatcher`]: talos_workflow_engine_core::NodeDispatcher
     pub async fn run_with_transport(
@@ -3555,30 +3754,27 @@ impl ParallelWorkflowEngine {
                                 // the Redis cache warm that used to fire here —
                                 // wasm_bytes is embedded in the dispatched chain,
                                 // so the worker doesn't depend on the pre-warm.
-                                let (artifact, module_config) =
-                                    match module_fetcher_clone.as_ref() {
-                                        Some(fetcher) => {
-                                            match fetcher.fetch(step_module_id, uid).await {
-                                                Ok(a) => {
-                                                    let config = a
-                                                        .config
-                                                        .clone()
-                                                        .unwrap_or_else(|| serde_json::json!({}));
-                                                    (Some(a), config)
-                                                }
-                                                Err(e) => {
-                                                    return (
-                                                        chain_clone[chain_clone.len() - 1],
-                                                        Err(format!(
-                                                            "Failed to prepare module: {}",
-                                                            e
-                                                        )),
-                                                    )
-                                                }
+                                let (artifact, module_config) = match module_fetcher_clone.as_ref()
+                                {
+                                    Some(fetcher) => {
+                                        match fetcher.fetch(step_module_id, uid).await {
+                                            Ok(a) => {
+                                                let config = a
+                                                    .config
+                                                    .clone()
+                                                    .unwrap_or_else(|| serde_json::json!({}));
+                                                (Some(a), config)
+                                            }
+                                            Err(e) => {
+                                                return (
+                                                    chain_clone[chain_clone.len() - 1],
+                                                    Err(format!("Failed to prepare module: {}", e)),
+                                                )
                                             }
                                         }
-                                        None => (None, serde_json::json!({})),
-                                    };
+                                    }
+                                    None => (None, serde_json::json!({})),
+                                };
 
                                 // ── Approval gate (pipeline step) ────────────
                                 let requires_approval: Vec<String> = artifact
@@ -3653,23 +3849,21 @@ impl ParallelWorkflowEngine {
                                     .unwrap_or(module_default_fuel)
                                     .min(50_000_000);
 
-                                let encrypted_secrets = match (
-                                    secrets_resolver.as_ref(),
-                                    &worker_shared_key_clone,
-                                ) {
-                                    (Some(resolver), Some(key)) => {
-                                        build_encrypted_secrets_for(
-                                            resolver.as_ref(),
-                                            step_node_id,
-                                            user_id_clone,
-                                            &vault_paths,
-                                            &[],
-                                            key,
-                                        )
-                                        .await
-                                    }
-                                    _ => Default::default(),
-                                };
+                                let encrypted_secrets =
+                                    match (secrets_resolver.as_ref(), &worker_shared_key_clone) {
+                                        (Some(resolver), Some(key)) => {
+                                            build_encrypted_secrets_for(
+                                                resolver.as_ref(),
+                                                step_node_id,
+                                                user_id_clone,
+                                                &vault_paths,
+                                                &[],
+                                                key,
+                                            )
+                                            .await
+                                        }
+                                        _ => Default::default(),
+                                    };
                                 step_jobs.push(DispatchJob {
                                     execution_id,
                                     node_id: step_node_id,
@@ -3691,7 +3885,9 @@ impl ParallelWorkflowEngine {
                                     module_uri: artifact
                                         .as_ref()
                                         .and_then(|a| a.oci_url.clone())
-                                        .unwrap_or_else(|| format!("redis:wasm:{}", step_module_id)),
+                                        .unwrap_or_else(|| {
+                                            format!("redis:wasm:{}", step_module_id)
+                                        }),
                                     wasm_bytes: None,
                                     expected_wasm_hash: artifact
                                         .as_ref()
@@ -3837,15 +4033,16 @@ impl ParallelWorkflowEngine {
                                 retry_delay_expr: chain_retry.retry_delay_expression.clone(),
                             };
 
-                            let chain_result = match dispatcher_clone
-                                .dispatch_chain(chain_request)
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    return (chain_clone[chain_clone.len() - 1], Err(e.to_string()));
-                                }
-                            };
+                            let chain_result =
+                                match dispatcher_clone.dispatch_chain(chain_request).await {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        return (
+                                            chain_clone[chain_clone.len() - 1],
+                                            Err(e.to_string()),
+                                        );
+                                    }
+                                };
 
                             // Per-step post-processing: update module_executions
                             // rows with status/output/error, persist
@@ -3854,18 +4051,22 @@ impl ParallelWorkflowEngine {
                                 for (i, step_result) in chain_result.steps.iter().enumerate() {
                                     if let Some(&step_exec_id) = step_exec_ids.get(i) {
                                         let status_str = match step_result.status {
-                                            talos_workflow_engine_core::StepStatus::Success => "completed",
-                                            talos_workflow_engine_core::StepStatus::TimedOut => "timeout",
-                                            talos_workflow_engine_core::StepStatus::Failed => "failed",
+                                            talos_workflow_engine_core::StepStatus::Success => {
+                                                "completed"
+                                            }
+                                            talos_workflow_engine_core::StepStatus::TimedOut => {
+                                                "timeout"
+                                            }
+                                            talos_workflow_engine_core::StepStatus::Failed => {
+                                                "failed"
+                                            }
                                         };
                                         let error_msg = step_result
                                             .error
                                             .as_deref()
                                             .map(|s| self.redact_str(s));
-                                        let duration = i32::try_from(
-                                            step_result.execution_time_ms,
-                                        )
-                                        .unwrap_or(i32::MAX);
+                                        let duration = i32::try_from(step_result.execution_time_ms)
+                                            .unwrap_or(i32::MAX);
                                         if let Err(db_err) = store
                                             .record_completed(
                                                 step_exec_id,
@@ -3887,7 +4088,10 @@ impl ParallelWorkflowEngine {
                                         // steps may have partial/corrupt output. The hook
                                         // owns extraction + spawn semantics; the engine
                                         // just forwards per-step outputs.
-                                        if matches!(step_result.status, talos_workflow_engine_core::StepStatus::Success) {
+                                        if matches!(
+                                            step_result.status,
+                                            talos_workflow_engine_core::StepStatus::Success
+                                        ) {
                                             if let Some(hook) = self.node_hook.as_ref() {
                                                 hook.on_pipeline_step_completed(
                                                     self.actor_id,
@@ -3910,8 +4114,11 @@ impl ParallelWorkflowEngine {
                                             )
                                             .await
                                         {
-    tracing::error!("Database operation failed in engine: {}", db_err);
-}
+                                            tracing::error!(
+                                                "Database operation failed in engine: {}",
+                                                db_err
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -4010,7 +4217,8 @@ impl ParallelWorkflowEngine {
                     }),
                 )) = self.node_meta.get(&node_id)
                 {
-                    let final_result = self.aggregate_fan_in(node_idx, &results, join_mode, aggregation_expr);
+                    let final_result =
+                        self.aggregate_fan_in(node_idx, &results, join_mode, aggregation_expr);
 
                     results.insert(node_id, final_result);
 
@@ -4060,7 +4268,8 @@ impl ParallelWorkflowEngine {
                     self.node_meta.get(&node_id)
                 {
                     let synthesis_expr = synthesis_expr.clone();
-                    let synthesized = self.synthesize_parent_outputs(node_idx, &results, &synthesis_expr);
+                    let synthesized =
+                        self.synthesize_parent_outputs(node_idx, &results, &synthesis_expr);
 
                     // Recover parent_count for event logging from the synthesized output
                     // (it may be an object with "count" if no expression was applied, or
@@ -4081,8 +4290,12 @@ impl ParallelWorkflowEngine {
 
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if *cnt == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if *cnt == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
@@ -4092,12 +4305,22 @@ impl ParallelWorkflowEngine {
                 if let Some((
                     _,
                     _,
-                    Some(SystemNodeKind::Verify { ref condition, ref check_label, ref on_failure }),
+                    Some(SystemNodeKind::Verify {
+                        ref condition,
+                        ref check_label,
+                        ref on_failure,
+                    }),
                 )) = self.node_meta.get(&node_id)
                 {
-                    let check_label = check_label.clone().unwrap_or_else(|| "output quality".to_string());
+                    let check_label = check_label
+                        .clone()
+                        .unwrap_or_else(|| "output quality".to_string());
                     let (verify_result, passed) = self.evaluate_verify_node(
-                        node_idx, &results, condition, &check_label, on_failure,
+                        node_idx,
+                        &results,
+                        condition,
+                        &check_label,
+                        on_failure,
                     );
 
                     results.insert(node_id, verify_result);
@@ -4115,16 +4338,28 @@ impl ParallelWorkflowEngine {
 
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if *cnt == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if *cnt == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
                 }
 
                 // ── Judge dispatch (LLM-as-Judge evaluation) ─────────────────
-                if let Some((_, _, Some(SystemNodeKind::Judge { judge_workflow_id, ref rubric, pass_threshold, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                if let Some((
+                    _,
+                    _,
+                    Some(SystemNodeKind::Judge {
+                        judge_workflow_id,
+                        ref rubric,
+                        pass_threshold,
+                        timeout_secs: _,
+                    }),
+                )) = self.node_meta.get(&node_id)
                 {
                     let judge_wf_id = *judge_workflow_id;
                     let rubric = rubric.clone();
@@ -4145,16 +4380,29 @@ impl ParallelWorkflowEngine {
                     results.insert(node_id, judge_result);
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if pending.get(&child).copied().unwrap_or(1) == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
                 }
 
                 // ── Ensemble dispatch (self-consistency / ensemble voting) ────
-                if let Some((_, _, Some(SystemNodeKind::Ensemble { child_workflow_id, count, ref consensus, judge_workflow_id, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                if let Some((
+                    _,
+                    _,
+                    Some(SystemNodeKind::Ensemble {
+                        child_workflow_id,
+                        count,
+                        ref consensus,
+                        judge_workflow_id,
+                        timeout_secs: _,
+                    }),
+                )) = self.node_meta.get(&node_id)
                 {
                     let child_wf_id = *child_workflow_id;
                     let run_count = *count;
@@ -4177,41 +4425,76 @@ impl ParallelWorkflowEngine {
                     results.insert(node_id, ensemble_result);
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if pending.get(&child).copied().unwrap_or(1) == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
                 }
 
                 // ── ConfidenceGate dispatch ───────────────────────────────────
-                if let Some((_, _, Some(SystemNodeKind::ConfidenceGate { threshold, ref confidence_path, ref on_low_confidence }))) =
-                    self.node_meta.get(&node_id)
+                if let Some((
+                    _,
+                    _,
+                    Some(SystemNodeKind::ConfidenceGate {
+                        threshold,
+                        ref confidence_path,
+                        ref on_low_confidence,
+                    }),
+                )) = self.node_meta.get(&node_id)
                 {
-                    match self.evaluate_confidence_gate(
-                        node_idx, &results, execution_id, *threshold, confidence_path, on_low_confidence,
-                    ).await {
+                    match self
+                        .evaluate_confidence_gate(
+                            node_idx,
+                            &results,
+                            execution_id,
+                            *threshold,
+                            confidence_path,
+                            on_low_confidence,
+                        )
+                        .await
+                    {
                         Ok(gate_result) => {
                             results.insert(node_id, gate_result);
                         }
                         Err(waiting_json) => {
                             // Pending approval — pause execution
                             results.insert(node_id, waiting_json);
-                            return Ok(WorkflowContext { results, waiting: true, ..Default::default() });
+                            return Ok(WorkflowContext {
+                                results,
+                                waiting: true,
+                                ..Default::default()
+                            });
                         }
                     }
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if pending.get(&child).copied().unwrap_or(1) == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
                 }
 
                 // ── ReflectiveRetry dispatch ──────────────────────────────────
-                if let Some((_, _, Some(SystemNodeKind::ReflectiveRetry { child_workflow_id, reflection_workflow_id, max_retries, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                if let Some((
+                    _,
+                    _,
+                    Some(SystemNodeKind::ReflectiveRetry {
+                        child_workflow_id,
+                        reflection_workflow_id,
+                        max_retries,
+                        timeout_secs: _,
+                    }),
+                )) = self.node_meta.get(&node_id)
                 {
                     let child_wf_id = *child_workflow_id;
                     let reflection_wf_id = *reflection_workflow_id;
@@ -4232,16 +4515,28 @@ impl ParallelWorkflowEngine {
                     results.insert(node_id, reflective_result);
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if pending.get(&child).copied().unwrap_or(1) == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
                 }
 
                 // ── LlmDispatch dispatch (LLM-based routing) ──────────────────
-                if let Some((_, _, Some(SystemNodeKind::LlmDispatch { classifier_workflow_id, ref routes, fallback_workflow_id, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                if let Some((
+                    _,
+                    _,
+                    Some(SystemNodeKind::LlmDispatch {
+                        classifier_workflow_id,
+                        ref routes,
+                        fallback_workflow_id,
+                        timeout_secs: _,
+                    }),
+                )) = self.node_meta.get(&node_id)
                 {
                     let classifier_wf_id = *classifier_workflow_id;
                     let routes = routes.clone();
@@ -4262,8 +4557,12 @@ impl ParallelWorkflowEngine {
                     results.insert(node_id, llm_dispatch_result);
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                            if pending.get(&child).copied().unwrap_or(1) == 0 {
+                                ready.push_back(child);
+                            }
                         }
                     }
                     continue;
@@ -4302,10 +4601,16 @@ impl ParallelWorkflowEngine {
                                     "__error": true,
                                     "error_message": "user_id required for sub-workflow execution"
                                 }));
-                                for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
+                                for child in
+                                    self.graph.neighbors_directed(node_idx, Direction::Outgoing)
+                                {
                                     if let Some(cnt) = pending.get_mut(&child) {
-                                        if *cnt > 0 { *cnt -= 1; }
-                                        if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
+                                        if *cnt > 0 {
+                                            *cnt -= 1;
+                                        }
+                                        if pending.get(&child).copied().unwrap_or(1) == 0 {
+                                            ready.push_back(child);
+                                        }
                                     }
                                 }
                                 continue;
@@ -4503,7 +4808,9 @@ impl ParallelWorkflowEngine {
 
                     for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
                             if pending.get(&child).copied().unwrap_or(1) == 0 {
                                 ready.push_back(child);
                             }
@@ -4532,10 +4839,7 @@ impl ParallelWorkflowEngine {
 
                     while iteration < max_iters {
                         // Evaluate condition against current output
-                        if !self.eval_bool(
-                            &condition,
-                            &current_output,
-                        ) {
+                        if !self.eval_bool(&condition, &current_output) {
                             break;
                         }
                         iteration += 1;
@@ -4673,7 +4977,8 @@ impl ParallelWorkflowEngine {
                         let mut rhai_engine = rhai::Engine::new();
                         rhai_engine.set_max_operations(10_000);
                         rhai_engine.disable_symbol("eval");
-                        rhai_engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
+                        rhai_engine
+                            .set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
                         let mut scope = rhai::Scope::new();
                         if let Some(obj) = inputs.as_object() {
                             for (k, v) in obj {
@@ -4710,35 +5015,39 @@ impl ParallelWorkflowEngine {
 
                     let dispatch_result = match dispatch_target {
                         Ok(target_id_or_name) => {
-                            let target_wf_id: Option<uuid::Uuid> = if let Ok(id) =
-                                uuid::Uuid::parse_str(&target_id_or_name)
-                            {
-                                Some(id)
-                            } else if let Some(ref store) = self.graph_store {
-                                store
-                                    .resolve_by_name(
-                                        &target_id_or_name,
-                                        self.user_id.unwrap_or_else(Uuid::nil),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "DB query failed during execution",
-                                        );
-                                        e
-                                    })
-                                    .ok()
-                                    .flatten()
-                            } else {
-                                None
-                            };
+                            let target_wf_id: Option<uuid::Uuid> =
+                                if let Ok(id) = uuid::Uuid::parse_str(&target_id_or_name) {
+                                    Some(id)
+                                } else if let Some(ref store) = self.graph_store {
+                                    store
+                                        .resolve_by_name(
+                                            &target_id_or_name,
+                                            self.user_id.unwrap_or_else(Uuid::nil),
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "DB query failed during execution",
+                                            );
+                                            e
+                                        })
+                                        .ok()
+                                        .flatten()
+                                } else {
+                                    None
+                                };
 
                             match target_wf_id {
                                 Some(sub_wf_id) => {
                                     tracing::info!(node_id = %node_id, dispatched_workflow_id = %sub_wf_id, "DynamicDispatch resolved to workflow");
                                     if self.module_fetcher.is_some() {
-                                        let graph_row = self.get_sub_workflow_graph(sub_wf_id, self.user_id.unwrap_or_else(Uuid::nil)).await;
+                                        let graph_row = self
+                                            .get_sub_workflow_graph(
+                                                sub_wf_id,
+                                                self.user_id.unwrap_or_else(Uuid::nil),
+                                            )
+                                            .await;
 
                                         if let Some(graph_json) = graph_row {
                                             match self
@@ -4747,42 +5056,116 @@ impl ParallelWorkflowEngine {
                                             {
                                                 Ok(mut sub_engine) => {
                                                     let sub_execution_id = Uuid::new_v4();
-                                                    let clean_input = if let Some(obj) = inputs.as_object() {
-                                                        let mut cleaned = obj.clone(); cleaned.retain(|k, _| !k.starts_with("__")); serde_json::Value::Object(cleaned)
-                                                    } else { inputs.clone() };
+                                                    let clean_input = if let Some(obj) =
+                                                        inputs.as_object()
+                                                    {
+                                                        let mut cleaned = obj.clone();
+                                                        cleaned.retain(|k, _| !k.starts_with("__"));
+                                                        serde_json::Value::Object(cleaned)
+                                                    } else {
+                                                        inputs.clone()
+                                                    };
 
                                                     let trigger_node_id = Uuid::new_v4();
-                                                    sub_engine.add_node(trigger_node_id, None, None, None);
-                                                    sub_engine.node_labels.insert(trigger_node_id, "__trigger__".to_string());
-                                                    let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine.graph.node_indices()
-                                                        .filter(|&idx| sub_engine.graph[idx] != trigger_node_id && sub_engine.graph.neighbors_directed(idx, Direction::Incoming).count() == 0)
+                                                    sub_engine.add_node(
+                                                        trigger_node_id,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                    );
+                                                    sub_engine.node_labels.insert(
+                                                        trigger_node_id,
+                                                        "__trigger__".to_string(),
+                                                    );
+                                                    let root_indices: Vec<
+                                                        petgraph::graph::NodeIndex,
+                                                    > = sub_engine
+                                                        .graph
+                                                        .node_indices()
+                                                        .filter(|&idx| {
+                                                            sub_engine.graph[idx] != trigger_node_id
+                                                                && sub_engine
+                                                                    .graph
+                                                                    .neighbors_directed(
+                                                                        idx,
+                                                                        Direction::Incoming,
+                                                                    )
+                                                                    .count()
+                                                                    == 0
+                                                        })
                                                         .collect();
                                                     for root_idx in &root_indices {
                                                         let root_id = sub_engine.graph[*root_idx];
-                                                        let _ = sub_engine.add_edge(trigger_node_id, root_id, talos_workflow_engine_core::EdgeLogic {
-                                                            source_handle: "output".to_string(), target_handle: "input".to_string(), mapping: None, condition: None, edge_type: "default".to_string(),
-                                                        });
+                                                        let _ = sub_engine.add_edge(
+                                                            trigger_node_id,
+                                                            root_id,
+                                                            talos_workflow_engine_core::EdgeLogic {
+                                                                source_handle: "output".to_string(),
+                                                                target_handle: "input".to_string(),
+                                                                mapping: None,
+                                                                condition: None,
+                                                                edge_type: "default".to_string(),
+                                                            },
+                                                        );
                                                     }
 
                                                     let mut initial_results = HashMap::new();
-                                                    initial_results.insert(trigger_node_id, clean_input);
+                                                    initial_results
+                                                        .insert(trigger_node_id, clean_input);
                                                     let sub_labels = sub_engine.node_labels.clone();
-                                                    match sub_engine.run_with_seed_with_transport(dispatcher.clone(), worker_shared_key.clone(), initial_results, sub_execution_id).await {
+                                                    match sub_engine
+                                                        .run_with_seed_with_transport(
+                                                            dispatcher.clone(),
+                                                            worker_shared_key.clone(),
+                                                            initial_results,
+                                                            sub_execution_id,
+                                                        )
+                                                        .await
+                                                    {
                                                         Ok(ctx) => {
-                                                            let mut sub_outputs = serde_json::Map::new();
-                                                            sub_outputs.insert("__dispatched_workflow_id".to_string(), serde_json::json!(sub_wf_id.to_string()));
+                                                            let mut sub_outputs =
+                                                                serde_json::Map::new();
+                                                            sub_outputs.insert(
+                                                                "__dispatched_workflow_id"
+                                                                    .to_string(),
+                                                                serde_json::json!(
+                                                                    sub_wf_id.to_string()
+                                                                ),
+                                                            );
                                                             for (nid, output) in &ctx.results {
-                                                                if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                                                                let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
-                                                                if key == "__trigger__" { continue; }
-                                                                sub_outputs.insert(key, Self::unwrap_output(output).clone());
+                                                                if output
+                                                                    .get("__skipped")
+                                                                    .and_then(|v| v.as_bool())
+                                                                    .unwrap_or(false)
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                let key = sub_labels
+                                                                    .get(nid)
+                                                                    .cloned()
+                                                                    .unwrap_or_else(|| {
+                                                                        nid.to_string()
+                                                                    });
+                                                                if key == "__trigger__" {
+                                                                    continue;
+                                                                }
+                                                                sub_outputs.insert(
+                                                                    key,
+                                                                    Self::unwrap_output(output)
+                                                                        .clone(),
+                                                                );
                                                             }
                                                             serde_json::Value::Object(sub_outputs)
                                                         }
-                                                        Err(e) => { tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Dispatched workflow failed"); serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow failed: {}", e)}) }
+                                                        Err(e) => {
+                                                            tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Dispatched workflow failed");
+                                                            serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow failed: {}", e)})
+                                                        }
                                                     }
                                                 }
-                                                Err(e) => serde_json::json!({"__error": true, "error_message": format!("Failed to build dispatched workflow engine: {}", e)}),
+                                                Err(e) => {
+                                                    serde_json::json!({"__error": true, "error_message": format!("Failed to build dispatched workflow engine: {}", e)})
+                                                }
                                             }
                                         } else {
                                             serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow {} not found", sub_wf_id)})
@@ -4834,10 +5217,7 @@ impl ParallelWorkflowEngine {
 
                     let capability_result = if let Some(ref store) = self.graph_store {
                         let matching_row = store
-                            .resolve_by_capabilities(
-                                &caps,
-                                self.user_id.unwrap_or_else(Uuid::nil),
-                            )
+                            .resolve_by_capabilities(&caps, self.user_id.unwrap_or_else(Uuid::nil))
                             .await
                             .map_err(|e| {
                                 tracing::warn!(
@@ -4852,54 +5232,123 @@ impl ParallelWorkflowEngine {
                         match matching_row {
                             Some((sub_wf_id, sub_wf_name)) => {
                                 tracing::info!(node_id = %node_id, dispatched_workflow_id = %sub_wf_id, dispatched_workflow_name = %sub_wf_name, "CapabilityDispatch resolved to workflow");
-                                let graph_row = self.get_sub_workflow_graph(sub_wf_id, self.user_id.unwrap_or_else(Uuid::nil)).await;
+                                let graph_row = self
+                                    .get_sub_workflow_graph(
+                                        sub_wf_id,
+                                        self.user_id.unwrap_or_else(Uuid::nil),
+                                    )
+                                    .await;
 
                                 if let Some(graph_json) = graph_row {
-                                    match self
-                                        .adapter_set()
-                                        .into_engine_with_graph(&graph_json)
-                                    {
+                                    match self.adapter_set().into_engine_with_graph(&graph_json) {
                                         Ok(mut sub_engine) => {
                                             let sub_execution_id = Uuid::new_v4();
-                                            let clean_input = if let Some(obj) = inputs.as_object() {
-                                                let mut cleaned = obj.clone(); cleaned.retain(|k, _| !k.starts_with("__")); serde_json::Value::Object(cleaned)
-                                            } else { inputs.clone() };
+                                            let clean_input = if let Some(obj) = inputs.as_object()
+                                            {
+                                                let mut cleaned = obj.clone();
+                                                cleaned.retain(|k, _| !k.starts_with("__"));
+                                                serde_json::Value::Object(cleaned)
+                                            } else {
+                                                inputs.clone()
+                                            };
 
                                             let trigger_node_id = Uuid::new_v4();
                                             sub_engine.add_node(trigger_node_id, None, None, None);
-                                            sub_engine.node_labels.insert(trigger_node_id, "__trigger__".to_string());
-                                            let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine.graph.node_indices()
-                                                .filter(|&idx| sub_engine.graph[idx] != trigger_node_id && sub_engine.graph.neighbors_directed(idx, Direction::Incoming).count() == 0)
-                                                .collect();
+                                            sub_engine
+                                                .node_labels
+                                                .insert(trigger_node_id, "__trigger__".to_string());
+                                            let root_indices: Vec<petgraph::graph::NodeIndex> =
+                                                sub_engine
+                                                    .graph
+                                                    .node_indices()
+                                                    .filter(|&idx| {
+                                                        sub_engine.graph[idx] != trigger_node_id
+                                                            && sub_engine
+                                                                .graph
+                                                                .neighbors_directed(
+                                                                    idx,
+                                                                    Direction::Incoming,
+                                                                )
+                                                                .count()
+                                                                == 0
+                                                    })
+                                                    .collect();
                                             for root_idx in &root_indices {
                                                 let root_id = sub_engine.graph[*root_idx];
-                                                let _ = sub_engine.add_edge(trigger_node_id, root_id, talos_workflow_engine_core::EdgeLogic {
-                                                    source_handle: "output".to_string(), target_handle: "input".to_string(), mapping: None, condition: None, edge_type: "default".to_string(),
-                                                });
+                                                let _ = sub_engine.add_edge(
+                                                    trigger_node_id,
+                                                    root_id,
+                                                    talos_workflow_engine_core::EdgeLogic {
+                                                        source_handle: "output".to_string(),
+                                                        target_handle: "input".to_string(),
+                                                        mapping: None,
+                                                        condition: None,
+                                                        edge_type: "default".to_string(),
+                                                    },
+                                                );
                                             }
 
                                             let mut initial_results = HashMap::new();
                                             initial_results.insert(trigger_node_id, clean_input);
                                             let sub_labels = sub_engine.node_labels.clone();
-                                            match sub_engine.run_with_seed_with_transport(dispatcher.clone(), worker_shared_key.clone(), initial_results, sub_execution_id).await {
+                                            match sub_engine
+                                                .run_with_seed_with_transport(
+                                                    dispatcher.clone(),
+                                                    worker_shared_key.clone(),
+                                                    initial_results,
+                                                    sub_execution_id,
+                                                )
+                                                .await
+                                            {
                                                 Ok(ctx) => {
                                                     let mut sub_outputs = serde_json::Map::new();
-                                                    sub_outputs.insert("__dispatched_workflow_id".to_string(), serde_json::json!(sub_wf_id.to_string()));
-                                                    sub_outputs.insert("__dispatched_by".to_string(), serde_json::json!("capability_dispatch"));
-                                                    sub_outputs.insert("__dispatched_workflow_name".to_string(), serde_json::json!(sub_wf_name));
-                                                    sub_outputs.insert("__matched_capabilities".to_string(), serde_json::json!(caps));
+                                                    sub_outputs.insert(
+                                                        "__dispatched_workflow_id".to_string(),
+                                                        serde_json::json!(sub_wf_id.to_string()),
+                                                    );
+                                                    sub_outputs.insert(
+                                                        "__dispatched_by".to_string(),
+                                                        serde_json::json!("capability_dispatch"),
+                                                    );
+                                                    sub_outputs.insert(
+                                                        "__dispatched_workflow_name".to_string(),
+                                                        serde_json::json!(sub_wf_name),
+                                                    );
+                                                    sub_outputs.insert(
+                                                        "__matched_capabilities".to_string(),
+                                                        serde_json::json!(caps),
+                                                    );
                                                     for (nid, output) in &ctx.results {
-                                                        if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                                                        let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
-                                                        if key == "__trigger__" { continue; }
-                                                        sub_outputs.insert(key, Self::unwrap_output(output).clone());
+                                                        if output
+                                                            .get("__skipped")
+                                                            .and_then(|v| v.as_bool())
+                                                            .unwrap_or(false)
+                                                        {
+                                                            continue;
+                                                        }
+                                                        let key = sub_labels
+                                                            .get(nid)
+                                                            .cloned()
+                                                            .unwrap_or_else(|| nid.to_string());
+                                                        if key == "__trigger__" {
+                                                            continue;
+                                                        }
+                                                        sub_outputs.insert(
+                                                            key,
+                                                            Self::unwrap_output(output).clone(),
+                                                        );
                                                     }
                                                     serde_json::Value::Object(sub_outputs)
                                                 }
-                                                Err(e) => { tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Capability-dispatched workflow failed"); serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow failed: {}", e)}) }
+                                                Err(e) => {
+                                                    tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Capability-dispatched workflow failed");
+                                                    serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow failed: {}", e)})
+                                                }
                                             }
                                         }
-                                        Err(e) => serde_json::json!({"__error": true, "error_message": format!("Failed to build capability-dispatched engine: {}", e)}),
+                                        Err(e) => {
+                                            serde_json::json!({"__error": true, "error_message": format!("Failed to build capability-dispatched engine: {}", e)})
+                                        }
                                     }
                                 } else {
                                     serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow {} graph not found", sub_wf_id)})
@@ -4914,7 +5363,11 @@ impl ParallelWorkflowEngine {
                     };
 
                     // If capability dispatch failed, check continue_on_error before propagating
-                    if capability_result.get("__error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if capability_result
+                        .get("__error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         let continue_on_error = self
                             .node_configs
                             .get(&node_id)
@@ -4928,7 +5381,10 @@ impl ParallelWorkflowEngine {
                                 .unwrap_or("capability dispatch failed")
                                 .to_string();
                             tracing::error!(node_id = %node_id, error = %err_msg, "Capability dispatch failed — failing workflow");
-                            return Err(format!("Capability dispatch node {}: {}", node_id, err_msg));
+                            return Err(format!(
+                                "Capability dispatch node {}: {}",
+                                node_id, err_msg
+                            ));
                         }
                         tracing::info!(node_id = %node_id, "Capability dispatch failed but continue_on_error is set — continuing");
                     }
@@ -5022,10 +5478,7 @@ impl ParallelWorkflowEngine {
                                                 "output": last_output,
                                             })
                                         };
-                                        if !self.eval_bool(
-                                            &condition,
-                                            &condition_ctx,
-                                        ) {
+                                        if !self.eval_bool(&condition, &condition_ctx) {
                                             break;
                                         }
                                     }
@@ -5129,7 +5582,9 @@ impl ParallelWorkflowEngine {
                                                 // module_executions rows; let the adapter
                                                 // mint a fresh job_id.
                                                 job_id: None,
-                                                user_id: self.user_id.unwrap_or_else(uuid::Uuid::nil),
+                                                user_id: self
+                                                    .user_id
+                                                    .unwrap_or_else(uuid::Uuid::nil),
                                                 actor_id: self.actor_id,
                                                 module_uri: wasm_module
                                                     .oci_url
@@ -5151,8 +5606,7 @@ impl ParallelWorkflowEngine {
                                                 timeout: std::time::Duration::from_secs(
                                                     body_timeout_secs,
                                                 ),
-                                                max_fuel: (wasm_module.max_fuel)
-                                                    .min(50_000_000),
+                                                max_fuel: (wasm_module.max_fuel).min(50_000_000),
                                                 allowed_hosts: wasm_module.allowed_hosts.clone(),
                                                 allowed_methods: wasm_module
                                                     .allowed_methods
@@ -5388,7 +5842,9 @@ impl ParallelWorkflowEngine {
                                         )),
                                     );
                                 }
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
+                                Ok(talos_workflow_engine_core::ApprovalStatus::Denied {
+                                    reason,
+                                }) => {
                                     return (node_idx, Err(reason));
                                 }
                                 Err(e) => {
@@ -5486,7 +5942,8 @@ impl ParallelWorkflowEngine {
                         // Always include "input" sub-key for non-null, non-empty upstream
                         // outputs so downstream modules can access data["input"] regardless
                         // of whether the upstream returned an object or a scalar.
-                        let is_empty_object = inputs.as_object().map(|m| m.is_empty()).unwrap_or(false);
+                        let is_empty_object =
+                            inputs.as_object().map(|m| m.is_empty()).unwrap_or(false);
                         if !inputs.is_null() && !is_empty_object {
                             merged.insert("input".to_string(), inputs.clone());
                         }
@@ -5506,7 +5963,11 @@ impl ParallelWorkflowEngine {
                     {
                         let input_preview = {
                             let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
-                            if s.len() > 4096 { format!("{}...(truncated)", &s[..4096]) } else { s }
+                            if s.len() > 4096 {
+                                format!("{}...(truncated)", &s[..4096])
+                            } else {
+                                s
+                            }
                         };
                         emit_event_spawn(
                             &event_sink_clone,
@@ -5562,29 +6023,29 @@ impl ParallelWorkflowEngine {
                         .min(50_000_000);
 
                     // Resolve encrypted secrets payload (opaque bytes at this layer).
-                    let encrypted_secrets = match (
-                        secrets_resolver.as_ref(),
-                        &worker_shared_key_clone,
-                    ) {
-                        (Some(resolver), Some(key)) => {
-                            let vault_paths = extract_vault_paths(&module_config);
-                            build_encrypted_secrets_for(
-                                resolver.as_ref(),
-                                module_id_resolved,
-                                single_user_id,
-                                &vault_paths,
-                                &wasm_module.allowed_secrets,
-                                key,
-                            )
-                            .await
-                        }
-                        _ => Default::default(),
-                    };
+                    let encrypted_secrets =
+                        match (secrets_resolver.as_ref(), &worker_shared_key_clone) {
+                            (Some(resolver), Some(key)) => {
+                                let vault_paths = extract_vault_paths(&module_config);
+                                build_encrypted_secrets_for(
+                                    resolver.as_ref(),
+                                    module_id_resolved,
+                                    single_user_id,
+                                    &vault_paths,
+                                    &wasm_module.allowed_secrets,
+                                    key,
+                                )
+                                .await
+                            }
+                            _ => Default::default(),
+                        };
 
                     // Wire-format WASM budget. The dispatcher internally adds its
                     // own Tokio-outer grace on top (see TOKIO_WRAP_GRACE_SECS).
-                    let node_timeout_secs =
-                        node_timeouts_clone.get(&node_id).copied().unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
+                    let node_timeout_secs = node_timeouts_clone
+                        .get(&node_id)
+                        .copied()
+                        .unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
 
                     let job = DispatchJob {
                         execution_id,
@@ -5604,7 +6065,11 @@ impl ParallelWorkflowEngine {
                         // bypassing the "wasm:{uid}:{id}" vs "wasm:{id}" key mismatch and
                         // the template-UUID failure in ensure_module_in_cache. OCI modules
                         // have empty wasm_bytes (fetched by the worker from the registry).
-                        wasm_bytes: if wasm_module.wasm_bytes.is_empty() { None } else { Some(wasm_module.wasm_bytes.clone()) },
+                        wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
+                            None
+                        } else {
+                            Some(wasm_module.wasm_bytes.clone())
+                        },
                         // For OCI modules (wasm_bytes empty), commit the expected hash so the
                         // worker can verify the fetched content matches what we compiled.
                         expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
@@ -5670,12 +6135,11 @@ impl ParallelWorkflowEngine {
                         // Skip system nodes — they have no module in the registry (resolve_module_id
                         // returns the node UUID as a fallback). Fetching would waste a 5-second
                         // timeout and generate noisy debug log entries for every system successor.
-                        let succ_module_id = match self.node_meta.get(&succ_id)
-                            .and_then(|(mid, _, _)| *mid)
-                        {
-                            Some(mid) => mid,
-                            None => continue,
-                        };
+                        let succ_module_id =
+                            match self.node_meta.get(&succ_id).and_then(|(mid, _, _)| *mid) {
+                                Some(mid) => mid,
+                                None => continue,
+                            };
                         let prefetch_cache = Arc::clone(&self.module_prefetch_cache);
                         if let Some(ref fetcher) = self.module_fetcher {
                             let fetcher = Arc::clone(fetcher);
@@ -5786,12 +6250,9 @@ impl ParallelWorkflowEngine {
                         // `run_with_seed` does), so wall_time_ms is reported
                         // as 0 ("unknown") here per trait contract.
                         if let Some(hook) = self.node_hook.as_ref() {
-                            let node_label =
-                                self.node_labels.get(&finished_id).map(String::as_str);
-                            let module_id = self
-                                .node_meta
-                                .get(&finished_id)
-                                .and_then(|(m, _, _)| *m);
+                            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
+                            let module_id =
+                                self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
                             hook.on_node_completed(
                                 talos_workflow_engine_core::NodeCompletionContext {
                                     workflow_id: self.workflow_id.unwrap_or(execution_id),
@@ -6087,10 +6548,8 @@ impl ParallelWorkflowEngine {
                             if let Some(hook) = self.node_hook.as_ref() {
                                 let node_label =
                                     self.node_labels.get(&finished_id).map(String::as_str);
-                                let module_id = self
-                                    .node_meta
-                                    .get(&finished_id)
-                                    .and_then(|(m, _, _)| *m);
+                                let module_id =
+                                    self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
                                 hook.on_node_failed(
                                     talos_workflow_engine_core::NodeCompletionContext {
                                         workflow_id: self.workflow_id.unwrap_or(execution_id),
@@ -6126,10 +6585,7 @@ impl ParallelWorkflowEngine {
         let results: HashMap<Uuid, JsonValue> = results
             .into_iter()
             .map(|(k, v)| {
-                let v = exec_ctx
-                    .as_ref()
-                    .map(|c| c.redact_output(&v))
-                    .unwrap_or(v);
+                let v = exec_ctx.as_ref().map(|c| c.redact_output(&v)).unwrap_or(v);
                 (k, self.redact_json(&v))
             })
             .collect();
@@ -6166,8 +6622,8 @@ impl ParallelWorkflowEngine {
             return Box::pin(async move {
                 Err(
                     "ParallelWorkflowEngine was constructed without a SecretsResolver. \
-                     Use a controller-side builder or `set_secrets_resolver` \
-                     before calling run_with_seed_with_transport."
+                     Call `set_secrets_resolver` before \
+                     `run_with_seed_with_transport`."
                         .to_string(),
                 )
             });
@@ -8290,8 +8746,18 @@ mod tests {
         results.insert(uuids["alpha"], serde_json::json!({"v": 1}));
         results.insert(uuids["beta"], serde_json::json!({"v": 2}));
         let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out.get("alpha").and_then(|v| v.get("v")).and_then(|v| v.as_i64()), Some(1));
-        assert_eq!(out.get("beta").and_then(|v| v.get("v")).and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(
+            out.get("alpha")
+                .and_then(|v| v.get("v"))
+                .and_then(|v| v.as_i64()),
+            Some(1)
+        );
+        assert_eq!(
+            out.get("beta")
+                .and_then(|v| v.get("v"))
+                .and_then(|v| v.as_i64()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -8302,8 +8768,14 @@ mod tests {
             &[("__trigger__", "skipped"), ("skipped", "real")],
         );
         let mut results = HashMap::new();
-        results.insert(uuids["__trigger__"], serde_json::json!({"trigger": "ignored"}));
-        results.insert(uuids["skipped"], serde_json::json!({"__skipped": true, "noise": "x"}));
+        results.insert(
+            uuids["__trigger__"],
+            serde_json::json!({"trigger": "ignored"}),
+        );
+        results.insert(
+            uuids["skipped"],
+            serde_json::json!({"__skipped": true, "noise": "x"}),
+        );
         results.insert(uuids["real"], serde_json::json!({"answer": "42"}));
         let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
         assert_eq!(out.get("answer").and_then(|v| v.as_str()), Some("42"));
@@ -8363,8 +8835,23 @@ mod tests {
         results.insert(uuids["c"], serde_json::json!({"stage": "c"}));
         let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
         // Multiple terminals → label-keyed map including non-terminal a.
-        assert_eq!(out.get("a").and_then(|v| v.get("stage")).and_then(|v| v.as_str()), Some("a"));
-        assert_eq!(out.get("b").and_then(|v| v.get("stage")).and_then(|v| v.as_str()), Some("b"));
-        assert_eq!(out.get("c").and_then(|v| v.get("stage")).and_then(|v| v.as_str()), Some("c"));
+        assert_eq!(
+            out.get("a")
+                .and_then(|v| v.get("stage"))
+                .and_then(|v| v.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            out.get("b")
+                .and_then(|v| v.get("stage"))
+                .and_then(|v| v.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            out.get("c")
+                .and_then(|v| v.get("stage"))
+                .and_then(|v| v.as_str()),
+            Some("c")
+        );
     }
 }

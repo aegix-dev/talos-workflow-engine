@@ -67,7 +67,7 @@ See each crate's README for a worked example.
 
 ## MSRV
 
-Rust **1.80**. Pinned via `rust-toolchain.toml` and each crate's
+Rust **1.88**. Pinned via `rust-toolchain.toml` and each crate's
 `rust-version` field.
 
 ## Stability

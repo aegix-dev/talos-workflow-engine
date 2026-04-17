@@ -12,11 +12,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value as JsonValue;
-use uuid::Uuid;
 use talos_workflow_engine_core::{
-    BoxError, CheckpointStore, ModuleArtifact, ModuleFetcher, SecretsResolver,
-    WorkflowGraphStore,
+    BoxError, CheckpointStore, ModuleArtifact, ModuleFetcher, SecretsResolver, WorkflowGraphStore,
 };
+use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // InMemoryModuleFetcher
@@ -72,11 +71,7 @@ impl std::fmt::Debug for InMemoryModuleFetcher {
 
 #[async_trait]
 impl ModuleFetcher for InMemoryModuleFetcher {
-    async fn fetch(
-        &self,
-        module_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<ModuleArtifact, BoxError> {
+    async fn fetch(&self, module_id: Uuid, _user_id: Uuid) -> Result<ModuleArtifact, BoxError> {
         self.modules
             .get(&module_id)
             .map(|entry| entry.clone())
@@ -139,10 +134,7 @@ impl std::fmt::Debug for InMemoryCheckpointStore {
 
 #[async_trait]
 impl CheckpointStore for InMemoryCheckpointStore {
-    async fn load(
-        &self,
-        execution_id: Uuid,
-    ) -> Result<HashMap<Uuid, JsonValue>, BoxError> {
+    async fn load(&self, execution_id: Uuid) -> Result<HashMap<Uuid, JsonValue>, BoxError> {
         let Some(entry) = self.snapshots.get(&execution_id) else {
             return Ok(HashMap::new());
         };
@@ -155,11 +147,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
             .collect())
     }
 
-    async fn save(
-        &self,
-        execution_id: Uuid,
-        snapshot: &JsonValue,
-    ) -> Result<(), BoxError> {
+    async fn save(&self, execution_id: Uuid, snapshot: &JsonValue) -> Result<(), BoxError> {
         self.snapshots.insert(execution_id, snapshot.clone());
         Ok(())
     }
@@ -231,11 +219,7 @@ impl WorkflowGraphStore for InMemoryWorkflowGraphStore {
         Ok(self.graphs.get(&workflow_id).map(|e| e.clone()))
     }
 
-    async fn resolve_by_name(
-        &self,
-        name: &str,
-        _user_id: Uuid,
-    ) -> Result<Option<Uuid>, BoxError> {
+    async fn resolve_by_name(&self, name: &str, _user_id: Uuid) -> Result<Option<Uuid>, BoxError> {
         Ok(self.by_name.get(name).map(|e| *e))
     }
 
@@ -291,11 +275,7 @@ impl InMemorySecretsResolver {
     }
 
     /// Seed a vault-path resolution.
-    pub fn with_vault_path(
-        self,
-        path: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn with_vault_path(self, path: impl Into<String>, value: impl Into<String>) -> Self {
         self.vault.insert(path.into(), value.into());
         self
     }
@@ -363,7 +343,11 @@ impl SecretsResolver for InMemorySecretsResolver {
         let Some(uid) = user_id else {
             return Ok(HashMap::new());
         };
-        Ok(self.llm_keys.get(&uid).map(|e| e.clone()).unwrap_or_default())
+        Ok(self
+            .llm_keys
+            .get(&uid)
+            .map(|e| e.clone())
+            .unwrap_or_default())
     }
 }
 
@@ -432,7 +416,10 @@ mod tests {
 
         assert!(store.get_graph(id, Uuid::nil()).await.unwrap().is_some());
         assert_eq!(
-            store.resolve_by_name("my-workflow", Uuid::nil()).await.unwrap(),
+            store
+                .resolve_by_name("my-workflow", Uuid::nil())
+                .await
+                .unwrap(),
             Some(id)
         );
         let got = store

@@ -6,8 +6,8 @@
 //! [`ApprovalGate`]: talos_workflow_engine_core::ApprovalGate
 
 use async_trait::async_trait;
-use uuid::Uuid;
 use talos_workflow_engine_core::{ApprovalGate, ApprovalStatus, BoxError};
+use uuid::Uuid;
 
 /// [`ApprovalGate`] that returns [`ApprovalStatus::Approved`] for
 /// every call. Use when testing the happy-path dispatch of a module

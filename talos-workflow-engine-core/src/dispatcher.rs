@@ -197,12 +197,18 @@ impl fmt::Debug for DispatchJob {
             .field("module_uri", &self.module_uri)
             .field(
                 "wasm_bytes",
-                &self.wasm_bytes.as_ref().map(|b| format!("<{} bytes>", b.len())),
+                &self
+                    .wasm_bytes
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
             )
             .field("expected_wasm_hash", &self.expected_wasm_hash)
             .field("capability_world", &self.capability_world)
             .field("integration_name", &self.integration_name)
-            .field("input_payload", &"<redacted — may contain plaintext secrets>")
+            .field(
+                "input_payload",
+                &"<redacted — may contain plaintext secrets>",
+            )
             .field("timeout", &self.timeout)
             .field("max_fuel", &self.max_fuel)
             .field("allowed_hosts", &self.allowed_hosts)

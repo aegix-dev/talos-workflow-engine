@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
-use uuid::Uuid;
 use talos_workflow_engine_core::{
     BoxError, EventSink, ExecutionStartedContext, ModuleExecutionStore, NodeCompletionContext,
     NodeEventWrite, NodeLifecycleHook,
 };
+use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CaptureEventSink
@@ -38,17 +38,26 @@ impl CaptureEventSink {
     /// Snapshot of events emitted so far. Returns owned clones so the
     /// caller can iterate / assert without holding the internal lock.
     pub fn events(&self) -> Vec<NodeEventWrite> {
-        self.events.lock().expect("CaptureEventSink mutex poisoned").clone()
+        self.events
+            .lock()
+            .expect("CaptureEventSink mutex poisoned")
+            .clone()
     }
 
     /// Count of events emitted so far.
     pub fn len(&self) -> usize {
-        self.events.lock().expect("CaptureEventSink mutex poisoned").len()
+        self.events
+            .lock()
+            .expect("CaptureEventSink mutex poisoned")
+            .len()
     }
 
     /// True when no events have been emitted.
     pub fn is_empty(&self) -> bool {
-        self.events.lock().expect("CaptureEventSink mutex poisoned").is_empty()
+        self.events
+            .lock()
+            .expect("CaptureEventSink mutex poisoned")
+            .is_empty()
     }
 
     /// Filter recorded events by `event_type`. Common in tests that
@@ -66,20 +75,28 @@ impl CaptureEventSink {
     /// Drop all recorded events. Useful between stages of a multi-run
     /// test.
     pub fn clear(&self) {
-        self.events.lock().expect("CaptureEventSink mutex poisoned").clear();
+        self.events
+            .lock()
+            .expect("CaptureEventSink mutex poisoned")
+            .clear();
     }
 }
 
 impl std::fmt::Debug for CaptureEventSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CaptureEventSink").field("len", &self.len()).finish()
+        f.debug_struct("CaptureEventSink")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
 #[async_trait]
 impl EventSink for CaptureEventSink {
     async fn emit(&self, event: NodeEventWrite) {
-        self.events.lock().expect("CaptureEventSink mutex poisoned").push(event);
+        self.events
+            .lock()
+            .expect("CaptureEventSink mutex poisoned")
+            .push(event);
     }
 }
 
@@ -154,28 +171,42 @@ impl CaptureNodeLifecycleHook {
 
     /// Snapshot of recorded callbacks.
     pub fn calls(&self) -> Vec<LifecycleCall> {
-        self.calls.lock().expect("CaptureNodeLifecycleHook mutex poisoned").clone()
+        self.calls
+            .lock()
+            .expect("CaptureNodeLifecycleHook mutex poisoned")
+            .clone()
     }
 
     /// Count of recorded callbacks.
     pub fn len(&self) -> usize {
-        self.calls.lock().expect("CaptureNodeLifecycleHook mutex poisoned").len()
+        self.calls
+            .lock()
+            .expect("CaptureNodeLifecycleHook mutex poisoned")
+            .len()
     }
 
     /// True when no callbacks have fired.
     pub fn is_empty(&self) -> bool {
-        self.calls.lock().expect("CaptureNodeLifecycleHook mutex poisoned").is_empty()
+        self.calls
+            .lock()
+            .expect("CaptureNodeLifecycleHook mutex poisoned")
+            .is_empty()
     }
 
     /// Drop all recorded callbacks.
     pub fn clear(&self) {
-        self.calls.lock().expect("CaptureNodeLifecycleHook mutex poisoned").clear();
+        self.calls
+            .lock()
+            .expect("CaptureNodeLifecycleHook mutex poisoned")
+            .clear();
     }
 }
 
 impl std::fmt::Debug for CaptureNodeLifecycleHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CaptureNodeLifecycleHook").field("len", &self.len()).finish()
+        f.debug_struct("CaptureNodeLifecycleHook")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -218,11 +249,7 @@ impl NodeLifecycleHook for CaptureNodeLifecycleHook {
             });
     }
 
-    fn on_pipeline_step_completed(
-        &self,
-        actor_id: Option<Uuid>,
-        step_output: &JsonValue,
-    ) {
+    fn on_pipeline_step_completed(&self, actor_id: Option<Uuid>, step_output: &JsonValue) {
         self.calls
             .lock()
             .expect("CaptureNodeLifecycleHook mutex poisoned")
@@ -309,23 +336,34 @@ impl CaptureModuleExecutionStore {
 
     /// Snapshot of recorded calls.
     pub fn calls(&self) -> Vec<ExecutionStoreCall> {
-        self.calls.lock().expect("CaptureModuleExecutionStore mutex poisoned").clone()
+        self.calls
+            .lock()
+            .expect("CaptureModuleExecutionStore mutex poisoned")
+            .clone()
     }
 
     /// Count of recorded calls.
     pub fn len(&self) -> usize {
-        self.calls.lock().expect("CaptureModuleExecutionStore mutex poisoned").len()
+        self.calls
+            .lock()
+            .expect("CaptureModuleExecutionStore mutex poisoned")
+            .len()
     }
 
     /// True when no calls have been recorded.
     pub fn is_empty(&self) -> bool {
-        self.calls.lock().expect("CaptureModuleExecutionStore mutex poisoned").is_empty()
+        self.calls
+            .lock()
+            .expect("CaptureModuleExecutionStore mutex poisoned")
+            .is_empty()
     }
 }
 
 impl std::fmt::Debug for CaptureModuleExecutionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CaptureModuleExecutionStore").field("len", &self.len()).finish()
+        f.debug_struct("CaptureModuleExecutionStore")
+            .field("len", &self.len())
+            .finish()
     }
 }
 

@@ -36,11 +36,7 @@ pub trait ModuleFetcher: Send + Sync {
     /// `user_id`. Impls run whatever fallback pipeline they need to
     /// produce a dispatch-ready artifact; the executor expects a
     /// single outcome — a ready artifact or an error.
-    async fn fetch(
-        &self,
-        module_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<ModuleArtifact, BoxError>;
+    async fn fetch(&self, module_id: Uuid, user_id: Uuid) -> Result<ModuleArtifact, BoxError>;
 
     /// Batch-load per-module rate limits (requests-per-minute).
     /// Called once at graph init to populate the engine's per-module
@@ -51,10 +47,7 @@ pub trait ModuleFetcher: Send + Sync {
     /// rate-limit concept opt out implicitly, and the engine then
     /// performs no rate limiting. A Postgres-backed impl might run a
     /// single `UNION ALL` over its module tables.
-    async fn load_rate_limits(
-        &self,
-        _module_ids: &[Uuid],
-    ) -> HashMap<Uuid, i32> {
+    async fn load_rate_limits(&self, _module_ids: &[Uuid]) -> HashMap<Uuid, i32> {
         HashMap::new()
     }
 }

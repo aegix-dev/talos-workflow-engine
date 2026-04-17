@@ -8,10 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value as JsonValue;
+use talos_workflow_engine_core::{BoxError, DispatchJob, DispatchResult, NodeDispatcher};
 use uuid::Uuid;
-use talos_workflow_engine_core::{
-    BoxError, DispatchJob, DispatchResult, NodeDispatcher,
-};
 
 /// One scripted response.
 #[derive(Clone, Debug)]
@@ -49,7 +47,8 @@ impl ScriptedDispatcher {
 
     /// Script a successful response for `module_id`.
     pub fn with_response(self, module_id: Uuid, output: JsonValue) -> Self {
-        self.responses.insert(module_id, ScriptedResponse::Ok(output));
+        self.responses
+            .insert(module_id, ScriptedResponse::Ok(output));
         self
     }
 
@@ -149,8 +148,7 @@ mod tests {
     #[tokio::test]
     async fn scripted_response_returned() {
         let id = Uuid::new_v4();
-        let d = ScriptedDispatcher::new()
-            .with_response(id, serde_json::json!({ "result": 42 }));
+        let d = ScriptedDispatcher::new().with_response(id, serde_json::json!({ "result": 42 }));
         let out = d.dispatch(stub_job(id)).await.expect("scripted");
         assert_eq!(out.output, serde_json::json!({ "result": 42 }));
         assert_eq!(d.dispatch_count(id), 1);

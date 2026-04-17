@@ -3,10 +3,10 @@
 //! These tests cover oversized payload rejection, HMAC nonce validation,
 //! nonce replay detection, and tampered job request handling.
 
+use serde_json::json;
 use talos_workflow_job_protocol::{
     EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineStep,
 };
-use serde_json::json;
 use uuid::Uuid;
 
 fn test_key() -> Vec<u8> {

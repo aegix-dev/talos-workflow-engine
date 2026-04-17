@@ -7,8 +7,9 @@
 //! `talos-workflow-engine-core`; this crate carries only the scheduling loop,
 //! sub-workflow handlers, and the primary engine type.
 //!
-//! See [`talos_workflow_engine_core`] for the trait surface and
-//! `crates/talos-workflow-engine/src/engine.rs` for the executor body.
+//! See [`talos_workflow_engine_core`] for the trait surface; the
+//! executor body is re-exported from this crate as
+//! [`ParallelWorkflowEngine`] and [`AdapterSet`].
 
 mod engine;
 mod event_spawn;
