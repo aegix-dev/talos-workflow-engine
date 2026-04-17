@@ -27,6 +27,7 @@ use crate::BoxError;
 #[async_trait]
 pub trait ModuleExecutionStore: Send + Sync {
     /// Insert a "running" row for a dispatched node or pipeline step.
+    #[allow(clippy::too_many_arguments)]
     ///
     /// When `race_safe_status` is `true`, the row enters as
     /// `"cancelled"` if the parent workflow has already been flipped
@@ -71,7 +72,7 @@ pub trait ModuleExecutionStore: Send + Sync {
     /// matching `wasm_modules` row (most recent compile). Returns the
     /// input unchanged if no mapping exists — the engine stores that
     /// as-is and the FK may fail downstream, which is correct: a
-    /// missing wasm_modules row is a legitimate DB-state error, not
+    /// missing `wasm_modules` row is a legitimate DB-state error, not
     /// something the engine should paper over.
     async fn resolve_wasm_module_id(&self, id_or_template: Uuid) -> Uuid;
 }

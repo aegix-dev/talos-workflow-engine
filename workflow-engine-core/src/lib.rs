@@ -81,6 +81,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod approval_gate;
 mod checkpoint;
 mod context;
 mod dispatcher;
@@ -99,6 +100,7 @@ mod secrets;
 mod system_node;
 mod transport;
 
+pub use approval_gate::{ApprovalGate, ApprovalStatus};
 pub use checkpoint::CheckpointStore;
 pub use context::WorkflowContext;
 pub use dispatcher::{
