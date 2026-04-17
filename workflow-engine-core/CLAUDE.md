@@ -1,15 +1,29 @@
 # workflow-engine-core — Claude guide
 
 This crate defines the **trait surface** for a portable workflow executor.
-It is types + traits only: no I/O, no runtime, no backing store. A
-downstream `workflow-engine` crate layers the scheduling loop on top of
-these traits; consumer crates supply concrete implementations of each
-trait for their infrastructure.
+It is types + traits only: no I/O, no runtime, no backing store. Sibling
+crates layer implementations on top.
 
 This file captures the non-obvious rules for working in this crate. The
 short version: **be paranoid about leaks**. Every dependency, every
 runtime coupling, every concrete type that creeps in here undermines the
 "portable, no-I/O" contract the crate commits to.
+
+## Sibling crates
+
+```
+workflow-engine-core      ← you are here (types + traits only)
+    │
+    ├── workflow-engine                 DAG scheduler + dispatch loop
+    │        └── workflow-engine-nats   NATS-backed NodeDispatcher
+    │
+    └── workflow-engine-test-utils       in-memory + capture trait impls
+```
+
+Every sibling depends on this crate; this crate depends on none of
+them. Adding a dep to any sibling here would be a cycle. If a sibling
+needs something declared here, add it; if it needs something impl'd,
+that belongs in the sibling.
 
 ## Prime directives
 

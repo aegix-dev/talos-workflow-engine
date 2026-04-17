@@ -8,6 +8,27 @@ This file captures the non-obvious rules for working in this crate —
 invariants that matter for correctness, patterns that previous work
 converged on, and pitfalls that have bitten production.
 
+## Sibling crates
+
+```
+workflow-engine-core        types + traits, no I/O, no runtime
+    │
+    ├── workflow-engine     ← you are here (executor)
+    │        └── workflow-engine-nats   NATS-backed NodeDispatcher
+    │
+    └── workflow-engine-test-utils       in-memory + capture trait impls
+```
+
+When you need to reach for something this crate doesn't provide, check
+which sibling owns it before adding code here:
+
+- **Trait surface / types** → `workflow-engine-core`. If the thing you
+  want is a new trait method or a new protocol type, that's its home.
+- **Transport-specific dispatcher** → new sibling crate (e.g.
+  `workflow-engine-grpc`). Do not land a second transport here.
+- **Test double for a trait** → `workflow-engine-test-utils`.
+- **Talos-specific policy / SQL / schema** → the controller, not here.
+
 ## Core invariant: zero concrete controller types
 
 The engine body contains **zero** references to Talos controller types
@@ -87,24 +108,27 @@ When adding a new event type, decide deliberately which bucket it
 belongs in. If an observer would be confused by this event landing
 before/after a related one, use the synchronous path.
 
-## `NodeDispatcher` is abstract; NATS is controller-side
+## `NodeDispatcher` is abstract; transports live in sibling crates
 
 The engine's public entry is `run_with_transport(Arc<dyn NodeDispatcher>, ...)`.
-The engine has **no idea** that NATS exists. Controller-side glue lives
-in `controller/src/engine/nats_run.rs` and `nats_dispatcher.rs`:
+The engine has **no idea** any specific transport exists. Sibling
+crates host the concrete impls:
 
-- `NatsNodeDispatcher` impls `NodeDispatcher` for a signed-NATS
-  transport.
-- `run_with_nats(engine, client, key, exec_id)` wraps `client` in a
-  `NatsTransport`, builds a `NatsNodeDispatcher`, calls
-  `engine.run_with_transport(dispatcher, ...)`.
+- `workflow-engine-nats` — `NatsNodeDispatcher` + `NatsTransport` +
+  `run_with_nats(engine, dispatcher, key, exec_id)` /
+  `run_with_seed_via_nats(...)`. Signed job-protocol wire format over
+  NATS.
+- Future consumers (gRPC, in-process, shell-out) add their own
+  crates alongside.
 
 **Do not** add `async_nats` or transport-specific logic to this crate.
-It's banned at the `Cargo.toml` level for good reason — it would
-recouple the engine to NATS.
+It's absent from `Cargo.toml` for good reason — re-introducing it
+would recouple the engine to NATS.
 
-New transports belong in their own crates. See `nats_dispatcher.rs` as
-the reference shape.
+New transports belong in their own crates. See `workflow-engine-nats`
+as the reference shape and its own `CLAUDE.md` for the NATS-specific
+quirks (topic routing, signing, retry loop, edge-routing nil-UUID
+mapping).
 
 ## Engine body shims (`self.eval_bool`, `self.redact_str`, etc.)
 
