@@ -93,9 +93,11 @@ mod module_artifact;
 mod module_execution_store;
 mod module_fetcher;
 mod node_hook;
+pub mod reserved_keys;
 mod retry;
 mod retry_classifier;
 mod sanitizer;
+mod secret_envelope;
 mod secrets;
 mod system_node;
 mod transport;
@@ -105,19 +107,20 @@ pub use checkpoint::CheckpointStore;
 pub use context::WorkflowContext;
 pub use dispatcher::{
     dispatch_chain_sequential, ChainDispatchRequest, ChainDispatchResult, ChainStepResult,
-    DispatchJob, DispatchResult, NodeDispatcher, StepStatus,
+    DispatchJob, DispatchResult, NodeDispatcher, StepStatus, DEFAULT_DISPATCH_TIMEOUT_SECS,
 };
 pub use edge::EdgeLogic;
 pub use event_sink::{EventSink, NodeEventWrite};
 pub use expression::ExpressionEvaluator;
 pub use graph_store::WorkflowGraphStore;
-pub use module_artifact::ModuleArtifact;
+pub use module_artifact::WasmModuleArtifact;
 pub use module_execution_store::{ExecutionStartedContext, ModuleExecutionStore};
 pub use module_fetcher::ModuleFetcher;
 pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
 pub use retry::RetryPolicy;
 pub use retry_classifier::RetryClassifier;
 pub use sanitizer::{ExecutionSanitizer, OutputSanitizer};
+pub use secret_envelope::SecretEnvelope;
 pub use secrets::{BoxError, SecretsResolver};
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;

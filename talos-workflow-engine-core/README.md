@@ -55,7 +55,7 @@ Splitting the trait surface from the executor keeps three things clean:
 **Protocol types**
 
 - `DispatchJob` — what the executor hands to a transport for worker dispatch.
-- `ModuleArtifact` — the minimal dispatch-ready view of a compiled module.
+- `WasmModuleArtifact` — the minimal dispatch-ready view of a compiled module.
 - `NodeCompletionContext`, `ExecutionStartedContext` — context structs
   passed into lifecycle hooks / execution store methods.
 
@@ -113,7 +113,7 @@ contributor guide. Summary:
   associated types).
 - Every fallible trait method returns `Result<T, BoxError>`.
 - Types carrying plaintext secrets or wasm bytes write `Debug` by hand and
-  redact those fields (see `DispatchJob`, `ModuleArtifact`,
+  redact those fields (see `DispatchJob`, `WasmModuleArtifact`,
   `ExecutionStartedContext` for the pattern).
 - Optional trait methods carry sensible default bodies so extending a trait
   is non-breaking for downstream impls.

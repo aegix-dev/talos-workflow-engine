@@ -77,6 +77,23 @@ talos-workflow-engine-test-utils = "0.1"
 
 See each crate's README for a worked example.
 
+## Feature flags
+
+| Flag | Default | What it gates |
+|---|---|---|
+| `llm-primitives` | on | LLM/agent-specific `SystemNodeKind` variants (`Judge`, `Ensemble`, `LlmDispatch`, `AgentLoop`, `ReActLoop`, `ReflectiveRetry`, `ConfidenceGate`) and their engine-side dispatch code. Drop for a leaner build when not orchestrating LLM workflows. |
+| `minimal` (test-utils only) | on | Pulls `talos-workflow-engine` into `talos-workflow-engine-test-utils` so `minimal_engine()` is available. Drop when you only need the trait stubs. |
+
+**Set `llm-primitives` coherently across the family.** When you opt
+out, do so on **every** sibling crate in your dependency tree —
+`talos-workflow-engine-core`, `talos-workflow-engine`, and (if used)
+`talos-workflow-engine-nats` and `talos-workflow-engine-test-utils`.
+Mixing (e.g. `-core` with the feature on but `-engine` with it off)
+leaves the LLM variants reachable in the type enum but never dispatched
+by the engine — the engine parses them as `None`-kind and rejects at
+run time. There is no compile-time error for the mismatch; it surfaces
+only at workflow execution.
+
 ## MSRV
 
 Rust **1.88**. Pinned via `rust-toolchain.toml` and each crate's

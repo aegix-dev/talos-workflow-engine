@@ -306,6 +306,47 @@ pub struct EncryptedSecrets {
     pub nonce: Vec<u8>,
 }
 
+/// Reference [`SecretEnvelope`] impl backing the workspace's default
+/// dispatch path. Seals the plaintext secrets map with AES-256-GCM,
+/// using a caller-supplied 32-byte key as the AEAD key and a fresh
+/// random 12-byte nonce per call. The AEAD tag authenticates the
+/// ciphertext in-place, so callers do not need to add an outer MAC.
+///
+/// Construct as `AesGcmSecretEnvelope` (unit struct — no state). The
+/// engine holds an `Arc<dyn SecretEnvelope>` and calls
+/// [`SecretEnvelope::seal`] once per dispatch.
+///
+/// # Security properties
+///
+/// * Fresh 96-bit nonce per call (`rand::thread_rng`).
+/// * Authenticated (AES-GCM's GMAC covers the ciphertext).
+/// * Key length is validated — a non-32-byte key returns an error
+///   rather than silently truncating.
+///
+/// [`SecretEnvelope`]: talos_workflow_engine_core::SecretEnvelope
+/// [`SecretEnvelope::seal`]: talos_workflow_engine_core::SecretEnvelope::seal
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AesGcmSecretEnvelope;
+
+#[async_trait::async_trait]
+impl talos_workflow_engine_core::SecretEnvelope for AesGcmSecretEnvelope {
+    async fn seal(
+        &self,
+        secrets: &HashMap<String, String>,
+        shared_key: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), talos_workflow_engine_core::BoxError> {
+        // Empty map is a valid input — return the sentinel (empty
+        // ciphertext + empty nonce) so the engine can short-circuit
+        // without running AES on nothing.
+        if secrets.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let enc = EncryptedSecrets::encrypt(secrets, shared_key)
+            .map_err(|e| -> talos_workflow_engine_core::BoxError { e.into() })?;
+        Ok((enc.ciphertext, enc.nonce))
+    }
+}
+
 impl EncryptedSecrets {
     /// Encrypt a secrets map using AES-256-GCM.
     ///

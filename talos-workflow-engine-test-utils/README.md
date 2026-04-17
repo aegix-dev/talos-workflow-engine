@@ -12,7 +12,7 @@ database, secrets manager, or transport.
   "it works" behavior:
   - `InMemoryWorkflowGraphStore` — graph lookup from a seeded map.
   - `InMemoryCheckpointStore` — per-execution checkpoint state.
-  - `InMemoryModuleFetcher` — returns a preconfigured `ModuleArtifact`
+  - `InMemoryModuleFetcher` — returns a preconfigured `WasmModuleArtifact`
     for any id; optional rate-limit map.
   - `InMemorySecretsResolver` — layered module / path / LLM-key maps.
 - **`capture`** — record-and-assert impls you use when you want to
@@ -21,7 +21,7 @@ database, secrets manager, or transport.
   - `CaptureNodeLifecycleHook` — every `on_node_completed` /
     `on_node_failed` / `on_pipeline_step_completed` call.
   - `CaptureModuleExecutionStore` — every `record_started` /
-    `record_completed` / `resolve_wasm_module_id` call.
+    `record_completed` / `resolve_module_id` call.
 - **`dispatch`** — scriptable dispatcher for testing engine logic
   without a real worker:
   - `ScriptedDispatcher` — returns preconfigured responses keyed on

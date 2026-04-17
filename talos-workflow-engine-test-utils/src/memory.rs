@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value as JsonValue;
 use talos_workflow_engine_core::{
-    BoxError, CheckpointStore, ModuleArtifact, ModuleFetcher, SecretsResolver, WorkflowGraphStore,
+    BoxError, CheckpointStore, ModuleFetcher, SecretsResolver, WasmModuleArtifact,
+    WorkflowGraphStore,
 };
 use uuid::Uuid;
 
@@ -21,12 +22,12 @@ use uuid::Uuid;
 // InMemoryModuleFetcher
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// [`ModuleFetcher`] backed by an in-memory `module_id → ModuleArtifact`
+/// [`ModuleFetcher`] backed by an in-memory `module_id → WasmModuleArtifact`
 /// map. Ignores `user_id` — tests that need per-user isolation should
 /// key modules into separate fetchers per user.
 #[derive(Clone, Default)]
 pub struct InMemoryModuleFetcher {
-    modules: Arc<DashMap<Uuid, ModuleArtifact>>,
+    modules: Arc<DashMap<Uuid, WasmModuleArtifact>>,
     rate_limits: Arc<DashMap<Uuid, i32>>,
 }
 
@@ -38,7 +39,7 @@ impl InMemoryModuleFetcher {
 
     /// Configure a `(module_id → artifact)` mapping. Fluent — chain
     /// multiple `.with_module` calls to seed a full module set.
-    pub fn with_module(self, module_id: Uuid, artifact: ModuleArtifact) -> Self {
+    pub fn with_module(self, module_id: Uuid, artifact: WasmModuleArtifact) -> Self {
         self.modules.insert(module_id, artifact);
         self
     }
@@ -71,7 +72,7 @@ impl std::fmt::Debug for InMemoryModuleFetcher {
 
 #[async_trait]
 impl ModuleFetcher for InMemoryModuleFetcher {
-    async fn fetch(&self, module_id: Uuid, _user_id: Uuid) -> Result<ModuleArtifact, BoxError> {
+    async fn fetch(&self, module_id: Uuid, _user_id: Uuid) -> Result<WasmModuleArtifact, BoxError> {
         self.modules
             .get(&module_id)
             .map(|entry| entry.clone())
@@ -358,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_fetcher_returns_seeded_artifact() {
         let id = Uuid::new_v4();
-        let artifact = ModuleArtifact {
+        let artifact = WasmModuleArtifact {
             module_id: id,
             content_hash: "sha256".into(),
             wasm_bytes: vec![1, 2, 3],

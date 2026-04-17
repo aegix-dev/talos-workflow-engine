@@ -298,9 +298,9 @@ pub enum ExecutionStoreCall {
         /// Optional error message (non-None on failures).
         error_message: Option<String>,
     },
-    /// `resolve_wasm_module_id` — translation of a template/module id
-    /// to a `wasm_modules.id`.
-    ResolveWasmModuleId {
+    /// `resolve_module_id` — translation of a logical module id
+    /// (e.g. template id) to the canonical id recorded on execution.
+    ResolveModuleId {
         /// The id the caller asked about.
         input: Uuid,
         /// The id the store returned.
@@ -314,7 +314,7 @@ pub enum ExecutionStoreCall {
 pub struct CaptureModuleExecutionStore {
     calls: Arc<Mutex<Vec<ExecutionStoreCall>>>,
     /// Optional `template_id → wasm_modules.id` mapping returned by
-    /// `resolve_wasm_module_id`. Unmapped ids pass through unchanged.
+    /// `resolve_module_id`. Unmapped ids pass through unchanged.
     resolver_map: Arc<Mutex<std::collections::HashMap<Uuid, Uuid>>>,
 }
 
@@ -324,7 +324,7 @@ impl CaptureModuleExecutionStore {
         Self::default()
     }
 
-    /// Configure the id returned by `resolve_wasm_module_id` when
+    /// Configure the id returned by `resolve_module_id` when
     /// asked about `template_id`.
     pub fn with_wasm_module_id(self, template_id: Uuid, wasm_module_id: Uuid) -> Self {
         self.resolver_map
@@ -406,7 +406,7 @@ impl ModuleExecutionStore for CaptureModuleExecutionStore {
         Ok(())
     }
 
-    async fn resolve_wasm_module_id(&self, id_or_template: Uuid) -> Uuid {
+    async fn resolve_module_id(&self, id_or_template: Uuid) -> Uuid {
         let output = self
             .resolver_map
             .lock()
@@ -417,7 +417,7 @@ impl ModuleExecutionStore for CaptureModuleExecutionStore {
         self.calls
             .lock()
             .expect("CaptureModuleExecutionStore mutex poisoned")
-            .push(ExecutionStoreCall::ResolveWasmModuleId {
+            .push(ExecutionStoreCall::ResolveModuleId {
                 input: id_or_template,
                 output,
             });
@@ -465,10 +465,10 @@ mod tests {
         let wasm = Uuid::new_v4();
         let store = CaptureModuleExecutionStore::new().with_wasm_module_id(template, wasm);
 
-        assert_eq!(store.resolve_wasm_module_id(template).await, wasm);
+        assert_eq!(store.resolve_module_id(template).await, wasm);
         // Unmapped ids pass through.
         let other = Uuid::new_v4();
-        assert_eq!(store.resolve_wasm_module_id(other).await, other);
+        assert_eq!(store.resolve_module_id(other).await, other);
         assert_eq!(store.len(), 2);
     }
 }

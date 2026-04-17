@@ -1,6 +1,6 @@
 //! Executor-facing shape of a compiled workflow module.
 //!
-//! [`ModuleArtifact`] is the minimal dispatch-ready view an engine needs
+//! [`WasmModuleArtifact`] is the minimal dispatch-ready view an engine needs
 //! to ship a node to a worker: the wasm binary (or its URI), the
 //! capability grants the worker must enforce, budgets, and integration
 //! scope. It is deliberately **lean** — no compile-time metadata
@@ -32,7 +32,7 @@ use uuid::Uuid;
 /// only) so tracing the artifact at dispatch sites is safe; inlined wasm
 /// blobs are multi-MB and not useful in log output.
 #[derive(Clone)]
-pub struct ModuleArtifact {
+pub struct WasmModuleArtifact {
     /// Fetcher-assigned module identity. The adapter and the engine
     /// cache key off this — a stable id across fetches of the same
     /// module means the engine's prefetch cache hits the next time
@@ -83,9 +83,9 @@ pub struct ModuleArtifact {
     pub config: Option<JsonValue>,
 }
 
-impl std::fmt::Debug for ModuleArtifact {
+impl std::fmt::Debug for WasmModuleArtifact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ModuleArtifact")
+        f.debug_struct("WasmModuleArtifact")
             .field("module_id", &self.module_id)
             .field("content_hash", &self.content_hash)
             .field(

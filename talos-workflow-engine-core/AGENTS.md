@@ -41,7 +41,7 @@ that belongs in the sibling.
 3. **No concrete types from downstream crates.** Controller types
    (`ModuleRegistry`, `SecretsManager`, `WasmModule`) MUST NOT appear in
    any signature. If a trait method needs shape that a consumer type
-   provides, define a protocol type here (see `ModuleArtifact` for the
+   provides, define a protocol type here (see `WasmModuleArtifact` for the
    pattern — a flat `struct` with only the fields the executor reads).
 4. **Every trait is `dyn`-compatible.** The executor holds `Arc<dyn
    Trait>`. No generic methods, no associated types, no `where Self:

@@ -74,7 +74,9 @@ pub mod approval;
 pub mod capture;
 pub mod dispatch;
 pub mod memory;
+#[cfg(feature = "minimal")]
 pub mod minimal;
 pub mod noop;
 
+#[cfg(feature = "minimal")]
 pub use minimal::minimal_engine;

@@ -18,7 +18,7 @@ surface stabilizes, the crate will move to 1.0 and normal semver applies.
   `CheckpointStore`, `ModuleFetcher`, `ModuleExecutionStore`,
   `WorkflowGraphStore`, `ExpressionEvaluator`, `OutputSanitizer` /
   `ExecutionSanitizer`, `RetryClassifier`.
-- Protocol types: `DispatchJob`, `ModuleArtifact`, `NodeCompletionContext`,
+- Protocol types: `DispatchJob`, `WasmModuleArtifact`, `NodeCompletionContext`,
   `ExecutionStartedContext`, `NodeEventWrite`.
 - `BoxError` alias for trait-boundary error propagation.
 - Dependency allowlist: `async-trait`, `serde`, `serde_json`, `uuid`. No

@@ -407,7 +407,8 @@ pub struct ParallelWorkflowEngine {
     /// Speculative module prefetch cache — populated by background fetch tasks when a node
     /// has `speculative_prefetch: true`. `fetch_module` checks here first to avoid a DB
     /// round-trip when the module was pre-loaded while a slow predecessor was executing.
-    module_prefetch_cache: Arc<dashmap::DashMap<Uuid, talos_workflow_engine_core::ModuleArtifact>>,
+    module_prefetch_cache:
+        Arc<dashmap::DashMap<Uuid, talos_workflow_engine_core::WasmModuleArtifact>>,
     /// Pre-fetched sub-workflow graphs, keyed by workflow_id.
     /// Populated at execution start to avoid N+1 queries during node dispatch.
     /// Workflows referenced by SubWorkflow, AgentLoop, Ensemble, Judge,
@@ -451,6 +452,17 @@ pub struct ParallelWorkflowEngine {
     /// In production writes to `execution_approvals`; tests can plug
     /// in an auto-approve or auto-deny impl.
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
+    /// Seals per-dispatch plaintext secrets into the opaque
+    /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
+    /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
+    /// production-grade AES-256-GCM impl with fresh nonces per
+    /// dispatch. Override via
+    /// [`set_secret_envelope`](Self::set_secret_envelope) only when
+    /// the consumer's wire protocol sealed differently.
+    ///
+    /// The field is non-optional so the engine never silently
+    /// downgrades to plaintext secret transport on the wire.
+    secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     /// Root directory under which per-execution scratch sandboxes are
     /// created. `Some(path)` → `<path>/<execution_id>` is created at
     /// run-start and torn down at run-end (RAII guard cleans up even on
@@ -494,6 +506,7 @@ pub struct AdapterSet {
     retry_classifier: Option<Arc<dyn talos_workflow_engine_core::RetryClassifier>>,
     module_execution_store: Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
+    secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
     dry_run: bool,
@@ -532,6 +545,7 @@ impl AdapterSet {
         engine.retry_classifier = self.retry_classifier;
         engine.module_execution_store = self.module_execution_store;
         engine.approval_gate = self.approval_gate;
+        engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
         engine.dry_run = self.dry_run;
@@ -631,6 +645,7 @@ fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
 /// encrypting an empty map.
 pub(crate) async fn build_encrypted_secrets_for(
     resolver: &dyn SecretsResolver,
+    envelope: &dyn talos_workflow_engine_core::SecretEnvelope,
     node_id: Uuid,
     user_id: Option<Uuid>,
     vault_paths: &[String],
@@ -678,12 +693,25 @@ pub(crate) async fn build_encrypted_secrets_for(
         ),
     }
 
-    // 6. Encrypt.
+    // 6. Seal via the pluggable envelope. Empty-map short-circuit
+    // matches the reference impl's sentinel; callers read an empty
+    // ciphertext as "no secrets to forward."
     if secrets_map.is_empty() {
         return talos_workflow_job_protocol::EncryptedSecrets::default();
     }
-    talos_workflow_job_protocol::EncryptedSecrets::encrypt(&secrets_map, worker_shared_key)
-        .unwrap_or_default()
+    match envelope.seal(&secrets_map, worker_shared_key).await {
+        Ok((ciphertext, nonce)) => {
+            talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                %node_id,
+                "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
+            );
+            talos_workflow_job_protocol::EncryptedSecrets::default()
+        }
+    }
 }
 
 /// Validate config values against `pattern` constraints in the config_schema.
@@ -977,8 +1005,23 @@ impl ParallelWorkflowEngine {
             retry_classifier: None,
             module_execution_store: None,
             approval_gate: None,
+            secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(std::path::PathBuf::from(DEFAULT_SANDBOX_ROOT)),
         }
+    }
+
+    /// Replace the secret-sealing envelope. Accepts any
+    /// [`SecretEnvelope`] impl. Defaults to AES-256-GCM; override
+    /// only when the consumer's worker fleet speaks a different
+    /// wire protocol (e.g. an HMAC-only shape, a post-quantum AEAD,
+    /// or a pass-through envelope for tests).
+    ///
+    /// [`SecretEnvelope`]: talos_workflow_engine_core::SecretEnvelope
+    pub fn set_secret_envelope(
+        &mut self,
+        envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
+    ) {
+        self.secret_envelope = envelope;
     }
 
     /// Override the per-execution sandbox root.
@@ -1064,6 +1107,7 @@ impl ParallelWorkflowEngine {
             retry_classifier: self.retry_classifier.clone(),
             module_execution_store: self.module_execution_store.clone(),
             approval_gate: self.approval_gate.clone(),
+            secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
             actor_id: self.actor_id,
             dry_run: self.dry_run,
@@ -1087,11 +1131,20 @@ impl ParallelWorkflowEngine {
     /// pay a second `serde_json::from_str`; callers holding a raw
     /// string parse once at their boundary before calling.
     ///
+    /// The full wire shape is documented in
+    /// [`docs/graph-json-schema.md`](https://github.com/aegix-dev/talos-workflow-engine/blob/main/docs/graph-json-schema.md).
+    /// Summary: an object with `nodes: []` + `edges: []` + optional
+    /// `execution_timeout_secs`. Each node carries `id` (UUID), an
+    /// optional module `type` / built-in `kind` discriminator, an
+    /// optional per-kind `data` payload, and retry/skip hints. Each
+    /// edge carries `source` / `target` plus optional `sourceHandle`,
+    /// `targetHandle`, and `logic` condition.
+    ///
     /// Optional `execution_timeout_secs` at the graph root overrides
-    /// the default 300s timeout. Nodes with no resolvable
+    /// the default 300 s timeout. Nodes with no resolvable
     /// `module_id` (non-UUID `type` and no `data.moduleId`) are
     /// silently skipped — the engine treats them as presentation-
-    /// only annotations, matching the React-Flow frontend's
+    /// only annotations, matching the React Flow frontend's
     /// behavior.
     ///
     /// This replaced the pre-extraction `from_graph_json` associated
@@ -1393,6 +1446,7 @@ impl ParallelWorkflowEngine {
             .unwrap_or_default();
         build_encrypted_secrets_for(
             resolver.as_ref(),
+            self.secret_envelope.as_ref(),
             node_id,
             self.user_id,
             &vault_paths,
@@ -2991,7 +3045,7 @@ impl ParallelWorkflowEngine {
     async fn fetch_module(
         &self,
         node_id: Uuid,
-    ) -> Result<talos_workflow_engine_core::ModuleArtifact, String> {
+    ) -> Result<talos_workflow_engine_core::WasmModuleArtifact, String> {
         if let Some(cached) = self.module_prefetch_cache.remove(&node_id) {
             tracing::debug!(node_id = %node_id, "fetch_module: speculative prefetch cache hit");
             return Ok(cached.1);
@@ -3007,7 +3061,7 @@ impl ParallelWorkflowEngine {
                 let bytes =
                     std::fs::read("example-node/target/wasm32-wasi/release/my_first_node.wasm")
                         .map_err(|e| format!("failed to read wasm module: {}", e))?;
-                return Ok(talos_workflow_engine_core::ModuleArtifact {
+                return Ok(talos_workflow_engine_core::WasmModuleArtifact {
                     module_id: self.resolve_module_id(node_id),
                     content_hash: "example".to_string(),
                     wasm_bytes: bytes,
@@ -3627,6 +3681,7 @@ impl ParallelWorkflowEngine {
                         let module_fetcher_clone = self.module_fetcher.clone();
                         let approval_gate = self.approval_gate.clone();
                         let secrets_resolver = self.secrets_resolver.clone();
+                        let secret_envelope = self.secret_envelope.clone();
                         let chain_clone = chain.clone();
                         let chain_user_id = self.user_id;
                         let worker_shared_key_clone = worker_shared_key.clone();
@@ -3683,7 +3738,7 @@ impl ParallelWorkflowEngine {
                                 };
 
                                 // Fetch the pipeline step's module artifact via the
-                                // trait; `ModuleArtifact.config` mirrors
+                                // trait; `WasmModuleArtifact.config` mirrors
                                 // `wasm_modules.config`, same data the pre-extraction
                                 // code read via `reg.get_execution_info`. Dropping
                                 // the Redis cache warm that used to fire here —
@@ -3789,6 +3844,7 @@ impl ParallelWorkflowEngine {
                                         (Some(resolver), Some(key)) => {
                                             build_encrypted_secrets_for(
                                                 resolver.as_ref(),
+                                                secret_envelope.as_ref(),
                                                 step_node_id,
                                                 user_id_clone,
                                                 &vault_paths,
@@ -3914,8 +3970,7 @@ impl ParallelWorkflowEngine {
                                     } else {
                                         serde_json::json!(null)
                                     };
-                                    let actual_mid =
-                                        store.resolve_wasm_module_id(step_node_id).await;
+                                    let actual_mid = store.resolve_module_id(step_node_id).await;
                                     if let Err(db_err) = store
                                         .record_started(ExecutionStartedContext {
                                             id: step_exec_id,
@@ -5732,6 +5787,7 @@ impl ParallelWorkflowEngine {
                 let user_id_clone = self.user_id;
                 let fetch_fut = self.fetch_module(node_id);
                 let secrets_resolver = self.secrets_resolver.clone();
+                let secret_envelope = self.secret_envelope.clone();
                 let approval_gate = self.approval_gate.clone();
                 let _exec_sandbox = execution_sandbox.clone();
                 let single_user_id = self.user_id;
@@ -5806,7 +5862,7 @@ impl ParallelWorkflowEngine {
                     // Read the module's compile-time config from the
                     // artifact we already fetched. `wasm_module` came from
                     // `fetch_fut` above (which hit `ModuleFetcher::fetch`);
-                    // `ModuleArtifact::config` mirrors `wasm_modules.config`,
+                    // `WasmModuleArtifact::config` mirrors `wasm_modules.config`,
                     // so this avoids a separate `reg.get_module_config`
                     // round-trip the engine previously made.
                     //
@@ -5931,8 +5987,7 @@ impl ParallelWorkflowEngine {
                         // (Fallback 2 path) not present in wasm_modules;
                         // the store's resolver maps template → wasm_modules
                         // by most-recent compile.
-                        let actual_module_id =
-                            store.resolve_wasm_module_id(module_id_resolved).await;
+                        let actual_module_id = store.resolve_module_id(module_id_resolved).await;
                         if let Err(db_err) = store
                             .record_started(ExecutionStartedContext {
                                 id: job_id,
@@ -5970,6 +6025,7 @@ impl ParallelWorkflowEngine {
                                 let vault_paths = extract_vault_paths(&module_config);
                                 build_encrypted_secrets_for(
                                     resolver.as_ref(),
+                                    secret_envelope.as_ref(),
                                     module_id_resolved,
                                     single_user_id,
                                     &vault_paths,
@@ -7815,6 +7871,7 @@ impl ParallelWorkflowEngine {
                 let user_id_clone = self.user_id;
                 let fetch_fut = self.fetch_module(node_id);
                 let secrets_resolver = self.secrets_resolver.clone();
+                let secret_envelope = self.secret_envelope.clone();
                 let approval_gate = self.approval_gate.clone();
                 let module_execution_store = self.module_execution_store.clone();
                 let _exec_sandbox = execution_sandbox.clone();
@@ -7990,7 +8047,7 @@ impl ParallelWorkflowEngine {
                         // dispatch path for the rationale behind
                         // race_safe_status=true.
                         let actual_module_id =
-                            store.resolve_wasm_module_id(module_id_resolved).await;
+                            store.resolve_module_id(module_id_resolved).await;
                         if let Err(db_err) = store
                             .record_started(ExecutionStartedContext {
                                 id: job_id,
@@ -8026,6 +8083,7 @@ impl ParallelWorkflowEngine {
                             let vault_paths = extract_vault_paths(&module_config);
                             build_encrypted_secrets_for(
                                 resolver.as_ref(),
+                                secret_envelope.as_ref(),
                                 module_id_resolved,
                                 user_id_clone,
                                 &vault_paths,

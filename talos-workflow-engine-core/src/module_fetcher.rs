@@ -27,16 +27,16 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{BoxError, ModuleArtifact};
+use crate::{BoxError, WasmModuleArtifact};
 
 /// Resolve the wasm artifact for a workflow node.
 #[async_trait]
 pub trait ModuleFetcher: Send + Sync {
-    /// Fetch the [`ModuleArtifact`] identified by `module_id` for
+    /// Fetch the [`WasmModuleArtifact`] identified by `module_id` for
     /// `user_id`. Impls run whatever fallback pipeline they need to
     /// produce a dispatch-ready artifact; the executor expects a
     /// single outcome — a ready artifact or an error.
-    async fn fetch(&self, module_id: Uuid, user_id: Uuid) -> Result<ModuleArtifact, BoxError>;
+    async fn fetch(&self, module_id: Uuid, user_id: Uuid) -> Result<WasmModuleArtifact, BoxError>;
 
     /// Batch-load per-module rate limits (requests-per-minute).
     /// Called once at graph init to populate the engine's per-module

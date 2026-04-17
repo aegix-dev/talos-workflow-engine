@@ -39,9 +39,10 @@ pub struct ExecutionStartedContext<'a> {
     /// [`ModuleExecutionStore::record_completed`] when the worker
     /// returns.
     pub id: Uuid,
-    /// Resolved `wasm_modules.id` used as the FK. The engine calls
-    /// [`ModuleExecutionStore::resolve_wasm_module_id`] first to map
-    /// any template id onto this.
+    /// Canonical module id used when recording the execution row. The
+    /// engine calls
+    /// [`ModuleExecutionStore::resolve_module_id`] first to map any
+    /// template / alias id onto this.
     pub module_id: Uuid,
     /// Owning user for the dispatch.
     pub user_id: Uuid,
@@ -105,13 +106,16 @@ pub trait ModuleExecutionStore: Send + Sync {
         error_message: Option<&str>,
     ) -> Result<(), BoxError>;
 
-    /// Resolve a `module_id_or_template_id` to the actual
-    /// `wasm_modules.id` used for the foreign key. Template-dispatched
-    /// paths pass a `node_templates.id`; a typical impl maps it to the
-    /// matching `wasm_modules` row (most recent compile). Returns the
-    /// input unchanged if no mapping exists — the engine stores that
-    /// as-is and the FK may fail downstream, which is correct: a
-    /// missing `wasm_modules` row is a legitimate DB-state error, not
-    /// something the engine should paper over.
-    async fn resolve_wasm_module_id(&self, id_or_template: Uuid) -> Uuid;
+    /// Resolve a logical module identifier (e.g. a template id) to the
+    /// canonical id used when recording execution rows. Impls backed
+    /// by a `node_templates ↔ wasm_modules` split map the template id
+    /// to the matching wasm_modules row (most recent compile);
+    /// simpler stores return the input unchanged.
+    ///
+    /// When the input is already canonical, or no mapping exists, the
+    /// impl returns the input as-is. The engine records whatever value
+    /// is returned; consumers are expected to reject unknown ids at
+    /// their storage layer rather than expecting the engine to paper
+    /// over a missing row.
+    async fn resolve_module_id(&self, id_or_template: Uuid) -> Uuid;
 }

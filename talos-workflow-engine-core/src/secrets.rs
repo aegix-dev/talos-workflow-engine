@@ -70,13 +70,20 @@ pub trait SecretsResolver: Send + Sync {
     /// Impls propagate backing-store errors through the `Err` arm; the
     /// executor decides the policy (a common choice is to swallow and
     /// log so a missing or broken LLM-key vault doesn't fail unrelated
-    /// nodes).
-    /// Returning an empty `Ok(HashMap)` is correct when the user has
-    /// no LLM keys configured.
+    /// nodes). Returning an empty `Ok(HashMap)` is correct when the
+    /// user has no LLM keys configured.
+    ///
+    /// The default body returns an empty map — useful for consumers
+    /// running with `default-features = false` (no `llm-primitives`)
+    /// and for in-process executors that don't orchestrate LLM
+    /// workflows at all. Override when the resolver backs onto an
+    /// LLM-key store.
     async fn resolve_llm_keys(
         &self,
-        user_id: Option<Uuid>,
-    ) -> Result<HashMap<String, String>, BoxError>;
+        _user_id: Option<Uuid>,
+    ) -> Result<HashMap<String, String>, BoxError> {
+        Ok(HashMap::new())
+    }
 
     /// Optional pre-fetch hook invoked with the vault paths about to be
     /// resolved. Impls can use this to refresh short-lived credentials

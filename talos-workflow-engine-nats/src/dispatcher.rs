@@ -463,6 +463,21 @@ const TOKIO_WRAP_GRACE_SECS: u64 = 5;
 #[async_trait]
 impl NodeDispatcher for NatsNodeDispatcher {
     async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        // Zero-timeout sanity check: combined with the outer grace this
+        // would surface as "cancel after ~5 s" for every job, which is
+        // almost certainly not what the caller intended. `DispatchJob`'s
+        // `Default` ships a positive budget; a zero value here is either
+        // a manual misconfiguration or an old caller that predates the
+        // default fix.
+        if job.timeout.is_zero() {
+            tracing::warn!(
+                execution_id = %job.execution_id,
+                node_id = %job.node_id,
+                "DispatchJob::timeout is zero — jobs will cancel under the dispatcher's grace window. \
+                 Set `timeout` explicitly or use `DispatchJob::default()` for a 60 s budget."
+            );
+        }
+
         // 1. Assemble the wire-format `JobRequest`.
         let mut req = JobRequest {
             // Reuse a caller-supplied job id when present so a

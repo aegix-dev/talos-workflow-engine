@@ -13,7 +13,7 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1", default-features = false }
-talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.1", default-features = false }
+talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.1", default-features = false, optional = true }
 async-trait = "0.1"
 dashmap = "6.1"
 serde_json = "1"
@@ -23,12 +23,21 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 
 [features]
-default = ["llm-primitives"]
+default = ["minimal", "llm-primitives"]
+# Pulls in `talos-workflow-engine` so the `minimal_engine()` convenience
+# constructor is available. Consumers who only want the trait stubs
+# (capture, memory, noop, dispatch, approval modules) can drop this
+# feature with `default-features = false` to shed the `-engine` dep
+# and its transitive `rhai`/`cap-std`/`petgraph`/`aes-gcm`/`hmac`
+# compile cost.
+minimal = ["dep:talos-workflow-engine"]
 # Propagates to sibling crates so helpers compile against the same
-# feature surface as the engine consumer.
+# feature surface as the engine consumer. Only meaningful when the
+# `minimal` feature is also active (no engine to propagate to
+# otherwise); the propagation list stays consistent either way.
 llm-primitives = [
     "talos-workflow-engine-core/llm-primitives",
-    "talos-workflow-engine/llm-primitives",
+    "talos-workflow-engine?/llm-primitives",
 ]
 
 [lints.rust]

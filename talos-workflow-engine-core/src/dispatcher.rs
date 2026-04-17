@@ -204,6 +204,16 @@ pub struct DispatchJob {
     pub emit_retry_events: bool,
 }
 
+/// Default per-node execution budget used by [`DispatchJob::default`].
+///
+/// Matches the engine's out-of-box node-timeout (also 60 s). Chosen so a
+/// `DispatchJob::new(...)` that doesn't override `timeout` produces a
+/// positive, bounded budget; [`Duration::ZERO`] would surface as "0 s +
+/// dispatcher-grace = ~5 s cancel" under the reference NATS dispatcher,
+/// which is the wrong foot-gun to ship. Override explicitly when the
+/// consumer has its own budget policy.
+pub const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 60;
+
 impl Default for DispatchJob {
     /// Populates every field with its documented default:
     ///
@@ -211,8 +221,10 @@ impl Default for DispatchJob {
     /// * All `Option<...>` fields → `None`
     /// * All `Vec<...>` fields → empty
     /// * `input_payload` → `JsonValue::Null`
-    /// * `timeout` → [`Duration::ZERO`] — impls that require a positive
-    ///   budget must set this explicitly
+    /// * `timeout` → [`DEFAULT_DISPATCH_TIMEOUT_SECS`] (60 s). Chosen to
+    ///   avoid the `Duration::ZERO` + dispatcher-grace foot-gun where
+    ///   every job cancels after a few seconds because the user forgot
+    ///   to set a budget.
     /// * `max_fuel` → 0 — impls that enforce fuel read this as "no
     ///   budget configured"
     /// * `priority` → 100 (documented default)
@@ -232,7 +244,7 @@ impl Default for DispatchJob {
             capability_world: None,
             integration_name: None,
             input_payload: JsonValue::Null,
-            timeout: Duration::ZERO,
+            timeout: Duration::from_secs(DEFAULT_DISPATCH_TIMEOUT_SECS),
             max_fuel: 0,
             allowed_hosts: Vec::new(),
             allowed_methods: Vec::new(),
