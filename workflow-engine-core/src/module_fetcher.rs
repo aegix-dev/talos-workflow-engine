@@ -22,6 +22,8 @@
 //!   impl's policy is correct and indistinguishable from "really
 //!   doesn't exist" at this layer.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -39,4 +41,20 @@ pub trait ModuleFetcher: Send + Sync {
         module_id: Uuid,
         user_id: Uuid,
     ) -> Result<ModuleArtifact, BoxError>;
+
+    /// Batch-load per-module rate limits (requests-per-minute).
+    /// Called once at graph init to populate the engine's per-module
+    /// rate-limit map. Ids that do not carry a rate limit (or do not
+    /// exist) are simply absent from the returned map.
+    ///
+    /// Default impl returns an empty map — consumers without a
+    /// rate-limit concept opt out implicitly, and the engine then
+    /// performs no rate limiting. The Talos Postgres impl runs a
+    /// single `UNION ALL` over `wasm_modules` + `node_templates`.
+    async fn load_rate_limits(
+        &self,
+        _module_ids: &[Uuid],
+    ) -> HashMap<Uuid, i32> {
+        HashMap::new()
+    }
 }
