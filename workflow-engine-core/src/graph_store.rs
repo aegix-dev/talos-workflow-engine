@@ -75,4 +75,43 @@ pub trait WorkflowGraphStore: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Resolve a workflow by its display name, scoped to `user_id`.
+    /// Used by the engine's `DynamicDispatch` system node when the
+    /// target is specified as a string rather than a UUID.
+    ///
+    /// Returns the first matching workflow's id (impls may order
+    /// however they like — the Talos default takes the most recent
+    /// by update time). Returns `Ok(None)` when no workflow matches.
+    ///
+    /// Default impl returns `None` (out-of-tree consumers that don't
+    /// support name-based dispatch can leave this unimplemented; the
+    /// engine's DynamicDispatch then only resolves UUID targets).
+    async fn resolve_by_name(
+        &self,
+        _name: &str,
+        _user_id: Uuid,
+    ) -> Result<Option<Uuid>, BoxError> {
+        Ok(None)
+    }
+
+    /// Resolve a workflow whose declared capabilities are a superset
+    /// of `required_capabilities`, scoped to `user_id`. Used by the
+    /// engine's `CapabilityDispatch` system node — "find a workflow
+    /// that can do these things."
+    ///
+    /// Returns the first matching workflow's `(id, name)` — impls may
+    /// order however they like (the Talos default takes the most recent
+    /// by update time). `Ok(None)` means no workflow satisfies the
+    /// capability set.
+    ///
+    /// Default impl returns `None` for the same reason as
+    /// [`resolve_by_name`](Self::resolve_by_name).
+    async fn resolve_by_capabilities(
+        &self,
+        _required_capabilities: &[String],
+        _user_id: Uuid,
+    ) -> Result<Option<(Uuid, String)>, BoxError> {
+        Ok(None)
+    }
 }
