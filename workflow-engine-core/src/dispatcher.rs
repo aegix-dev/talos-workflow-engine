@@ -344,15 +344,19 @@ pub trait NodeDispatcher: Send + Sync {
     /// pipeline-chain optimization where the engine has detected a
     /// sequence of nodes that can share a sandbox.
     ///
-    /// Impls without batch support can delegate to
-    /// [`dispatch_chain_sequential`] — it loops over [`dispatch`](Self::dispatch)
-    /// and assembles a `ChainDispatchResult`. Batch-capable transports
-    /// (the Talos NATS impl uses `PipelineJobRequest`) should override
-    /// for the round-trip savings.
+    /// The default body delegates to [`dispatch_chain_sequential`],
+    /// which loops over [`dispatch`](Self::dispatch) and assembles a
+    /// `ChainDispatchResult`. Batch-capable transports (the Talos NATS
+    /// impl uses `PipelineJobRequest`) should **override** this method
+    /// to get the round-trip savings and, if `share_sandbox` is load-
+    /// bearing for the consumer, a truly shared worker sandbox — the
+    /// default impl does not provide either.
     async fn dispatch_chain(
         &self,
         request: ChainDispatchRequest,
-    ) -> Result<ChainDispatchResult, BoxError>;
+    ) -> Result<ChainDispatchResult, BoxError> {
+        dispatch_chain_sequential(self, request).await
+    }
 }
 
 /// Helper for `NodeDispatcher` impls that lack a batch transport.

@@ -10,10 +10,21 @@
 //! The trait is **read-only**: callers that need to *create* workflows
 //! go through a different path (e.g. a dedicated workflow-authoring
 //! service). The executor's concern is hydration, not mutation.
+//!
+//! # Return type
+//!
+//! Graphs come back as parsed [`serde_json::Value`], not as a `String`.
+//! Every executor call site immediately parses what it gets, so parsing
+//! at the storage boundary collapses N parses into one (Postgres can
+//! return JSONB natively as `Value`, skipping a text round-trip
+//! entirely). Impls whose backing store holds a raw string should call
+//! `serde_json::from_str` inside the impl, not push that cost onto
+//! every consumer.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::BoxError;
@@ -30,15 +41,15 @@ use crate::BoxError;
 /// re-check ownership on the returned graph.
 #[async_trait]
 pub trait WorkflowGraphStore: Send + Sync {
-    /// Fetch one workflow's `graph_json` string. Returns `Ok(None)`
-    /// when no workflow with that id is visible to `user_id`.
+    /// Fetch one workflow's parsed graph. Returns `Ok(None)` when no
+    /// workflow with that id is visible to `user_id`.
     async fn get_graph(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<String>, BoxError>;
+    ) -> Result<Option<JsonValue>, BoxError>;
 
-    /// Batch-fetch `graph_json` for a set of workflow ids scoped to
+    /// Batch-fetch parsed graphs for a set of workflow ids scoped to
     /// `user_id`. Ids that do not resolve are simply absent from the
     /// returned map — the caller is expected to tolerate partial results.
     ///
@@ -55,7 +66,7 @@ pub trait WorkflowGraphStore: Send + Sync {
         &self,
         ids: &[Uuid],
         user_id: Uuid,
-    ) -> Result<HashMap<Uuid, String>, BoxError> {
+    ) -> Result<HashMap<Uuid, JsonValue>, BoxError> {
         let mut out = HashMap::with_capacity(ids.len());
         for id in ids {
             if let Some(graph) = self.get_graph(*id, user_id).await? {

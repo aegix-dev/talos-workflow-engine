@@ -5,11 +5,6 @@
 //! resume later. [`CheckpointStore`] is the trait the executor talks to
 //! for resumption; the backing store (Postgres, S3, a local file, an
 //! in-memory map for tests) is the consumer's choice.
-//!
-//! This initial version is **load-only**. A `save` method will land
-//! once the first consumer migrates off its bespoke persistence path —
-//! that migration will fix the trait's save semantics against a real
-//! workload instead of guessing at them.
 
 use std::collections::HashMap;
 
@@ -19,13 +14,15 @@ use uuid::Uuid;
 
 use crate::BoxError;
 
-/// Retrieve per-node outputs for a paused execution.
+/// Persist and retrieve per-node outputs for a paused execution.
 ///
 /// # Semantics
 ///
 /// * [`load`](Self::load) returns an empty map when the execution has
 ///   no checkpoint — a fresh run is indistinguishable from a run with
 ///   zero completed nodes, so `Ok(empty)` is correct for both.
+/// * [`save`](Self::save) overwrites any prior snapshot for the same
+///   `execution_id`; impls are responsible for idempotency.
 /// * Whether the stored blob is encrypted, compressed, or serialized
 ///   differently than the returned `JsonValue` is entirely up to the
 ///   impl. The trait traffics in plaintext `JsonValue`.
@@ -37,4 +34,17 @@ pub trait CheckpointStore: Send + Sync {
         &self,
         execution_id: Uuid,
     ) -> Result<HashMap<Uuid, JsonValue>, BoxError>;
+
+    /// Persist a snapshot of per-node outputs for `execution_id` so a
+    /// future resume can pick up from here. `snapshot` is a JSON object
+    /// whose keys are node UUID strings and whose values are the node
+    /// outputs — the same shape [`load`](Self::load) returns on the way
+    /// back. Impls that encrypt at rest (the Talos default does, with
+    /// AES-256-GCM) own the key material and never expose it through
+    /// this trait.
+    async fn save(
+        &self,
+        execution_id: Uuid,
+        snapshot: &JsonValue,
+    ) -> Result<(), BoxError>;
 }

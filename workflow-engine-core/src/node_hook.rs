@@ -14,6 +14,42 @@
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
+/// Identity + measurements that accompany every node-completion event.
+///
+/// Passed as a single struct rather than a long parameter list so the
+/// call site stays readable and so adding a future field (e.g. fuel
+/// consumed, wall-start timestamp) is a non-breaking change for
+/// impls — they only pattern-match or field-access what they need.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeCompletionContext<'a> {
+    /// Parent workflow definition id. `Uuid::nil()` when the engine is
+    /// running in a context with no durable workflow row (e.g. a
+    /// one-off test harness); impls that persist per-workflow rollups
+    /// should treat nil as "don't attribute".
+    pub workflow_id: Uuid,
+    /// Workflow execution that owns this dispatch.
+    pub execution_id: Uuid,
+    /// Engine-local node identifier within the graph.
+    pub node_id: Uuid,
+    /// User-defined label for the node (e.g. `"fetch-upcoming"`) when
+    /// one exists, or `None` if the node is anonymous. Impls typically
+    /// use it for human-readable rollups.
+    pub node_label: Option<&'a str>,
+    /// Resolved module id the node ran, if the engine has one. `None`
+    /// for system nodes that don't dispatch to a wasm module
+    /// (`SubWorkflow`, `FanIn`, synthetic triggers, etc.).
+    pub module_id: Option<Uuid>,
+    /// Actor that owns the execution. Consumers that implement
+    /// actor-scoped side effects (for example, an actor-memory write
+    /// triggered by an engine protocol field in `output`) key off this.
+    pub actor_id: Option<Uuid>,
+    /// Wall-clock execution time in milliseconds, measured from
+    /// dispatch to completion. `0` when the engine didn't record a
+    /// start time (some legacy paths don't); impls should treat `0`
+    /// as "unknown" rather than "instantaneous".
+    pub wall_time_ms: u64,
+}
+
 /// Called after each node's output is finalized.
 ///
 /// # Contract
@@ -31,23 +67,8 @@ use uuid::Uuid;
 ///   failures are surfaced through the consumer's event-persistence
 ///   path (e.g. the Talos `EventSink`). A future revision may add
 ///   sibling hooks for lifecycle transitions other than success.
-/// * `actor_id` is the ID of the actor that owns the execution, if
-///   any. Consumers that implement actor-scoped side effects (for
-///   example, an actor-memory write triggered by an engine protocol
-///   field in `output`) key off this.
 pub trait NodeLifecycleHook: Send + Sync {
-    /// Synchronous notification that `node_id` within execution
-    /// `execution_id` has produced its final `output`.
-    ///
-    /// `node_label` is the user-defined label for the node (e.g.
-    /// `"fetch-upcoming"`) when one exists, or `None` if the node is
-    /// anonymous. Impls typically use it for human-readable rollups.
-    fn on_node_completed(
-        &self,
-        execution_id: Uuid,
-        node_id: Uuid,
-        node_label: Option<&str>,
-        actor_id: Option<Uuid>,
-        output: &JsonValue,
-    );
+    /// Synchronous notification that the node identified by
+    /// `ctx.node_id` has produced its final `output`.
+    fn on_node_completed(&self, ctx: NodeCompletionContext<'_>, output: &JsonValue);
 }

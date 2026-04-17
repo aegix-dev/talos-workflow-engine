@@ -35,9 +35,10 @@
 //!   [`NodeDispatcher`] with engine-local state. Sub-workflow graphs
 //!   are batch-prefetched at run start (one `WHERE id = ANY($1)`
 //!   query via [`WorkflowGraphStore`]) to eliminate N+1 lookups.
-//! * **Resumes paused runs** from a checkpoint via
-//!   [`CheckpointStore`] (currently load-only; a save method will
-//!   follow once the first consumer migrates to the trait).
+//! * **Persists and resumes paused runs** via [`CheckpointStore`] —
+//!   `Wait` / cancelled runs snapshot per-node outputs through
+//!   [`CheckpointStore::save`]; a subsequent resume hydrates them
+//!   through [`CheckpointStore::load`].
 //! * **Enforces security invariants** at every dispatch:
 //!   [`SecretsResolver`] resolves per-node secrets; the executor
 //!   refreshes short-lived credentials via
@@ -65,10 +66,10 @@
 //!   nodes)" primitive. Owns wire-format construction, signing,
 //!   retry, and result parsing.
 //!
-//! Two more traits (`EventSink`, `ModuleFetcher`) live in the
-//! controller today alongside the executor but have no Talos types
-//! in their signatures; they will migrate into this crate in a
-//! follow-up.
+//! One more trait (`ModuleFetcher`) lives in the controller today
+//! alongside the executor. Its signature mentions a Talos-specific
+//! `WasmModule` shape; it'll migrate into this crate once that shape
+//! is abstracted into a protocol-level `ModuleArtifact` type.
 //!
 //! # What's in this crate, what's not
 //!
@@ -100,7 +101,7 @@ pub use dispatcher::{
 pub use edge::EdgeLogic;
 pub use event_sink::{EventSink, NodeEventWrite};
 pub use graph_store::WorkflowGraphStore;
-pub use node_hook::NodeLifecycleHook;
+pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
 pub use retry::RetryPolicy;
 pub use secrets::{BoxError, SecretsResolver};
 pub use system_node::{JoinMode, SystemNodeKind};
