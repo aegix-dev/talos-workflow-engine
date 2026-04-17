@@ -74,4 +74,7 @@ pub mod approval;
 pub mod capture;
 pub mod dispatch;
 pub mod memory;
+pub mod minimal;
 pub mod noop;
+
+pub use minimal::minimal_engine;

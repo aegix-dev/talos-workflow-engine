@@ -73,40 +73,48 @@ use talos_workflow_engine_core::{
 // holds only an `Arc<dyn CheckpointStore>` and never talks to a
 // database directly.
 
-/// Create a temporary sandboxed directory for a workflow execution.
-/// Returns an Arc-wrapped cap-std Dir for secure file access.
-/// The directory is created under a per-process sandbox base path
-/// and should be cleaned up after workflow execution completes (see
-/// [`SandboxGuard`] for the `Drop`-based cleanup).
-fn create_execution_sandbox(execution_id: Uuid) -> Result<Arc<cap_std::fs::Dir>, String> {
-    let sandbox_base = std::path::PathBuf::from("/tmp/workflow-engine-sandboxes");
+/// Default sandbox root used when the engine has
+/// [`set_sandbox_root`](ParallelWorkflowEngine::set_sandbox_root)
+/// left at its out-of-the-box value. Configurable at engine-build time.
+pub const DEFAULT_SANDBOX_ROOT: &str = "/tmp/workflow-engine-sandboxes";
 
-    // Create base directory if it doesn't exist
-    std::fs::create_dir_all(&sandbox_base)
-        .map_err(|e| format!("Failed to create sandbox base directory: {}", e))?;
+/// Create a per-execution sandbox directory under `base`, rooted at
+/// `base/<execution_id>`. Returns a cap-std Dir handle for capability-
+/// based filesystem access from inside module dispatch.
+///
+/// Uses `create_dir_all` on both the base and per-execution paths; the
+/// base is a shared directory created once and reused across executions.
+/// Returns a structured error string; callers log and fall back to a
+/// `None` sandbox, so this function never panics.
+fn create_execution_sandbox(
+    base: &std::path::Path,
+    execution_id: Uuid,
+) -> Result<(Arc<cap_std::fs::Dir>, std::path::PathBuf), String> {
+    std::fs::create_dir_all(base)
+        .map_err(|e| format!("Failed to create sandbox base directory: {e}"))?;
 
-    // Create execution-specific sandbox directory
-    let sandbox_path = sandbox_base.join(execution_id.to_string());
+    let sandbox_path = base.join(execution_id.to_string());
     std::fs::create_dir_all(&sandbox_path)
-        .map_err(|e| format!("Failed to create execution sandbox directory: {}", e))?;
+        .map_err(|e| format!("Failed to create execution sandbox directory: {e}"))?;
 
-    // Open directory with cap-std for capability-based security
-    cap_std::fs::Dir::open_ambient_dir(&sandbox_path, cap_std::ambient_authority())
+    let dir = cap_std::fs::Dir::open_ambient_dir(&sandbox_path, cap_std::ambient_authority())
         .map(Arc::new)
-        .map_err(|e| format!("Failed to open sandbox directory with cap-std: {}", e))
+        .map_err(|e| format!("Failed to open sandbox directory with cap-std: {e}"))?;
+    Ok((dir, sandbox_path))
 }
 
-/// RAII guard that removes the execution sandbox directory when dropped.
-/// This ensures cleanup happens even if the execution task panics.
+/// RAII guard that removes the execution sandbox directory when
+/// dropped. Carries the full resolved path so cleanup doesn't depend
+/// on the engine's `sandbox_root` still matching what it was at
+/// creation time.
 struct SandboxGuard {
     execution_id: Uuid,
+    sandbox_path: std::path::PathBuf,
 }
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
-        let sandbox_path = std::path::PathBuf::from("/tmp/workflow-engine-sandboxes")
-            .join(self.execution_id.to_string());
-        if let Err(e) = std::fs::remove_dir_all(&sandbox_path) {
+        if let Err(e) = std::fs::remove_dir_all(&self.sandbox_path) {
             tracing::warn!(
                 "Failed to cleanup execution sandbox {}: {}",
                 self.execution_id,
@@ -443,6 +451,18 @@ pub struct ParallelWorkflowEngine {
     /// In production writes to `execution_approvals`; tests can plug
     /// in an auto-approve or auto-deny impl.
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
+    /// Root directory under which per-execution scratch sandboxes are
+    /// created. `Some(path)` → `<path>/<execution_id>` is created at
+    /// run-start and torn down at run-end (RAII guard cleans up even on
+    /// panic). `None` → sandbox creation is skipped entirely; modules
+    /// that request filesystem scratch space will observe `None` and
+    /// fall back to in-memory paths.
+    ///
+    /// Defaults to `Some(PathBuf::from(`[`DEFAULT_SANDBOX_ROOT`]`))`.
+    /// Use [`set_sandbox_root`](Self::set_sandbox_root) to change or
+    /// disable, e.g. when running on a read-only filesystem, Windows,
+    /// or a sandboxed container.
+    sandbox_root: Option<std::path::PathBuf>,
 }
 
 impl Default for ParallelWorkflowEngine {
@@ -477,6 +497,7 @@ pub struct AdapterSet {
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
     dry_run: bool,
+    sandbox_root: Option<std::path::PathBuf>,
 }
 
 impl AdapterSet {
@@ -514,6 +535,7 @@ impl AdapterSet {
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
         engine.dry_run = self.dry_run;
+        engine.sandbox_root = self.sandbox_root;
         engine
     }
 }
@@ -727,6 +749,206 @@ fn sanitize_node_output(output: &mut serde_json::Value) {
     }
 }
 
+/// Parse an LLM/agent-specific `SystemNodeKind` from a React-Flow
+/// node's `kind` + `data` fields. Returns `None` for kinds this
+/// helper doesn't recognize.
+///
+/// Lives in its own function so the LLM parsing surface can be
+/// cfg-gated as a single unit. When `llm-primitives` is disabled,
+/// the stub body returns `None` for every kind — graphs that
+/// reference these kinds parse as `None`-kind nodes and the engine
+/// rejects them at execution time.
+#[cfg(feature = "llm-primitives")]
+fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKind> {
+    if k == "agent_loop" {
+        let data = node.get("data")?;
+        Some(SystemNodeKind::AgentLoop {
+            body_workflow_id: data.get("body_workflow_id")?.as_str()?.parse().ok()?,
+            max_iterations: data
+                .get("max_iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .min(50) as u32,
+            inject_history: data
+                .get("inject_history")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            timeout_secs: data
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(60),
+        })
+    } else if k == "judge" {
+        let data = node.get("data").unwrap_or(&JsonValue::Null);
+        let judge_workflow_id = data
+            .get("judge_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let rubric = data
+            .get("rubric")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
+        let timeout_secs = data
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+        Some(SystemNodeKind::Judge {
+            judge_workflow_id,
+            rubric,
+            pass_threshold,
+            timeout_secs,
+        })
+    } else if k == "ensemble" {
+        let data = node.get("data").unwrap_or(&JsonValue::Null);
+        let child_workflow_id = data
+            .get("child_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let count = data
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3)
+            .min(10)
+            .max(2) as u32;
+        let consensus = data
+            .get("consensus")
+            .and_then(|v| v.as_str())
+            .unwrap_or("majority_vote")
+            .to_string();
+        let judge_workflow_id = data
+            .get("judge_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
+        let timeout_secs = data
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+        Some(SystemNodeKind::Ensemble {
+            child_workflow_id,
+            count,
+            consensus,
+            judge_workflow_id,
+            timeout_secs,
+        })
+    } else if k == "confidence_gate" {
+        let data = node.get("data").unwrap_or(&JsonValue::Null);
+        let threshold = data
+            .get("threshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.7)
+            .clamp(0.0, 1.0);
+        let confidence_path = data
+            .get("confidence_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("__confidence__")
+            .to_string();
+        let on_low_confidence = data
+            .get("on_low_confidence")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pause")
+            .to_string();
+        Some(SystemNodeKind::ConfidenceGate {
+            threshold,
+            confidence_path,
+            on_low_confidence,
+        })
+    } else if k == "reflective_retry" {
+        let data = node.get("data").unwrap_or(&JsonValue::Null);
+        let child_workflow_id = data
+            .get("child_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let reflection_workflow_id = data
+            .get("reflection_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let max_retries = data
+            .get("max_retries")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2)
+            .min(5)
+            .max(1) as u32;
+        let timeout_secs = data
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+        Some(SystemNodeKind::ReflectiveRetry {
+            child_workflow_id,
+            reflection_workflow_id,
+            max_retries,
+            timeout_secs,
+        })
+    } else if k == "llm_dispatch" {
+        let data = node.get("data").unwrap_or(&JsonValue::Null);
+        let classifier_workflow_id = data
+            .get("classifier_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let routes: std::collections::HashMap<String, uuid::Uuid> = data
+            .get("routes")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_str()
+                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                            .map(|uid| (k.clone(), uid))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fallback_workflow_id = data
+            .get("fallback_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
+        let timeout_secs = data
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+        Some(SystemNodeKind::LlmDispatch {
+            classifier_workflow_id,
+            routes,
+            fallback_workflow_id,
+            timeout_secs,
+        })
+    } else if k == "react_loop" {
+        let data = node.get("data")?;
+        Some(SystemNodeKind::ReActLoop {
+            body_workflow_id: data.get("body_workflow_id")?.as_str()?.parse().ok()?,
+            max_iterations: data
+                .get("max_iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .min(50) as u32,
+            inject_history: data
+                .get("inject_history")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            timeout_secs: data
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(60),
+        })
+    } else {
+        None
+    }
+}
+
+/// Stub that returns `None` for every input. Active when the
+/// `llm-primitives` feature is disabled — graphs that reference
+/// LLM-flavored kinds parse as `None`-kind nodes.
+#[cfg(not(feature = "llm-primitives"))]
+fn parse_llm_system_node_kind(_k: &str, _node: &JsonValue) -> Option<SystemNodeKind> {
+    None
+}
+
 impl ParallelWorkflowEngine {
     pub fn new() -> Self {
         Self {
@@ -755,7 +977,27 @@ impl ParallelWorkflowEngine {
             retry_classifier: None,
             module_execution_store: None,
             approval_gate: None,
+            sandbox_root: Some(std::path::PathBuf::from(DEFAULT_SANDBOX_ROOT)),
         }
+    }
+
+    /// Override the per-execution sandbox root.
+    ///
+    /// * `Some(path)` — every execution creates `<path>/<execution_id>`
+    ///   at run-start and tears it down at run-end (RAII cleanup runs
+    ///   even on panic). `<path>` itself is created with
+    ///   [`std::fs::create_dir_all`] if missing — operators supply a
+    ///   writable directory at startup.
+    /// * `None` — sandbox creation is skipped entirely. Useful on
+    ///   read-only filesystems, Windows without a writable `/tmp`
+    ///   equivalent, or locked-down container environments. Modules
+    ///   that request filesystem scratch space will observe `None` and
+    ///   fall back to in-memory paths.
+    ///
+    /// The default is `Some(`[`DEFAULT_SANDBOX_ROOT`]`)` for backwards
+    /// compatibility with the engine's pre-0.1 behavior.
+    pub fn set_sandbox_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.sandbox_root = root;
     }
 
     /// Replace the default approval gate. Out-of-tree consumers plug
@@ -825,6 +1067,7 @@ impl ParallelWorkflowEngine {
             user_id: self.user_id,
             actor_id: self.actor_id,
             dry_run: self.dry_run,
+            sandbox_root: self.sandbox_root.clone(),
         }
     }
 
@@ -1179,16 +1422,19 @@ impl ParallelWorkflowEngine {
                 Some(SystemNodeKind::SubWorkflow { workflow_id, .. }) => {
                     ids.insert(*workflow_id);
                 }
+                #[cfg(feature = "llm-primitives")]
                 Some(SystemNodeKind::AgentLoop {
                     body_workflow_id, ..
                 }) => {
                     ids.insert(*body_workflow_id);
                 }
+                #[cfg(feature = "llm-primitives")]
                 Some(SystemNodeKind::Judge {
                     judge_workflow_id, ..
                 }) => {
                     ids.insert(*judge_workflow_id);
                 }
+                #[cfg(feature = "llm-primitives")]
                 Some(SystemNodeKind::Ensemble {
                     child_workflow_id,
                     judge_workflow_id,
@@ -1199,6 +1445,7 @@ impl ParallelWorkflowEngine {
                         ids.insert(*jid);
                     }
                 }
+                #[cfg(feature = "llm-primitives")]
                 Some(SystemNodeKind::ReflectiveRetry {
                     child_workflow_id,
                     reflection_workflow_id,
@@ -1207,6 +1454,7 @@ impl ParallelWorkflowEngine {
                     ids.insert(*child_workflow_id);
                     ids.insert(*reflection_workflow_id);
                 }
+                #[cfg(feature = "llm-primitives")]
                 Some(SystemNodeKind::LlmDispatch {
                     classifier_workflow_id,
                     routes,
@@ -1221,6 +1469,7 @@ impl ParallelWorkflowEngine {
                         ids.insert(*fb);
                     }
                 }
+                #[cfg(feature = "llm-primitives")]
                 Some(SystemNodeKind::ReActLoop {
                     body_workflow_id, ..
                 }) => {
@@ -1486,28 +1735,6 @@ impl ParallelWorkflowEngine {
                                     .unwrap_or("error")
                                     .to_string(),
                             })
-                        } else if k == "agent_loop" {
-                            let data = node.get("data")?;
-                            Some(SystemNodeKind::AgentLoop {
-                                body_workflow_id: data
-                                    .get("body_workflow_id")?
-                                    .as_str()?
-                                    .parse()
-                                    .ok()?,
-                                max_iterations: data
-                                    .get("max_iterations")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(10)
-                                    .min(50) as u32,
-                                inject_history: data
-                                    .get("inject_history")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(true),
-                                timeout_secs: data
-                                    .get("timeout_secs")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(60),
-                            })
                         } else if k == "dispatch" {
                             let data = node.get("data")?;
                             Some(SystemNodeKind::DynamicDispatch {
@@ -1538,149 +1765,9 @@ impl ParallelWorkflowEngine {
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(30),
                             })
-                        } else if k == "judge" {
-                            let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let judge_workflow_id = data
-                                .get("judge_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                .unwrap_or_else(uuid::Uuid::nil);
-                            let rubric = data
-                                .get("rubric")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let pass_threshold =
-                                data.get("pass_threshold").and_then(|v| v.as_f64());
-                            let timeout_secs = data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(60);
-                            Some(SystemNodeKind::Judge {
-                                judge_workflow_id,
-                                rubric,
-                                pass_threshold,
-                                timeout_secs,
-                            })
-                        } else if k == "ensemble" {
-                            let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let child_workflow_id = data
-                                .get("child_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                .unwrap_or_else(uuid::Uuid::nil);
-                            let count = data
-                                .get("count")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(3)
-                                .min(10)
-                                .max(2) as u32;
-                            let consensus = data
-                                .get("consensus")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("majority_vote")
-                                .to_string();
-                            let judge_workflow_id = data
-                                .get("judge_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                            let timeout_secs = data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(60);
-                            Some(SystemNodeKind::Ensemble {
-                                child_workflow_id,
-                                count,
-                                consensus,
-                                judge_workflow_id,
-                                timeout_secs,
-                            })
-                        } else if k == "confidence_gate" {
-                            let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let threshold = data
-                                .get("threshold")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.7)
-                                .clamp(0.0, 1.0);
-                            let confidence_path = data
-                                .get("confidence_path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("__confidence__")
-                                .to_string();
-                            let on_low_confidence = data
-                                .get("on_low_confidence")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("pause")
-                                .to_string();
-                            Some(SystemNodeKind::ConfidenceGate {
-                                threshold,
-                                confidence_path,
-                                on_low_confidence,
-                            })
-                        } else if k == "reflective_retry" {
-                            let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let child_workflow_id = data
-                                .get("child_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                .unwrap_or_else(uuid::Uuid::nil);
-                            let reflection_workflow_id = data
-                                .get("reflection_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                .unwrap_or_else(uuid::Uuid::nil);
-                            let max_retries = data
-                                .get("max_retries")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(2)
-                                .min(5)
-                                .max(1) as u32;
-                            let timeout_secs = data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(60);
-                            Some(SystemNodeKind::ReflectiveRetry {
-                                child_workflow_id,
-                                reflection_workflow_id,
-                                max_retries,
-                                timeout_secs,
-                            })
-                        } else if k == "llm_dispatch" {
-                            let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                            let classifier_workflow_id = data
-                                .get("classifier_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                .unwrap_or_else(uuid::Uuid::nil);
-                            let routes: std::collections::HashMap<String, uuid::Uuid> = data
-                                .get("routes")
-                                .and_then(|v| v.as_object())
-                                .map(|map| {
-                                    map.iter()
-                                        .filter_map(|(k, v)| {
-                                            v.as_str()
-                                                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                                .map(|uid| (k.clone(), uid))
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let fallback_workflow_id = data
-                                .get("fallback_workflow_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                            let timeout_secs = data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(60);
-                            Some(SystemNodeKind::LlmDispatch {
-                                classifier_workflow_id,
-                                routes,
-                                fallback_workflow_id,
-                                timeout_secs,
-                            })
                         } else {
-                            None
+                            // LLM/agent-specific kinds (feature-gated).
+                            parse_llm_system_node_kind(k, node)
                         }
                     });
                     // Extract per-node retry policy from graph_json
@@ -1856,28 +1943,6 @@ impl ParallelWorkflowEngine {
                                 .unwrap_or("error")
                                 .to_string(),
                         })
-                    } else if k == "agent_loop" {
-                        let data = node.get("data")?;
-                        Some(SystemNodeKind::AgentLoop {
-                            body_workflow_id: data
-                                .get("body_workflow_id")?
-                                .as_str()?
-                                .parse()
-                                .ok()?,
-                            max_iterations: data
-                                .get("max_iterations")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(10)
-                                .min(50) as u32,
-                            inject_history: data
-                                .get("inject_history")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(true),
-                            timeout_secs: data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(60),
-                        })
                     } else if k == "dispatch" {
                         let data = node.get("data")?;
                         Some(SystemNodeKind::DynamicDispatch {
@@ -1908,148 +1973,9 @@ impl ParallelWorkflowEngine {
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(30),
                         })
-                    } else if k == "judge" {
-                        let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let judge_workflow_id = data
-                            .get("judge_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                            .unwrap_or_else(uuid::Uuid::nil);
-                        let rubric = data
-                            .get("rubric")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
-                        let timeout_secs = data
-                            .get("timeout_secs")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(60);
-                        Some(SystemNodeKind::Judge {
-                            judge_workflow_id,
-                            rubric,
-                            pass_threshold,
-                            timeout_secs,
-                        })
-                    } else if k == "ensemble" {
-                        let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let child_workflow_id = data
-                            .get("child_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                            .unwrap_or_else(uuid::Uuid::nil);
-                        let count = data
-                            .get("count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(3)
-                            .min(10)
-                            .max(2) as u32;
-                        let consensus = data
-                            .get("consensus")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("majority_vote")
-                            .to_string();
-                        let judge_workflow_id = data
-                            .get("judge_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                        let timeout_secs = data
-                            .get("timeout_secs")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(60);
-                        Some(SystemNodeKind::Ensemble {
-                            child_workflow_id,
-                            count,
-                            consensus,
-                            judge_workflow_id,
-                            timeout_secs,
-                        })
-                    } else if k == "confidence_gate" {
-                        let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let threshold = data
-                            .get("threshold")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.7)
-                            .clamp(0.0, 1.0);
-                        let confidence_path = data
-                            .get("confidence_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("__confidence__")
-                            .to_string();
-                        let on_low_confidence = data
-                            .get("on_low_confidence")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("pause")
-                            .to_string();
-                        Some(SystemNodeKind::ConfidenceGate {
-                            threshold,
-                            confidence_path,
-                            on_low_confidence,
-                        })
-                    } else if k == "reflective_retry" {
-                        let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let child_workflow_id = data
-                            .get("child_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                            .unwrap_or_else(uuid::Uuid::nil);
-                        let reflection_workflow_id = data
-                            .get("reflection_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                            .unwrap_or_else(uuid::Uuid::nil);
-                        let max_retries = data
-                            .get("max_retries")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(2)
-                            .min(5)
-                            .max(1) as u32;
-                        let timeout_secs = data
-                            .get("timeout_secs")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(60);
-                        Some(SystemNodeKind::ReflectiveRetry {
-                            child_workflow_id,
-                            reflection_workflow_id,
-                            max_retries,
-                            timeout_secs,
-                        })
-                    } else if k == "llm_dispatch" {
-                        let data = node.get("data").unwrap_or(&serde_json::Value::Null);
-                        let classifier_workflow_id = data
-                            .get("classifier_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                            .unwrap_or_else(uuid::Uuid::nil);
-                        let routes: std::collections::HashMap<String, uuid::Uuid> = data
-                            .get("routes")
-                            .and_then(|v| v.as_object())
-                            .map(|map| {
-                                map.iter()
-                                    .filter_map(|(k, v)| {
-                                        v.as_str()
-                                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                                            .map(|uid| (k.clone(), uid))
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let fallback_workflow_id = data
-                            .get("fallback_workflow_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-                        let timeout_secs = data
-                            .get("timeout_secs")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(60);
-                        Some(SystemNodeKind::LlmDispatch {
-                            classifier_workflow_id,
-                            routes,
-                            fallback_workflow_id,
-                            timeout_secs,
-                        })
                     } else {
-                        None
+                        // LLM/agent-specific kinds (feature-gated).
+                        parse_llm_system_node_kind(k, node)
                     }
                 });
                 self.add_node(node_id, None, None, kind);
@@ -3604,18 +3530,27 @@ impl ParallelWorkflowEngine {
 
         // Create temporary sandboxed directory for this execution.
         // _sandbox_guard ensures the directory is removed even if this task panics.
-        let (execution_sandbox, _sandbox_guard) = match create_execution_sandbox(execution_id) {
-            Ok(sandbox) => {
-                tracing::debug!("Created execution sandbox: {}", execution_id);
-                (Some(sandbox), Some(SandboxGuard { execution_id }))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create execution sandbox: {}. File I/O will be unavailable.",
-                    e
-                );
-                (None, None)
-            }
+        let (execution_sandbox, _sandbox_guard) = match self.sandbox_root.as_deref() {
+            Some(base) => match create_execution_sandbox(base, execution_id) {
+                Ok((sandbox, sandbox_path)) => {
+                    tracing::debug!("Created execution sandbox: {}", execution_id);
+                    (
+                        Some(sandbox),
+                        Some(SandboxGuard {
+                            execution_id,
+                            sandbox_path,
+                        }),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create execution sandbox: {}. File I/O will be unavailable.",
+                        e
+                    );
+                    (None, None)
+                }
+            },
+            None => (None, None),
         };
 
         // Verify DAG – simple cycle check.
@@ -4350,6 +4285,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Judge dispatch (LLM-as-Judge evaluation) ─────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((
                     _,
                     _,
@@ -4392,6 +4328,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Ensemble dispatch (self-consistency / ensemble voting) ────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((
                     _,
                     _,
@@ -4437,6 +4374,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── ConfidenceGate dispatch ───────────────────────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((
                     _,
                     _,
@@ -4485,6 +4423,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── ReflectiveRetry dispatch ──────────────────────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((
                     _,
                     _,
@@ -4527,6 +4466,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── LlmDispatch dispatch (LLM-based routing) ──────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((
                     _,
                     _,
@@ -4569,6 +4509,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── AgentLoop dispatch (ReAct-style iterative sub-workflow execution) ──
+                #[cfg(feature = "llm-primitives")]
                 if let Some((
                     _,
                     _,
@@ -6636,21 +6577,32 @@ impl ParallelWorkflowEngine {
         // regex-based scrubs (crate::dlp::redact_*) run in a second pass
         // on top via `self.redact_str` / `self.redact_json`.
         let exec_ctx = self.new_execution_sanitizer();
+        // Clone so the `async move` closure owns it without borrowing `self`.
+        let sandbox_root = self.sandbox_root.clone();
         Box::pin(async move {
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
             let result = tokio::time::timeout(timeout_duration, async {
-        let (execution_sandbox, _sandbox_guard) = match create_execution_sandbox(execution_id) {
-            Ok(sandbox) => {
-                tracing::debug!("Created execution sandbox: {}", execution_id);
-                (Some(sandbox), Some(SandboxGuard { execution_id }))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create execution sandbox: {}. File I/O will be unavailable.",
-                    e
-                );
-                (None, None)
-            }
+        let (execution_sandbox, _sandbox_guard) = match sandbox_root.as_deref() {
+            Some(base) => match create_execution_sandbox(base, execution_id) {
+                Ok((sandbox, sandbox_path)) => {
+                    tracing::debug!("Created execution sandbox: {}", execution_id);
+                    (
+                        Some(sandbox),
+                        Some(SandboxGuard {
+                            execution_id,
+                            sandbox_path,
+                        }),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create execution sandbox: {}. File I/O will be unavailable.",
+                        e
+                    );
+                    (None, None)
+                }
+            },
+            None => (None, None),
         };
 
         if petgraph::algo::is_cyclic_directed(&self.graph) {
@@ -6868,6 +6820,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Judge dispatch (LLM-as-Judge evaluation) [run_with_seed] ──
+                #[cfg(feature = "llm-primitives")]
                 if let Some((_, _, Some(SystemNodeKind::Judge { judge_workflow_id, ref rubric, pass_threshold, timeout_secs: _ }))) =
                     self.node_meta.get(&node_id)
                 {
@@ -6898,6 +6851,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Ensemble dispatch (self-consistency) [run_with_seed] ──────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((_, _, Some(SystemNodeKind::Ensemble { child_workflow_id, count, ref consensus, judge_workflow_id, timeout_secs: _ }))) =
                     self.node_meta.get(&node_id)
                 {
@@ -6930,6 +6884,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── ConfidenceGate dispatch [run_with_seed] ───────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((_, _, Some(SystemNodeKind::ConfidenceGate { threshold, ref confidence_path, ref on_low_confidence }))) =
                     self.node_meta.get(&node_id)
                 {
@@ -6955,6 +6910,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── ReflectiveRetry dispatch [run_with_seed] ──────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((_, _, Some(SystemNodeKind::ReflectiveRetry { child_workflow_id, reflection_workflow_id, max_retries, timeout_secs: _ }))) =
                     self.node_meta.get(&node_id)
                 {
@@ -6985,6 +6941,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── LlmDispatch dispatch [run_with_seed] ──────────────────────
+                #[cfg(feature = "llm-primitives")]
                 if let Some((_, _, Some(SystemNodeKind::LlmDispatch { classifier_workflow_id, ref routes, fallback_workflow_id, timeout_secs: _ }))) =
                     self.node_meta.get(&node_id)
                 {
@@ -7015,6 +6972,7 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── AgentLoop dispatch (ReAct-style iterative sub-workflow) ─
+                #[cfg(feature = "llm-primitives")]
                 if let Some((_, _, Some(SystemNodeKind::AgentLoop { body_workflow_id, max_iterations, inject_history, timeout_secs }))) =
                     self.node_meta.get(&node_id)
                 {

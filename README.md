@@ -37,16 +37,28 @@ storage, secrets, and observability.
 
 ## Design principles
 
-- **Pluggable everything.** Every external-I/O boundary (transport,
-  storage, secrets, events, sanitizers) is a trait. No crate in this
-  workspace talks to Postgres, Redis, S3, or the filesystem directly.
+- **Pluggable I/O boundaries.** Transport, graph storage, secrets,
+  events, sanitizers, module fetch, approval gates, retry
+  classification, and expression evaluation are all traits. No crate
+  here opens a Postgres / Redis / S3 connection or spawns HTTP clients
+  on its own — consumers wire those in via trait impls.
 - **Dyn-compatible traits.** The engine holds `Arc<dyn Trait>` for
-  each boundary — no generics leaking through the scheduling loop.
+  each boundary — no generics leak through the scheduling loop.
 - **No runtime lock-in in `-core`.** The types + traits crate depends
   only on `async-trait`, `serde`, `serde_json`, `uuid`. You pick the
-  runtime in the executor crate.
-- **Security-by-default on the wire.** HMAC signing, fresh AES keys
-  per dispatch, reserved vault-path deny-lists for LLM providers.
+  async runtime in the executor crate.
+- **Security-by-default on the wire.** The optional
+  `talos-workflow-job-protocol` wire format ships HMAC signing, fresh
+  AES-GCM keys per dispatch, and a reserved vault-path deny-list for
+  LLM provider keys. The engine itself is wire-format-agnostic —
+  consumers who don't want the HMAC + AES envelope can implement
+  `NodeDispatcher` directly without it.
+- **Caveat (0.1):** the engine does create per-execution scratch
+  directories under a sandbox root (default `/tmp/workflow-engine-sandboxes`)
+  for modules that need a filesystem scratch space. Configure or
+  disable this via
+  [`ParallelWorkflowEngine::set_sandbox_root`](https://docs.rs/talos-workflow-engine)
+  (pass `None` to skip sandbox creation entirely).
 
 ## Quickstart
 

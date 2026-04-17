@@ -12,7 +12,7 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1", default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 cap-std = "3.4"
@@ -28,6 +28,15 @@ sha2 = "0.10"
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
 uuid = { version = "1.20", features = ["v4", "serde"] }
+
+[features]
+default = ["llm-primitives"]
+# Enables the engine-side dispatch for LLM/agent-specific sub-workflow
+# kinds (Judge, Ensemble, LlmDispatch, AgentLoop, ReActLoop,
+# ReflectiveRetry, ConfidenceGate). Propagates to `talos-workflow-engine-core`'s
+# `llm-primitives` feature so the variants are visible in the enum.
+# Drop the feature to compile a leaner binary for non-LLM use cases.
+llm-primitives = ["talos-workflow-engine-core/llm-primitives"]
 
 [lints.rust]
 unsafe_code = "forbid"

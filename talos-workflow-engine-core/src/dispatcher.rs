@@ -69,6 +69,30 @@ use crate::BoxError;
 /// that deviation; the reference NATS dispatcher does not honor them
 /// per-step because the underlying `PipelineJobRequest` wire format
 /// doesn't carry them.
+///
+/// # Construction
+///
+/// The struct exposes all fields as `pub`. For the common case of
+/// dispatching a node that doesn't need WASM/HMAC-shaped fields, use
+/// the functional-update syntax with [`Default`]:
+///
+/// ```no_run
+/// # use uuid::Uuid;
+/// # use serde_json::json;
+/// # use std::time::Duration;
+/// # use talos_workflow_engine_core::DispatchJob;
+/// let job = DispatchJob {
+///     execution_id: Uuid::new_v4(),
+///     node_id: Uuid::new_v4(),
+///     module_id: Uuid::new_v4(),
+///     input_payload: json!({ "msg": "hello" }),
+///     timeout: Duration::from_secs(30),
+///     ..Default::default()
+/// };
+/// ```
+///
+/// The [`DispatchJob::new`] constructor is equivalent shorthand for
+/// the four most-common required fields.
 #[derive(Clone)]
 pub struct DispatchJob {
     // ── Identity ─────────────────────────────────────────────────────
@@ -180,6 +204,81 @@ pub struct DispatchJob {
     pub emit_retry_events: bool,
 }
 
+impl Default for DispatchJob {
+    /// Populates every field with its documented default:
+    ///
+    /// * All `Uuid` fields → [`Uuid::nil()`]
+    /// * All `Option<...>` fields → `None`
+    /// * All `Vec<...>` fields → empty
+    /// * `input_payload` → `JsonValue::Null`
+    /// * `timeout` → [`Duration::ZERO`] — impls that require a positive
+    ///   budget must set this explicitly
+    /// * `max_fuel` → 0 — impls that enforce fuel read this as "no
+    ///   budget configured"
+    /// * `priority` → 100 (documented default)
+    /// * `emit_retry_events` → `true` (documented default)
+    /// * Everything else → `false` / 0 / `None`
+    fn default() -> Self {
+        Self {
+            execution_id: Uuid::nil(),
+            node_id: Uuid::nil(),
+            module_id: Uuid::nil(),
+            job_id: None,
+            user_id: Uuid::nil(),
+            actor_id: None,
+            module_uri: String::new(),
+            wasm_bytes: None,
+            expected_wasm_hash: None,
+            capability_world: None,
+            integration_name: None,
+            input_payload: JsonValue::Null,
+            timeout: Duration::ZERO,
+            max_fuel: 0,
+            allowed_hosts: Vec::new(),
+            allowed_methods: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_sql_operations: Vec::new(),
+            allow_tier2_exposure: false,
+            encrypted_secrets_ciphertext: Vec::new(),
+            encrypted_secrets_nonce: Vec::new(),
+            priority: 100,
+            dry_run: false,
+            max_retries: 0,
+            backoff_ms: 0,
+            retry_condition: None,
+            retry_delay_expr: None,
+            emit_retry_events: true,
+        }
+    }
+}
+
+impl DispatchJob {
+    /// Construct a [`DispatchJob`] with the four fields every dispatch
+    /// needs — the identity triple plus the input payload — leaving
+    /// every other field at its documented [`Default`].
+    ///
+    /// Callers that need WASM-flavored fields (`wasm_bytes`,
+    /// `capability_world`, `allowed_hosts`, `encrypted_secrets_*`, etc.)
+    /// populate them directly on the returned struct; the functional-
+    /// update idiom `DispatchJob { field: value, ..Default::default() }`
+    /// is equivalent when more than a handful of fields differ.
+    #[must_use]
+    pub fn new(
+        execution_id: Uuid,
+        node_id: Uuid,
+        module_id: Uuid,
+        input_payload: JsonValue,
+    ) -> Self {
+        Self {
+            execution_id,
+            node_id,
+            module_id,
+            input_payload,
+            ..Self::default()
+        }
+    }
+}
+
 impl fmt::Debug for DispatchJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Redact `input_payload` and the encrypted-secrets blobs so
@@ -283,7 +382,7 @@ pub struct ChainStepResult {
 /// can share a sandbox and avoid per-node round-trips. The dispatcher
 /// translates this into whatever batch format the backing transport
 /// supports.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChainDispatchRequest {
     /// Workflow execution the chain belongs to.
     pub workflow_execution_id: Uuid,

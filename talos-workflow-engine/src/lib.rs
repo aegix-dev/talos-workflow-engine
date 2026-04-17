@@ -17,7 +17,7 @@ pub mod vault_resolver;
 
 pub use engine::{
     detect_linear_chains, validate_config_patterns, AdapterSet, JudgeVerdict,
-    ParallelWorkflowEngine, SubflowError, DEFAULT_NODE_TIMEOUT_SECS,
+    ParallelWorkflowEngine, SubflowError, DEFAULT_NODE_TIMEOUT_SECS, DEFAULT_SANDBOX_ROOT,
 };
 pub use event_spawn::emit_event_spawn;
 pub use vault_resolver::{

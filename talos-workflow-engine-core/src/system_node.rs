@@ -1,5 +1,6 @@
 //! Built-in node taxonomy and fan-in join modes.
 
+#[cfg(feature = "llm-primitives")]
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,9 @@ pub enum SystemNodeKind {
     },
     /// ReAct-style agent loop running a body workflow with sliding-window
     /// history injection.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     AgentLoop {
         /// Workflow id of the per-iteration body.
         body_workflow_id: Uuid,
@@ -100,6 +104,9 @@ pub enum SystemNodeKind {
         timeout_secs: u64,
     },
     /// Run a judge workflow and parse its verdict.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     Judge {
         /// Workflow id of the judge.
         judge_workflow_id: Uuid,
@@ -111,6 +118,9 @@ pub enum SystemNodeKind {
         timeout_secs: u64,
     },
     /// Run N copies of a child workflow and consolidate their outputs.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     Ensemble {
         /// Workflow id of the child to replicate.
         child_workflow_id: Uuid,
@@ -124,6 +134,9 @@ pub enum SystemNodeKind {
         timeout_secs: u64,
     },
     /// Branch when a confidence signal falls below a threshold.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     ConfidenceGate {
         /// Minimum confidence required to take the pass path.
         threshold: f64,
@@ -147,6 +160,9 @@ pub enum SystemNodeKind {
         timeout_secs: u64,
     },
     /// Alternative agent-loop shape (reasoning + acting) with history.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     ReActLoop {
         /// Workflow id of the per-iteration body.
         body_workflow_id: Uuid,
@@ -158,6 +174,9 @@ pub enum SystemNodeKind {
         timeout_secs: u64,
     },
     /// Run a child; on failure, run a reflection workflow and retry.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     ReflectiveRetry {
         /// Workflow id of the primary child.
         child_workflow_id: Uuid,
@@ -169,6 +188,9 @@ pub enum SystemNodeKind {
         timeout_secs: u64,
     },
     /// Dispatch to one of several routes based on an LLM classifier.
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
     LlmDispatch {
         /// Workflow id of the classifier whose output selects the route.
         classifier_workflow_id: Uuid,

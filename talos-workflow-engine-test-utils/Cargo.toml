@@ -12,7 +12,8 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1", default-features = false }
+talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.1", default-features = false }
 async-trait = "0.1"
 dashmap = "6.1"
 serde_json = "1"
@@ -20,6 +21,15 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[features]
+default = ["llm-primitives"]
+# Propagates to sibling crates so helpers compile against the same
+# feature surface as the engine consumer.
+llm-primitives = [
+    "talos-workflow-engine-core/llm-primitives",
+    "talos-workflow-engine/llm-primitives",
+]
 
 [lints.rust]
 unsafe_code = "forbid"
