@@ -1,0 +1,38 @@
+[package]
+name = "workflow-engine-test-utils"
+version = "0.1.0"
+edition = "2021"
+description = "In-memory and capture implementations of every workflow-engine-core trait, for unit-testing executors without a database, secrets manager, or transport."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+workflow-engine-core = { path = "../workflow-engine-core" }
+async-trait = "0.1"
+dashmap = "6.1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+# `.lock().expect("poisoned")` panics on a genuinely unrecoverable
+# mutex state in test utilities — don't force every method into a
+# # Panics doc for a panic that can't fire in normal use.
+missing_panics_doc = "allow"
+# Fluent `with_*` builders return `Self`. Adding `#[must_use]` to each
+# is noise; the builder pattern's entire point is the chained return.
+return_self_not_must_use = "allow"
+# Manual `Debug` impls elide internal state (captured secret values,
+# raw event buffers) — the "all fields" lint is exactly wrong for our
+# intent-to-hide-state pattern.
+missing_fields_in_debug = "allow"
