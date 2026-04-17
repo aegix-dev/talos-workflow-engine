@@ -53,6 +53,26 @@ pub trait SecretEnvelope: Send + Sync {
     /// An empty `secrets` map is a valid input. Impls may return an
     /// empty `ciphertext` + empty `nonce` as a sentinel meaning
     /// "nothing to seal"; the reference impl does this.
+    ///
+    /// # Output contract (enforced by the engine)
+    ///
+    /// The engine validates every `seal` result against these rules
+    /// before forwarding the pair on the wire:
+    ///
+    /// 1. **Both empty, or both non-empty.** Returning a non-empty
+    ///    ciphertext with an empty nonce (or vice versa) is treated
+    ///    as a configuration bug and rejected.
+    /// 2. **When non-empty, the nonce MUST be at least 12 bytes.**
+    ///    AES-GCM's 96-bit nonce is the practical minimum; schemes
+    ///    with larger nonces (XChaCha20-Poly1305 at 192 bits)
+    ///    comfortably satisfy this bound. A shorter nonce is
+    ///    treated as a misconfigured envelope and rejected.
+    ///
+    /// Violations are logged at `tracing::error!` with the node id
+    /// and the envelope is treated as if it had returned an error —
+    /// the engine substitutes an empty sealed pair, which the
+    /// dispatcher forwards as "no secrets." This fails the node
+    /// (missing secrets) rather than sending corrupted ciphertext.
     async fn seal(
         &self,
         secrets: &HashMap<String, String>,

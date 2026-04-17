@@ -154,3 +154,48 @@ pub const VERIFICATION_CONDITION: &str = "__verification_condition__";
 
 /// Number of attempts the reflective-retry node made before returning.
 pub const REFLECTIVE_RETRY_ATTEMPTS: &str = "__reflective_retry_attempts__";
+
+// ── Agent / ReAct loops ─────────────────────────────────────────────
+
+/// Accumulator list written by loop nodes that concatenate
+/// per-iteration outputs (synthesize / collect flavour).
+pub const ACCUMULATED: &str = "__accumulated__";
+
+/// Sliding-window history the agent loop injects on the next
+/// iteration's input. Tuple-list of `(iteration, output)` values.
+pub const AGENT_HISTORY: &str = "__agent_history__";
+
+/// Index of the current iteration inside an agent / `ReAct` loop.
+pub const AGENT_ITERATION: &str = "__agent_iteration__";
+
+/// Flag written by the loop body signalling "continue iterating"
+/// (the loop reads this to decide whether to halt early).
+pub const CONTINUED: &str = "__continued";
+
+// ── Dispatch routing outputs ────────────────────────────────────────
+
+/// Label identifying which dispatch-kind routed this node
+/// (e.g. `"capability_dispatch"`, `"dynamic_dispatch"`).
+pub const DISPATCHED_BY: &str = "__dispatched_by";
+
+/// Human-readable name of the workflow that was dispatched to.
+pub const DISPATCHED_WORKFLOW_NAME: &str = "__dispatched_workflow_name";
+
+/// Capability labels that matched for a capability-dispatch target.
+pub const MATCHED_CAPABILITIES: &str = "__matched_capabilities";
+
+// ── Loop primitives ─────────────────────────────────────────────────
+
+/// Input captured at the start of a loop iteration so the body can
+/// reference the parent input regardless of intermediate writes.
+pub const LOOP_INPUT: &str = "__loop_input";
+
+/// Index of the current loop iteration. Zero-based.
+pub const LOOP_ITERATION: &str = "__loop_iteration";
+
+// ── Trigger context ─────────────────────────────────────────────────
+
+/// Original input payload that triggered this workflow execution —
+/// injected onto the synthetic trigger node so downstream branches
+/// can read the trigger payload even after intermediate transforms.
+pub const TRIGGER_INPUT: &str = "__trigger_input__";

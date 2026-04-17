@@ -701,6 +701,27 @@ pub(crate) async fn build_encrypted_secrets_for(
     }
     match envelope.seal(&secrets_map, worker_shared_key).await {
         Ok((ciphertext, nonce)) => {
+            // Validate the seal output structurally — a misconfigured
+            // envelope that returns a short nonce or a mismatched
+            // empty/non-empty pair would send corrupted bytes on the
+            // wire. Fail closed (empty ciphertext → node dispatches
+            // with no secrets → node fails cleanly) rather than
+            // forwarding the bad output.
+            if !validate_seal_output(&ciphertext, &nonce, node_id) {
+                return talos_workflow_job_protocol::EncryptedSecrets::default();
+            }
+            // Separate check: the envelope accepted the structural
+            // contract (returned the empty-empty sentinel) but did so
+            // on a non-empty input. We forwarded no secrets; the node
+            // is about to fail with a secrets-unavailable error, so
+            // surface the root cause in the logs.
+            if ciphertext.is_empty() && nonce.is_empty() {
+                tracing::error!(
+                    %node_id,
+                    secret_count = secrets_map.len(),
+                    "SecretEnvelope::seal returned the empty sentinel for a non-empty secrets map — node will dispatch without secrets"
+                );
+            }
             talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
         }
         Err(e) => {
@@ -710,6 +731,64 @@ pub(crate) async fn build_encrypted_secrets_for(
                 "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
             );
             talos_workflow_job_protocol::EncryptedSecrets::default()
+        }
+    }
+}
+
+/// Minimum AEAD nonce length accepted by the engine. AES-GCM's 96-bit
+/// nonce is the practical floor; XChaCha20-Poly1305 (192 bits) and
+/// other modern AEADs comfortably clear this bound. A shorter nonce
+/// almost certainly indicates a misconfigured envelope.
+const MIN_SEAL_NONCE_LEN: usize = 12;
+
+/// Validate a `SecretEnvelope::seal` output against the engine's
+/// documented structural invariants. Returns `true` when the output
+/// is safe to forward on the wire.
+///
+/// Structural rules checked (no caller-context semantics — pass the
+/// output of `seal` directly):
+///
+/// * `(empty, empty)` — accepted. Documented sentinel meaning
+///   "nothing to seal"; callers short-circuit on empty input before
+///   reaching here, so in practice this branch fires only if an
+///   impl returns empty for non-empty input — which, together with
+///   the caller's own empty-map filter, means no bytes are sent on
+///   the wire either way.
+/// * `(non-empty, non-empty)` with `nonce.len() >= 12` — accepted.
+///   12 bytes is the AEAD-nonce floor (AES-GCM's 96-bit nonce);
+///   schemes with larger nonces pass trivially.
+/// * Mismatched (one empty, one non-empty) — rejected.
+/// * `(non-empty, non-empty)` with `nonce.len() < 12` — rejected.
+///
+/// On rejection, logs at `tracing::error!` with the node id and the
+/// structural shape. See
+/// [`talos_workflow_engine_core::SecretEnvelope`] for the contract.
+fn validate_seal_output(ciphertext: &[u8], nonce: &[u8], node_id: Uuid) -> bool {
+    match (ciphertext.is_empty(), nonce.is_empty()) {
+        (true, true) => true,
+        (false, false) => {
+            if nonce.len() < MIN_SEAL_NONCE_LEN {
+                tracing::error!(
+                    %node_id,
+                    nonce_len = nonce.len(),
+                    min_len = MIN_SEAL_NONCE_LEN,
+                    "SecretEnvelope::seal returned a nonce shorter than the AEAD minimum — dispatching with empty ciphertext"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        _ => {
+            // Mismatched empty / non-empty pair: impossible to decrypt,
+            // almost certainly a bug in the envelope impl.
+            tracing::error!(
+                %node_id,
+                ciphertext_empty = ciphertext.is_empty(),
+                nonce_empty = nonce.is_empty(),
+                "SecretEnvelope::seal returned mismatched empty/non-empty (ciphertext, nonce) pair — dispatching with empty ciphertext"
+            );
+            false
         }
     }
 }
@@ -5122,7 +5201,7 @@ impl ParallelWorkflowEngine {
                                                             let mut sub_outputs =
                                                                 serde_json::Map::new();
                                                             sub_outputs.insert(
-                                                                "__dispatched_workflow_id"
+                                                                "__dispatched_workflow_id__"
                                                                     .to_string(),
                                                                 serde_json::json!(
                                                                     sub_wf_id.to_string()
@@ -5299,7 +5378,7 @@ impl ParallelWorkflowEngine {
                                                 Ok(ctx) => {
                                                     let mut sub_outputs = serde_json::Map::new();
                                                     sub_outputs.insert(
-                                                        "__dispatched_workflow_id".to_string(),
+                                                        "__dispatched_workflow_id__".to_string(),
                                                         serde_json::json!(sub_wf_id.to_string()),
                                                     );
                                                     sub_outputs.insert(
@@ -7403,7 +7482,7 @@ impl ParallelWorkflowEngine {
                                                     match sub_engine.run_with_seed_with_transport(dispatcher.clone(), worker_shared_key.clone(), initial_results, sub_execution_id).await {
                                                         Ok(ctx) => {
                                                             let mut sub_outputs = serde_json::Map::new();
-                                                            sub_outputs.insert("__dispatched_workflow_id".to_string(), serde_json::json!(sub_wf_id.to_string()));
+                                                            sub_outputs.insert("__dispatched_workflow_id__".to_string(), serde_json::json!(sub_wf_id.to_string()));
                                                             for (nid, output) in &ctx.results {
                                                                 if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
                                                                 let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
@@ -7505,7 +7584,7 @@ impl ParallelWorkflowEngine {
                                             match sub_engine.run_with_seed_with_transport(dispatcher.clone(), worker_shared_key.clone(), initial_results, sub_execution_id).await {
                                                 Ok(ctx) => {
                                                     let mut sub_outputs = serde_json::Map::new();
-                                                    sub_outputs.insert("__dispatched_workflow_id".to_string(), serde_json::json!(sub_wf_id.to_string()));
+                                                    sub_outputs.insert("__dispatched_workflow_id__".to_string(), serde_json::json!(sub_wf_id.to_string()));
                                                     sub_outputs.insert("__dispatched_by".to_string(), serde_json::json!("capability_dispatch"));
                                                     sub_outputs.insert("__dispatched_workflow_name".to_string(), serde_json::json!(sub_wf_name));
                                                     sub_outputs.insert("__matched_capabilities".to_string(), serde_json::json!(caps));
@@ -8869,5 +8948,55 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("c")
         );
+    }
+
+    // ── Seal output validation ──────────────────────────────────────
+
+    #[test]
+    fn seal_validation_accepts_both_empty() {
+        let node_id = Uuid::nil();
+        assert!(validate_seal_output(&[], &[], node_id));
+    }
+
+    #[test]
+    fn seal_validation_accepts_full_aes_gcm_shape() {
+        // 12-byte nonce (GCM minimum), arbitrary ciphertext ≥ 1 byte.
+        let node_id = Uuid::nil();
+        let ciphertext = vec![0u8; 32];
+        let nonce = vec![0u8; 12];
+        assert!(validate_seal_output(&ciphertext, &nonce, node_id));
+    }
+
+    #[test]
+    fn seal_validation_accepts_larger_nonce() {
+        // XChaCha20 nonces are 24 bytes — must still pass.
+        let node_id = Uuid::nil();
+        let ciphertext = vec![0u8; 16];
+        let nonce = vec![0u8; 24];
+        assert!(validate_seal_output(&ciphertext, &nonce, node_id));
+    }
+
+    #[test]
+    fn seal_validation_rejects_short_nonce() {
+        let node_id = Uuid::nil();
+        let ciphertext = vec![0u8; 32];
+        let nonce = vec![0u8; 8]; // below MIN_SEAL_NONCE_LEN
+        assert!(!validate_seal_output(&ciphertext, &nonce, node_id));
+    }
+
+    #[test]
+    fn seal_validation_rejects_empty_nonce_with_ciphertext() {
+        let node_id = Uuid::nil();
+        let ciphertext = vec![0u8; 32];
+        let nonce = vec![];
+        assert!(!validate_seal_output(&ciphertext, &nonce, node_id));
+    }
+
+    #[test]
+    fn seal_validation_rejects_empty_ciphertext_with_nonce() {
+        let node_id = Uuid::nil();
+        let ciphertext = vec![];
+        let nonce = vec![0u8; 12];
+        assert!(!validate_seal_output(&ciphertext, &nonce, node_id));
     }
 }
