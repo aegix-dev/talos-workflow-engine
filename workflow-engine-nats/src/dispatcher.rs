@@ -1,0 +1,668 @@
+//! [`NodeDispatcher`] implementation backed by the Talos NATS job
+//! protocol (`job_protocol::JobRequest` + HMAC signing).
+//!
+//! Takes a [`DispatchJob`] from the engine, builds a signed
+//! `JobRequest`, serializes it, publishes to the right priority
+//! subject, and runs the engine's retry loop (including `node_retrying`
+//! / `retry_skipped` event emission) until a `JobResult` comes back —
+//! then unwraps it into a [`DispatchResult`] the engine can consume.
+//!
+//! This adapter is where every Talos-specific detail of dispatch lives:
+//! wire-format version of the `JobRequest` struct, the HMAC signing
+//! algorithm, the topic convention, the result-signature verification,
+//! etc.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use job_protocol::{
+    EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
+    PipelineStep,
+};
+use uuid::Uuid;
+use workflow_engine::emit_event_spawn;
+use workflow_engine_core::{
+    BoxError, ChainDispatchRequest, ChainDispatchResult, ChainStepResult, DispatchJob,
+    DispatchResult, EventSink, ExpressionEvaluator, JobTransport, NodeDispatcher, NodeEventWrite,
+    RetryClassifier, StepStatus,
+};
+
+// NATS edge routing helpers.
+// `priority` enables topic-level priority lanes: jobs with priority >= 200
+// are routed to a dedicated `.priority` sub-topic so workers can subscribe
+// to high-priority work first.
+pub(crate) fn get_single_job_topic(user_id: Option<Uuid>, priority: u8) -> String {
+    let base =
+        if std::env::var("ENABLE_EDGE_ROUTING").unwrap_or_else(|_| "false".to_string()) == "true" {
+            if let Some(uid) = user_id {
+                format!("talos.jobs.{}", uid)
+            } else {
+                "talos.jobs".to_string()
+            }
+        } else {
+            "talos.jobs".to_string()
+        };
+    if priority >= 200 {
+        format!("{}.priority", base)
+    } else {
+        base
+    }
+}
+
+pub(crate) fn get_pipeline_job_topic(user_id: Option<Uuid>, priority: u8) -> String {
+    let base =
+        if std::env::var("ENABLE_EDGE_ROUTING").unwrap_or_else(|_| "false".to_string()) == "true" {
+            if let Some(uid) = user_id {
+                format!("talos.pipeline.jobs.{}", uid)
+            } else {
+                "talos.pipeline.jobs".to_string()
+            }
+        } else {
+            "talos.pipeline.jobs".to_string()
+        };
+    if priority >= 200 {
+        format!("{}.priority", base)
+    } else {
+        base
+    }
+}
+
+/// Dispatch a NATS request with retry and exponential backoff.
+///
+/// Retries both NATS delivery errors and application-level job failures.
+/// Timeouts are **not** retried because they indicate the job ran but took too long.
+pub(crate) async fn dispatch_with_retry(
+    transport: &dyn JobTransport,
+    topic: String,
+    payload: Vec<u8>,
+    timeout_secs: u64,
+    max_retries: u32,
+    base_backoff_ms: u64,
+) -> Result<Vec<u8>, String> {
+    let mut attempts: u32 = 0;
+    loop {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            transport.request(&topic, payload.clone()),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(e)) => {
+                attempts += 1;
+                if attempts > max_retries {
+                    return Err(format!(
+                        "Job dispatch failed after {} attempts: {}",
+                        attempts, e
+                    ));
+                }
+                let backoff = base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
+                // Add jitter (up to 25% of backoff) using system time nanos to
+                // avoid pulling in an extra RNG dependency.
+                let jitter = backoff / 4;
+                let jitter_val = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64
+                    % jitter.max(1);
+                let delay = backoff + jitter_val;
+                tracing::warn!(
+                    attempt = attempts,
+                    max_retries,
+                    backoff_ms = delay,
+                    "Job dispatch failed, retrying: {}",
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            Err(_timeout) => {
+                // Timeouts are NOT retried – they indicate the job ran but took too long.
+                return Err("Job execution timed out".to_string());
+            }
+        }
+    }
+}
+
+/// Execute a job via NATS with full retry logic for both transport and application errors.
+///
+/// Retries on:
+/// - NATS delivery failures (connection issues)
+/// - Application-level job failures (WASM module returns error)
+///
+/// Does NOT retry:
+/// - Timeouts (job ran but took too long)
+/// - Signature verification failures (security issue)
+/// - Serialization errors (deterministic failures)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_job_with_retry(
+    transport: &dyn JobTransport,
+    topic: String,
+    payload: Vec<u8>,
+    timeout_secs: u64,
+    max_retries: u32,
+    base_backoff_ms: u64,
+    worker_shared_key: Option<&[u8]>,
+    retry_condition: Option<&str>,
+    retry_delay_expr: Option<&str>,
+    // Optional event tracking: when provided, a `node_retrying` / `retry_skipped`
+    // event is emitted per retry so that `retries_attempted` (= start_count - 1)
+    // remains accurate in observers. Taken by value; `Arc<dyn EventSink>`
+    // clone is ~4ns per call and retry is not a hot path, so the saved
+    // refcount bump does not justify a `None`-awkward `&Option` param.
+    event_sink: Option<Arc<dyn EventSink>>,
+    event_execution_id: Uuid,
+    event_node_id: Uuid,
+    // Policy traits: the retry classifier decides transient-vs-permanent on
+    // unconditional failures, and the expression evaluator evaluates
+    // `retry_condition` / `retry_delay_expression` strings. Both are
+    // `&dyn` so the dispatcher owns shared `Arc`s internally and only
+    // passes references into the loop.
+    retry_classifier: &dyn RetryClassifier,
+    expression_evaluator: &dyn ExpressionEvaluator,
+) -> Result<serde_json::Value, String> {
+    let mut attempts: u32 = 0;
+    loop {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            transport.request(&topic, payload.clone()),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(response)) => {
+                // Parse job result
+                let job_result: JobResult = serde_json::from_slice(&response)
+                    .map_err(|e| format!("Failed to parse job result: {}", e))?;
+
+                // Verify signature if worker key is available
+                if let Some(key) = worker_shared_key {
+                    if let Err(e) = job_result.verify(key, 300) {
+                        return Err(format!("Job result signature verification failed: {}", e));
+                    }
+                }
+
+                // Check both job-level status AND payload-level success field.
+                // WASM modules like database-query return JobStatus::Success but
+                // include {"success": false, "error": "..."} in the payload when
+                // the query itself fails. We treat payload success:false as a
+                // retryable application error.
+                let payload_success_false = job_result
+                    .output_payload
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    == Some(false);
+
+                let is_success =
+                    matches!(job_result.status, JobStatus::Success) && !payload_success_false;
+
+                if is_success {
+                    return Ok(job_result.output_payload);
+                } else {
+                    // Application-level failure — check retry_condition before retrying.
+                    // Default to retry (true) on evaluation error: retry_condition is meant to
+                    // BLOCK retrying in known-permanent-error scenarios. If the condition can't
+                    // evaluate (e.g. the referenced variable isn't in the error payload), the
+                    // safer default is to let the retry happen rather than silently dropping it.
+                    if let Some(cond) = retry_condition {
+                        let should_retry = expression_evaluator
+                            .try_eval_bool(cond, &job_result.output_payload)
+                            .unwrap_or(true);
+                        if !should_retry {
+                            let err_msg = job_result
+                                .output_payload
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .map(String::from)
+                                .unwrap_or_else(|| job_result.output_payload.to_string());
+                            tracing::info!(
+                                retry_condition = cond,
+                                "Retry condition evaluated to false — skipping retries"
+                            );
+                            return Err(format!(
+                                "Job failed (retry_condition not met): {}",
+                                err_msg
+                            ));
+                        }
+                    }
+
+                    // Smart retry default: when no explicit retry_condition is set,
+                    // classify the error and skip retries for non-transient failures
+                    // (auth errors, fuel exhaustion, missing secrets, etc.).
+                    if retry_condition.is_none() && max_retries > 0 {
+                        let err_for_classify = job_result
+                            .output_payload
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("");
+                        let classification = retry_classifier.classify(err_for_classify);
+                        if !retry_classifier.is_transient(&classification) {
+                            tracing::info!(
+                                error_type = %classification,
+                                "Non-transient error classified — skipping retries \
+                                 (no retry_condition configured)"
+                            );
+                            emit_event_spawn(
+                                &event_sink,
+                                NodeEventWrite {
+                                    execution_id: event_execution_id,
+                                    event_type: "retry_skipped".to_string(),
+                                    node_id: Some(event_node_id),
+                                    status: "Failed".to_string(),
+                                    log_message: Some(format!(
+                                        "Retry skipped: error classified as '{}' (non-transient)",
+                                        classification
+                                    )),
+                                    iteration_index: None,
+                                },
+                            );
+                            return Err(format!(
+                                "Job failed (non-transient: {}): {}",
+                                classification, err_for_classify
+                            ));
+                        }
+                    }
+
+                    attempts += 1;
+                    if attempts > max_retries {
+                        let err_msg = job_result
+                            .output_payload
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| job_result.output_payload.to_string());
+                        return Err(format!(
+                            "Job failed after {} attempts: {}",
+                            attempts, err_msg
+                        ));
+                    }
+
+                    // Compute delay: try retry_delay_expression first, fall back to exponential backoff
+                    let delay = if let Some(expr) = retry_delay_expr {
+                        match expression_evaluator.eval_i64(expr, &job_result.output_payload) {
+                            Some(ms) if ms > 0 => (ms as u64).min(60_000),
+                            _ => {
+                                let backoff =
+                                    base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
+                                let jitter = backoff / 4;
+                                let jitter_val = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .subsec_nanos()
+                                    as u64
+                                    % jitter.max(1);
+                                backoff + jitter_val
+                            }
+                        }
+                    } else {
+                        let backoff = base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
+                        let jitter = backoff / 4;
+                        let jitter_val = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos() as u64
+                            % jitter.max(1);
+                        backoff + jitter_val
+                    };
+
+                    let err_msg = job_result
+                        .output_payload
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown error");
+                    tracing::warn!(
+                        attempt = attempts,
+                        max_retries,
+                        backoff_ms = delay,
+                        "Job execution failed, retrying: {}",
+                        err_msg
+                    );
+                    // Emit a `node_retrying` event (distinct from `node_started`)
+                    // so observers can tell retry attempts apart from initial
+                    // starts or fan-out parallel starts.  The attempt number is
+                    // stored in `iteration_index` (1 = first retry, 2 = second,
+                    // …) and in `log_message` for human readers.
+                    // `retries_attempted` in get_execution_trace counts
+                    // `node_retrying` rows, not `node_started` rows.
+                    let retry_num = attempts as i32; // 1-based: attempts was just incremented
+                    emit_event_spawn(
+                        &event_sink,
+                        NodeEventWrite {
+                            execution_id: event_execution_id,
+                            event_type: "node_retrying".to_string(),
+                            node_id: Some(event_node_id),
+                            status: "Running".to_string(),
+                            log_message: Some(format!("Retry attempt {}", retry_num)),
+                            iteration_index: Some(retry_num),
+                        },
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+            Ok(Err(e)) => {
+                // NATS delivery failure — retry
+                attempts += 1;
+                if attempts > max_retries {
+                    return Err(format!(
+                        "Job dispatch failed after {} attempts: {}",
+                        attempts, e
+                    ));
+                }
+                let backoff = base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
+                let jitter_val = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64
+                    % (backoff / 4).max(1);
+                let delay = backoff + jitter_val;
+                tracing::warn!(
+                    attempt = attempts,
+                    max_retries,
+                    backoff_ms = delay,
+                    "NATS dispatch failed, retrying: {}",
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            Err(_timeout) => {
+                return Err("Job execution timed out".to_string());
+            }
+        }
+    }
+}
+
+/// Dispatches workflow nodes via the Talos signed-NATS job protocol.
+///
+/// Built once per engine run from `(transport, event_sink,
+/// worker_shared_key)`. Holding an `Arc` of each collaborator keeps
+/// per-node dispatch cheap (single refcount bump).
+pub struct NatsNodeDispatcher {
+    transport: Arc<dyn JobTransport>,
+    event_sink: Option<Arc<dyn EventSink>>,
+    /// Shared key used for both HMAC signing of the request and
+    /// verification of the response. `None` disables signing — used by
+    /// test harnesses that don't need the round-trip.
+    worker_shared_key: Option<Arc<Vec<u8>>>,
+    /// Policy trait for classifying dispatch errors into
+    /// transient-vs-permanent. Drives the "smart retry default" path
+    /// (skip retries on auth / fuel / missing-secret errors even when
+    /// `max_retries > 0`).
+    retry_classifier: Arc<dyn RetryClassifier>,
+    /// Policy trait for evaluating `retry_condition` / `retry_delay_expression`
+    /// expressions against the error payload. Wraps the sandboxed
+    /// `rhai::Engine` in production; tests plug in their own impl.
+    expression_evaluator: Arc<dyn ExpressionEvaluator>,
+}
+
+impl NatsNodeDispatcher {
+    /// Build a dispatcher. `event_sink` may be `None` when there's no
+    /// execution-event persistence configured; `worker_shared_key` may
+    /// be `None` in test harnesses. `retry_classifier` and
+    /// `expression_evaluator` are required — they drive the retry loop's
+    /// classification + expression-evaluation decisions and have no
+    /// sensible no-op fallback (a dispatcher that classifies every
+    /// error as "transient" would retry forever on hard failures).
+    #[must_use]
+    pub fn new(
+        transport: Arc<dyn JobTransport>,
+        event_sink: Option<Arc<dyn EventSink>>,
+        worker_shared_key: Option<Arc<Vec<u8>>>,
+        retry_classifier: Arc<dyn RetryClassifier>,
+        expression_evaluator: Arc<dyn ExpressionEvaluator>,
+    ) -> Self {
+        Self {
+            transport,
+            event_sink,
+            worker_shared_key,
+            retry_classifier,
+            expression_evaluator,
+        }
+    }
+}
+
+impl std::fmt::Debug for NatsNodeDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsNodeDispatcher")
+            .field(
+                "worker_shared_key",
+                &self
+                    .worker_shared_key
+                    .as_ref()
+                    .map(|k| format!("<redacted; len={}>", k.len()))
+                    .unwrap_or_else(|| "None".to_string()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Slack added to the Tokio-outer retry timeout so the worker-side
+/// sandbox can finish gracefully before the outer timer cancels the
+/// request. The wire-format `timeout_ms` stays at the bare
+/// `DispatchJob::timeout` — only the cancellation wrap around
+/// `execute_job_with_retry` gets this extra grace.
+const TOKIO_WRAP_GRACE_SECS: u64 = 5;
+
+#[async_trait]
+impl NodeDispatcher for NatsNodeDispatcher {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        // 1. Assemble the wire-format `JobRequest`.
+        let mut req = JobRequest {
+            // Reuse a caller-supplied job id when present so a
+            // pre-INSERTed `module_executions` row with that id stays
+            // correlated with the worker's update. Fresh UUID
+            // otherwise.
+            job_id: job.job_id.unwrap_or_else(uuid::Uuid::new_v4),
+            workflow_execution_id: job.execution_id,
+            module_uri: job.module_uri,
+            input_payload: job.input_payload,
+            encrypted_secrets: EncryptedSecrets {
+                ciphertext: job.encrypted_secrets_ciphertext,
+                nonce: job.encrypted_secrets_nonce,
+            },
+            timeout_ms: job.timeout.as_millis() as u64,
+            priority: job.priority,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: job.allowed_hosts,
+            allowed_methods: job.allowed_methods,
+            allowed_secrets: job.allowed_secrets,
+            allowed_sql_operations: job.allowed_sql_operations,
+            allow_tier2_exposure: job.allow_tier2_exposure,
+            signature: vec![],
+            job_nonce: String::new(),
+            actor_id: job.actor_id,
+            wasm_bytes: job.wasm_bytes,
+            capability_world: job.capability_world,
+            integration_name: job.integration_name,
+            expected_wasm_hash: job.expected_wasm_hash,
+            max_fuel: job.max_fuel,
+            dry_run: job.dry_run,
+            user_id: job.user_id,
+        };
+
+        // 2. Sign.
+        if let Some(key) = self.worker_shared_key.as_deref() {
+            req.sign(key)
+                .map_err(|e| -> BoxError { format!("Failed to sign job request: {e}").into() })?;
+        }
+
+        // 3. Serialize.
+        let payload = serde_json::to_vec(&req)
+            .map_err(|e| -> BoxError { format!("Failed to serialize job request: {e}").into() })?;
+
+        // 4. Topic. Map `Uuid::nil()` back to `None` so `None` routes
+        // (edge routing disabled or no user context) stay on the
+        // tenant-agnostic `talos.jobs` subject instead of being sent
+        // to `talos.jobs.00000000-...` — which no worker subscribes to
+        // under `ENABLE_EDGE_ROUTING=true`.
+        let topic_user = if job.user_id.is_nil() {
+            None
+        } else {
+            Some(job.user_id)
+        };
+        let topic = get_single_job_topic(topic_user, req.priority);
+
+        // 5. Retry loop + result verification + event emission.
+        // `execute_job_with_retry` owns the outer cancellation wrap,
+        // retry classification, backoff+jitter, result signature
+        // verification, and `node_retrying` / `retry_skipped`
+        // emission. The outer wrap gets `TOKIO_WRAP_GRACE_SECS` of
+        // slack over the wire-format WASM budget.
+        let event_sink = if job.emit_retry_events {
+            self.event_sink.clone()
+        } else {
+            None
+        };
+        let output = execute_job_with_retry(
+            self.transport.as_ref(),
+            topic,
+            payload,
+            job.timeout.as_secs() + TOKIO_WRAP_GRACE_SECS,
+            job.max_retries,
+            job.backoff_ms,
+            self.worker_shared_key.as_deref().map(Vec::as_slice),
+            job.retry_condition.as_deref(),
+            job.retry_delay_expr.as_deref(),
+            event_sink,
+            job.execution_id,
+            job.node_id,
+            self.retry_classifier.as_ref(),
+            self.expression_evaluator.as_ref(),
+        )
+        .await
+        .map_err(|e| -> BoxError { e.into() })?;
+
+        Ok(DispatchResult { output })
+    }
+
+    async fn dispatch_chain(
+        &self,
+        request: ChainDispatchRequest,
+    ) -> Result<ChainDispatchResult, BoxError> {
+        // 1. Map `DispatchJob`s into wire-format `PipelineStep`s. The
+        // step shape is a strict subset of JobRequest's per-node fields
+        // (no per-step user/actor/dry_run — those are chain-level).
+        let steps: Vec<PipelineStep> = request
+            .steps
+            .iter()
+            .map(|job| PipelineStep {
+                module_id: job.module_id,
+                module_uri: job.module_uri.clone(),
+                wasm_bytes: job.wasm_bytes.clone(),
+                config: job.input_payload.clone(),
+                allowed_hosts: job.allowed_hosts.clone(),
+                allowed_methods: job.allowed_methods.clone(),
+                allowed_secrets: job.allowed_secrets.clone(),
+                allowed_sql_operations: job.allowed_sql_operations.clone(),
+                allow_tier2_exposure: job.allow_tier2_exposure,
+                encrypted_secrets: EncryptedSecrets {
+                    ciphertext: job.encrypted_secrets_ciphertext.clone(),
+                    nonce: job.encrypted_secrets_nonce.clone(),
+                },
+                max_fuel: job.max_fuel,
+                // Default per-step memory; the core trait no longer
+                // carries a per-job value (see the equivalent note in
+                // `dispatch` above for the rationale).
+                max_memory_mb: 128,
+                timeout_ms: job.timeout.as_millis() as u64,
+                priority: job.priority,
+                cancellation_token: None,
+                expected_wasm_hash: job.expected_wasm_hash.clone(),
+                integration_name: job.integration_name.clone(),
+            })
+            .collect();
+
+        let max_priority = steps.iter().map(|s| s.priority).max().unwrap_or(100);
+
+        // 2. Assemble the chain-level wire request.
+        let mut req = PipelineJobRequest {
+            job_id: request.job_id.unwrap_or_else(uuid::Uuid::new_v4),
+            workflow_execution_id: request.workflow_execution_id,
+            steps,
+            total_timeout_ms: request.total_timeout.as_millis() as u64,
+            share_sandbox: request.share_sandbox,
+            signature: vec![],
+            job_nonce: String::new(),
+            user_id: request.user_id,
+        };
+
+        // 3. Sign (chain-level HMAC, independent of any per-step signing).
+        if let Some(key) = self.worker_shared_key.as_deref() {
+            req.sign(key).map_err(|e| -> BoxError {
+                format!("Failed to sign pipeline request: {e}").into()
+            })?;
+        }
+
+        // 4. Serialize.
+        let payload = serde_json::to_vec(&req).map_err(|e| -> BoxError {
+            format!("Failed to serialize pipeline request: {e}").into()
+        })?;
+
+        // 5. Topic. Same nil→None mapping as single-node dispatch.
+        let topic_user = if request.user_id.is_nil() {
+            None
+        } else {
+            Some(request.user_id)
+        };
+        let topic = get_pipeline_job_topic(topic_user, max_priority);
+
+        // 6. Chain retry loop via `dispatch_with_retry` (not
+        // `execute_job_with_retry`). Chain-level retry observability
+        // is deliberately not emitted here — pipelines complete as a
+        // single unit at the engine level. When a chain-retry
+        // observability surface becomes a real need, add an
+        // `emit_retry_events` field back to `ChainDispatchRequest`
+        // and route through `execute_job_with_retry` with a synthetic
+        // per-attempt event.
+        let response_bytes = dispatch_with_retry(
+            self.transport.as_ref(),
+            topic,
+            payload,
+            request.total_timeout.as_secs(),
+            request.max_retries,
+            request.backoff_ms,
+        )
+        .await
+        .map_err(|e| -> BoxError { e.into() })?;
+
+        // 7. Parse + verify.
+        let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
+            .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
+        if let Some(key) = self.worker_shared_key.as_deref() {
+            result.verify(key, 300).map_err(|e| -> BoxError {
+                format!("Pipeline result signature verification failed: {e}").into()
+            })?;
+        }
+
+        // 8. Map per-step results back into the abstract shape.
+        let steps: Vec<ChainStepResult> = result
+            .step_results
+            .into_iter()
+            .map(|sr| ChainStepResult {
+                module_id: sr.module_id,
+                status: map_job_status(sr.status),
+                output: sr.output,
+                error: sr.error,
+                execution_time_ms: sr.execution_time_ms,
+            })
+            .collect();
+
+        Ok(ChainDispatchResult {
+            steps,
+            final_output: result.final_output,
+            overall_status: map_job_status(result.overall_status),
+        })
+    }
+}
+
+/// Job-protocol `JobStatus` → core `StepStatus`. Any unknown variant
+/// maps to `Failed` — the core trait's status taxonomy is deliberately
+/// narrower than the wire-format's, and callers only act on the
+/// three-way distinction.
+fn map_job_status(status: JobStatus) -> StepStatus {
+    match status {
+        JobStatus::Success => StepStatus::Success,
+        JobStatus::TimedOut => StepStatus::TimedOut,
+        _ => StepStatus::Failed,
+    }
+}
