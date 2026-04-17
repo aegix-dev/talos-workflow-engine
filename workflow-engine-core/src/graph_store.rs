@@ -86,7 +86,7 @@ pub trait WorkflowGraphStore: Send + Sync {
     ///
     /// Default impl returns `None` (out-of-tree consumers that don't
     /// support name-based dispatch can leave this unimplemented; the
-    /// engine's DynamicDispatch then only resolves UUID targets).
+    /// engine's `DynamicDispatch` then only resolves UUID targets).
     async fn resolve_by_name(
         &self,
         _name: &str,
