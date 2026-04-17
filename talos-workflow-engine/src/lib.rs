@@ -13,6 +13,7 @@
 
 mod engine;
 mod event_spawn;
+pub mod graph_builder;
 pub mod vault_resolver;
 
 pub use engine::{
@@ -20,6 +21,7 @@ pub use engine::{
     ParallelWorkflowEngine, SubflowError, DEFAULT_NODE_TIMEOUT_SECS, DEFAULT_SANDBOX_ROOT,
 };
 pub use event_spawn::emit_event_spawn;
+pub use graph_builder::WorkflowGraphBuilder;
 pub use vault_resolver::{
     extract_vault_refs, merge_vault_refs_into_allowlist, replace_vault_values, VaultRef,
 };

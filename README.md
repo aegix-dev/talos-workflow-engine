@@ -2,9 +2,40 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-A portable, pluggable workflow execution engine for Rust. Five crates
-that compose into a DAG-based executor with pluggable transport,
-storage, secrets, and observability.
+A Rust-native workflow engine for **WASM-sandboxed module execution**
+with **first-class AI/agent primitives** and a signed job protocol
+for dispatching to remote worker pools.
+
+## When to reach for this
+
+- You're building a **Rust-native AI agent orchestration platform**
+  and want workflow primitives like `Judge`, `Ensemble`,
+  `ReActLoop`, and `ConfidenceGate` as building blocks rather than
+  reimplementing them from `tokio::spawn`.
+- You're running a **WASM module executor** (wasmtime or similar)
+  and want a pluggable DAG scheduler that speaks your module format
+  natively via `WasmModuleArtifact` + signed NATS dispatch.
+- You need **durable-ish execution** — checkpoint/resume on `Wait`
+  nodes, retry-with-classifier, per-attempt observability — but
+  don't want to run a Temporal server.
+
+## When something else fits better
+
+- **Plain async DAGs in-process**, no durability: reach for
+  `tokio::join!` + `futures::future::join_all`. Much lower bar.
+- **Background job queues** (retry-on-failure, rate-limited workers,
+  no DAGs): use [`apalis`](https://crates.io/crates/apalis),
+  [`sqlxmq`](https://crates.io/crates/sqlxmq), or
+  [`faktory-rs`](https://crates.io/crates/faktory).
+- **Enterprise durable-execution / saga orchestration** with multi-
+  language SDKs: use [Temporal](https://temporal.io). Industry
+  standard.
+- **Python-centric LLM agent orchestration**:
+  [LangGraph](https://github.com/langchain-ai/langgraph) /
+  [CrewAI](https://github.com/joaomdmoura/crewai) have more mature
+  ecosystems in their language.
+- **Streaming dataflow or materialized views**:
+  [Arroyo](https://arroyo.dev) / [Materialize](https://materialize.com).
 
 ## The crates
 
@@ -83,7 +114,39 @@ talos-workflow-job-protocol = "0.1"  # transitive via -nats; add directly for cu
 talos-workflow-engine-test-utils = "0.1"
 ```
 
-See each crate's README for a worked example.
+Build a graph programmatically with
+[`WorkflowGraphBuilder`](https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.WorkflowGraphBuilder.html):
+
+```rust,ignore
+use std::time::Duration;
+use serde_json::json;
+use uuid::Uuid;
+use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowGraphBuilder};
+use talos_workflow_engine_core::SystemNodeKind;
+
+let module_id = Uuid::new_v4();
+let graph = WorkflowGraphBuilder::new()
+    .execution_timeout(Duration::from_secs(600))
+    .add_module("fetch", module_id, Some(json!({ "url": "..." })))
+    .add_system_node("split", SystemNodeKind::ForEach {
+        input_path: "items".into(),
+        output_handle: "element".into(),
+    })
+    .edge("fetch", "split")
+    .build();
+
+let mut engine = ParallelWorkflowEngine::new();
+// ... wire adapters via engine.set_* methods ...
+engine.load_graph_from_json(&serde_json::to_string(&graph)?).await?;
+```
+
+Or start with [`minimal_engine()`](https://docs.rs/talos-workflow-engine-test-utils/0.1/talos_workflow_engine_test_utils/fn.minimal_engine.html)
+from `talos-workflow-engine-test-utils` for a fully-wired engine with
+in-memory stubs ready to dispatch against.
+
+See each crate's README for deeper worked examples and
+[docs/graph-json-schema.md](./docs/graph-json-schema.md) for the
+full graph-JSON shape.
 
 ## Feature flags
 

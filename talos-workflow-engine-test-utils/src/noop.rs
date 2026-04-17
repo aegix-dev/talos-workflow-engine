@@ -1,9 +1,13 @@
 //! Policy impls that do nothing. Use these when a test doesn't care
 //! about the trait's output but the engine requires one to be wired.
 
+use std::collections::HashMap;
+
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use talos_workflow_engine_core::{
     BoxError, ExecutionSanitizer, ExpressionEvaluator, OutputSanitizer, RetryClassifier,
+    SecretEnvelope,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,6 +180,54 @@ impl ExpressionEvaluator for StubExpressionEvaluator {
 
     fn eval_json(&self, _expression: &str, _context: &JsonValue) -> Result<JsonValue, BoxError> {
         Ok(self.json_value.clone())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NoopSecretEnvelope
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// [`SecretEnvelope`] that seals every input to the empty-empty
+/// sentinel — returns `(Vec::new(), Vec::new())` on every call.
+///
+/// The engine's structural validator accepts `(empty, empty)` as the
+/// documented "nothing to seal" sentinel and forwards a node's
+/// dispatch with no secrets. This impl is therefore useful for
+/// **in-process executors** that never cross a trust boundary, for
+/// **unit tests** that don't care about secrets plumbing, and for
+/// **CI runs** that shouldn't depend on a shared signing key.
+///
+/// # Not for production use
+///
+/// `NoopSecretEnvelope` is deliberately safe-by-empty, not safe-by-
+/// encryption. If your workers actually need secrets on the wire,
+/// this envelope will dispatch nodes with an empty secrets map —
+/// those nodes will then fail at secrets-access time. The failure
+/// mode is "node cannot find its secrets," not "plaintext secrets
+/// on the wire." Do not wire this into a production controller.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+/// use talos_workflow_engine_core::SecretEnvelope;
+/// use talos_workflow_engine_test_utils::noop::NoopSecretEnvelope;
+///
+/// let envelope: Arc<dyn SecretEnvelope> = Arc::new(NoopSecretEnvelope);
+/// // Feed into `ParallelWorkflowEngine::set_secret_envelope(envelope)`
+/// // for in-process tests / no-secrets workflows.
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopSecretEnvelope;
+
+#[async_trait]
+impl SecretEnvelope for NoopSecretEnvelope {
+    async fn seal(
+        &self,
+        _secrets: &HashMap<String, String>,
+        _shared_key: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), BoxError> {
+        Ok((Vec::new(), Vec::new()))
     }
 }
 

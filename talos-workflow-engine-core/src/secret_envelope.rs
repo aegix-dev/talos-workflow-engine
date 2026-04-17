@@ -28,10 +28,115 @@
 //! workloads.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use async_trait::async_trait;
 
 use crate::BoxError;
+
+/// Minimum AEAD nonce length accepted by
+/// [`validate_seal_output`]. AES-GCM's 96-bit nonce is the practical
+/// floor; larger-nonce schemes (XChaCha20-Poly1305 at 192 bits,
+/// AES-SIV at 128 bits) comfortably clear this bound.
+pub const MIN_SEAL_NONCE_LEN: usize = 12;
+
+/// Structural violation produced by [`validate_seal_output`].
+///
+/// The engine treats every variant the same way — dispatches the node
+/// with an empty sealed pair, which fails the node cleanly rather
+/// than forwarding corrupted bytes. Consumers reusing
+/// [`validate_seal_output`] from their own dispatcher impls can map
+/// the variants onto their own error taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealValidationError {
+    /// One of `ciphertext` / `nonce` was empty while the other was
+    /// non-empty. Impossible to decrypt; almost certainly a bug in the
+    /// envelope impl.
+    MismatchedEmptyNonEmpty {
+        /// Whether the ciphertext was the empty one.
+        ciphertext_empty: bool,
+        /// Whether the nonce was the empty one.
+        nonce_empty: bool,
+    },
+    /// The nonce was shorter than [`MIN_SEAL_NONCE_LEN`]. Nearly all
+    /// modern AEADs require at least 12 bytes.
+    NonceTooShort {
+        /// The nonce length the envelope returned.
+        actual: usize,
+        /// The minimum the engine requires.
+        minimum: usize,
+    },
+}
+
+impl fmt::Display for SealValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MismatchedEmptyNonEmpty {
+                ciphertext_empty,
+                nonce_empty,
+            } => write!(
+                f,
+                "SecretEnvelope::seal returned a mismatched (ciphertext, nonce) pair: ciphertext_empty={ciphertext_empty}, nonce_empty={nonce_empty}"
+            ),
+            Self::NonceTooShort { actual, minimum } => write!(
+                f,
+                "SecretEnvelope::seal returned a nonce shorter than the AEAD minimum: actual={actual}, minimum={minimum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SealValidationError {}
+
+/// Validate a [`SecretEnvelope::seal`] output against the engine's
+/// documented structural invariants.
+///
+/// Returns `Ok(())` when the `(ciphertext, nonce)` pair is safe to
+/// forward on the wire; returns a [`SealValidationError`] otherwise.
+///
+/// Accepted shapes:
+///
+/// * `(empty, empty)` — the documented sentinel for "nothing to seal."
+/// * `(non-empty, non-empty)` with `nonce.len() >= MIN_SEAL_NONCE_LEN`.
+///
+/// Rejected shapes:
+///
+/// * Mismatched (one empty, one non-empty).
+/// * `(non-empty, non-empty)` with `nonce.len() < MIN_SEAL_NONCE_LEN`.
+///
+/// This is a **structural** check, not a cryptographic one. It cannot
+/// detect an identity-function envelope (ciphertext equal to plaintext
+/// bytes) or a constant-nonce envelope — the engine has no way to
+/// audit AEAD semantics without the key. Verifying AEAD quality is the
+/// envelope impl's responsibility; this helper catches obvious
+/// configuration mistakes (e.g. a stub returning `(bytes, vec![])`).
+///
+/// The engine's reference dispatch path calls this after every
+/// `seal` and logs rejections at `tracing::error!`. External
+/// [`NodeDispatcher`] impls that build their own `DispatchJob` from
+/// a `SecretEnvelope::seal` result are encouraged to reuse this
+/// helper for identical guarantees.
+///
+/// [`NodeDispatcher`]: crate::NodeDispatcher
+pub fn validate_seal_output(ciphertext: &[u8], nonce: &[u8]) -> Result<(), SealValidationError> {
+    match (ciphertext.is_empty(), nonce.is_empty()) {
+        (true, true) => Ok(()),
+        (false, false) => {
+            if nonce.len() < MIN_SEAL_NONCE_LEN {
+                Err(SealValidationError::NonceTooShort {
+                    actual: nonce.len(),
+                    minimum: MIN_SEAL_NONCE_LEN,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        (c, n) => Err(SealValidationError::MismatchedEmptyNonEmpty {
+            ciphertext_empty: c,
+            nonce_empty: n,
+        }),
+    }
+}
 
 /// Seals a plaintext secrets map into a `(ciphertext, nonce)` pair
 /// authenticated under `shared_key`.
@@ -78,4 +183,78 @@ pub trait SecretEnvelope: Send + Sync {
         secrets: &HashMap<String, String>,
         shared_key: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), BoxError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_both_empty_sentinel() {
+        assert!(validate_seal_output(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn accepts_full_aes_gcm_shape() {
+        // 12-byte nonce (GCM floor), arbitrary ciphertext >= 1 byte.
+        assert!(validate_seal_output(&[0u8; 32], &[0u8; 12]).is_ok());
+    }
+
+    #[test]
+    fn accepts_larger_nonce() {
+        // XChaCha20 nonces are 24 bytes — still valid.
+        assert!(validate_seal_output(&[0u8; 16], &[0u8; 24]).is_ok());
+    }
+
+    #[test]
+    fn rejects_short_nonce() {
+        // 8 bytes — below MIN_SEAL_NONCE_LEN.
+        match validate_seal_output(&[0u8; 32], &[0u8; 8]) {
+            Err(SealValidationError::NonceTooShort { actual, minimum }) => {
+                assert_eq!(actual, 8);
+                assert_eq!(minimum, MIN_SEAL_NONCE_LEN);
+            }
+            other => panic!("expected NonceTooShort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_nonce_with_ciphertext() {
+        match validate_seal_output(&[0u8; 32], &[]) {
+            Err(SealValidationError::MismatchedEmptyNonEmpty {
+                ciphertext_empty,
+                nonce_empty,
+            }) => {
+                assert!(!ciphertext_empty);
+                assert!(nonce_empty);
+            }
+            other => panic!("expected MismatchedEmptyNonEmpty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_ciphertext_with_nonce() {
+        match validate_seal_output(&[], &[0u8; 12]) {
+            Err(SealValidationError::MismatchedEmptyNonEmpty {
+                ciphertext_empty,
+                nonce_empty,
+            }) => {
+                assert!(ciphertext_empty);
+                assert!(!nonce_empty);
+            }
+            other => panic!("expected MismatchedEmptyNonEmpty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_display_has_context() {
+        // Smoke test the Display impls so tracing output is useful.
+        let e = SealValidationError::NonceTooShort {
+            actual: 4,
+            minimum: 12,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("actual=4"), "got: {s}");
+        assert!(s.contains("minimum=12"), "got: {s}");
+    }
 }

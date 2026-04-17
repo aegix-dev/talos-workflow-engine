@@ -1,18 +1,52 @@
 # `graph_json` schema (v0)
 
-This is the wire shape the engine accepts at
+This document describes the JSON wire shape the engine accepts at
 [`ParallelWorkflowEngine::load_from_graph_json`][load-fn] and
-returns from [`WorkflowGraphStore::get_graph`][store-trait]. The
-shape is derived from React Flow's node/edge model so workflows
-authored in a visual editor can be loaded directly.
+[`ParallelWorkflowEngine::load_graph_from_json`][load-async-fn],
+and returns from
+[`WorkflowGraphStore::get_graph`][store-trait]. The shape derives
+from React Flow's node/edge model so workflows authored in a
+visual editor can be loaded directly.
 
-Pre-1.0, the shape is **additive-only**: new optional fields will
-land in 0.x minor bumps; removing or re-typing an existing field
-bumps the major. A typed Rust builder (`WorkflowGraphBuilder`) is
-planned for 0.2.
+## Choosing a construction path
+
+Three paths produce graphs in this shape. Pick based on how the
+workflow originates:
+
+| Origin | Preferred path |
+|---|---|
+| **Authored in a visual editor** (React Flow, generated tooling) | Hand-written / exported JSON → `load_graph_from_json(&str)` |
+| **Built programmatically from Rust code** | [`WorkflowGraphBuilder`][builder] → `load_graph_from_json(&str)` via `serde_json::to_string` |
+| **Persisted graph store fetch** | `WorkflowGraphStore::get_graph` returns `String`; feed to `load_graph_from_json(&str)` |
+
+The builder is the recommended in-process path because it gives you
+type-checked construction against the live `SystemNodeKind` enum; the
+engine's parser remains authoritative for what's accepted.
+
+### Two parser entry points
+
+The engine exposes two parsers with slightly different coverage
+(slated for unification in a later minor release):
+
+| Entry point | Input | Coverage |
+|---|---|---|
+| `load_graph_from_json(&str)` (async) | JSON string | **Full** — module nodes, system nodes (via `type: "system:<kind>"`), plus async rate-limit pre-load |
+| `load_from_graph_json(&serde_json::Value)` (sync) | Parsed `Value` | Module nodes only (skips system nodes); reads `execution_timeout_secs` |
+
+For programmatic consumers, prefer the async variant unless you have
+a pre-parsed `Value` already in hand and know your graph contains
+only module nodes.
+
+## Stability
+
+Pre-1.0, the shape is **additive-only**: new optional fields land in
+0.x minor bumps; removing or re-typing an existing field bumps the
+major version.
 
 [load-fn]: https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.ParallelWorkflowEngine.html#method.load_from_graph_json
+[load-async-fn]: https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.ParallelWorkflowEngine.html#method.load_graph_from_json
 [store-trait]: https://docs.rs/talos-workflow-engine-core/0.1/talos_workflow_engine_core/trait.WorkflowGraphStore.html
+[builder]: https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.WorkflowGraphBuilder.html
 
 ## Top-level shape
 

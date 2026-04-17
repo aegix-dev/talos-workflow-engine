@@ -120,7 +120,9 @@ pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
 pub use retry::RetryPolicy;
 pub use retry_classifier::RetryClassifier;
 pub use sanitizer::{ExecutionSanitizer, OutputSanitizer};
-pub use secret_envelope::SecretEnvelope;
+pub use secret_envelope::{
+    validate_seal_output, SealValidationError, SecretEnvelope, MIN_SEAL_NONCE_LEN,
+};
 pub use secrets::{BoxError, SecretsResolver};
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;

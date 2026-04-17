@@ -707,7 +707,12 @@ pub(crate) async fn build_encrypted_secrets_for(
             // wire. Fail closed (empty ciphertext → node dispatches
             // with no secrets → node fails cleanly) rather than
             // forwarding the bad output.
-            if !validate_seal_output(&ciphertext, &nonce, node_id) {
+            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
+                tracing::error!(
+                    %node_id,
+                    error = %e,
+                    "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
+                );
                 return talos_workflow_job_protocol::EncryptedSecrets::default();
             }
             // Separate check: the envelope accepted the structural
@@ -731,64 +736,6 @@ pub(crate) async fn build_encrypted_secrets_for(
                 "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
             );
             talos_workflow_job_protocol::EncryptedSecrets::default()
-        }
-    }
-}
-
-/// Minimum AEAD nonce length accepted by the engine. AES-GCM's 96-bit
-/// nonce is the practical floor; XChaCha20-Poly1305 (192 bits) and
-/// other modern AEADs comfortably clear this bound. A shorter nonce
-/// almost certainly indicates a misconfigured envelope.
-const MIN_SEAL_NONCE_LEN: usize = 12;
-
-/// Validate a `SecretEnvelope::seal` output against the engine's
-/// documented structural invariants. Returns `true` when the output
-/// is safe to forward on the wire.
-///
-/// Structural rules checked (no caller-context semantics — pass the
-/// output of `seal` directly):
-///
-/// * `(empty, empty)` — accepted. Documented sentinel meaning
-///   "nothing to seal"; callers short-circuit on empty input before
-///   reaching here, so in practice this branch fires only if an
-///   impl returns empty for non-empty input — which, together with
-///   the caller's own empty-map filter, means no bytes are sent on
-///   the wire either way.
-/// * `(non-empty, non-empty)` with `nonce.len() >= 12` — accepted.
-///   12 bytes is the AEAD-nonce floor (AES-GCM's 96-bit nonce);
-///   schemes with larger nonces pass trivially.
-/// * Mismatched (one empty, one non-empty) — rejected.
-/// * `(non-empty, non-empty)` with `nonce.len() < 12` — rejected.
-///
-/// On rejection, logs at `tracing::error!` with the node id and the
-/// structural shape. See
-/// [`talos_workflow_engine_core::SecretEnvelope`] for the contract.
-fn validate_seal_output(ciphertext: &[u8], nonce: &[u8], node_id: Uuid) -> bool {
-    match (ciphertext.is_empty(), nonce.is_empty()) {
-        (true, true) => true,
-        (false, false) => {
-            if nonce.len() < MIN_SEAL_NONCE_LEN {
-                tracing::error!(
-                    %node_id,
-                    nonce_len = nonce.len(),
-                    min_len = MIN_SEAL_NONCE_LEN,
-                    "SecretEnvelope::seal returned a nonce shorter than the AEAD minimum — dispatching with empty ciphertext"
-                );
-                false
-            } else {
-                true
-            }
-        }
-        _ => {
-            // Mismatched empty / non-empty pair: impossible to decrypt,
-            // almost certainly a bug in the envelope impl.
-            tracing::error!(
-                %node_id,
-                ciphertext_empty = ciphertext.is_empty(),
-                nonce_empty = nonce.is_empty(),
-                "SecretEnvelope::seal returned mismatched empty/non-empty (ciphertext, nonce) pair — dispatching with empty ciphertext"
-            );
-            false
         }
     }
 }
@@ -8950,53 +8897,8 @@ mod tests {
         );
     }
 
-    // ── Seal output validation ──────────────────────────────────────
-
-    #[test]
-    fn seal_validation_accepts_both_empty() {
-        let node_id = Uuid::nil();
-        assert!(validate_seal_output(&[], &[], node_id));
-    }
-
-    #[test]
-    fn seal_validation_accepts_full_aes_gcm_shape() {
-        // 12-byte nonce (GCM minimum), arbitrary ciphertext ≥ 1 byte.
-        let node_id = Uuid::nil();
-        let ciphertext = vec![0u8; 32];
-        let nonce = vec![0u8; 12];
-        assert!(validate_seal_output(&ciphertext, &nonce, node_id));
-    }
-
-    #[test]
-    fn seal_validation_accepts_larger_nonce() {
-        // XChaCha20 nonces are 24 bytes — must still pass.
-        let node_id = Uuid::nil();
-        let ciphertext = vec![0u8; 16];
-        let nonce = vec![0u8; 24];
-        assert!(validate_seal_output(&ciphertext, &nonce, node_id));
-    }
-
-    #[test]
-    fn seal_validation_rejects_short_nonce() {
-        let node_id = Uuid::nil();
-        let ciphertext = vec![0u8; 32];
-        let nonce = vec![0u8; 8]; // below MIN_SEAL_NONCE_LEN
-        assert!(!validate_seal_output(&ciphertext, &nonce, node_id));
-    }
-
-    #[test]
-    fn seal_validation_rejects_empty_nonce_with_ciphertext() {
-        let node_id = Uuid::nil();
-        let ciphertext = vec![0u8; 32];
-        let nonce = vec![];
-        assert!(!validate_seal_output(&ciphertext, &nonce, node_id));
-    }
-
-    #[test]
-    fn seal_validation_rejects_empty_ciphertext_with_nonce() {
-        let node_id = Uuid::nil();
-        let ciphertext = vec![];
-        let nonce = vec![0u8; 12];
-        assert!(!validate_seal_output(&ciphertext, &nonce, node_id));
-    }
+    // Seal-output validation tests live in
+    // `talos-workflow-engine-core::secret_envelope` alongside the
+    // `validate_seal_output` pub fn, since the helper is a pure
+    // structural check that external dispatchers can also reuse.
 }
