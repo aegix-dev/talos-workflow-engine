@@ -63,4 +63,12 @@ pub trait ExecutionSanitizer: Send + Sync {
     /// [`OutputSanitizer::redact_str`] because it knows the exact
     /// vault paths + config shapes this run touched.
     fn redact_error(&self, s: &str) -> String;
+
+    /// Scrub a per-node output payload. Applied to every stored
+    /// node-level output before persistence, **in addition to**
+    /// [`OutputSanitizer::redact_json`] — `redact_output` catches
+    /// values the execution-scoped pass learned from node configs
+    /// (vault refs, resolved secrets), while `redact_json` catches
+    /// globally-matching patterns (API key shapes, tokens).
+    fn redact_output(&self, v: &JsonValue) -> JsonValue;
 }

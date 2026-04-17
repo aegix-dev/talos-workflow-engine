@@ -50,25 +50,63 @@ pub struct NodeCompletionContext<'a> {
     pub wall_time_ms: u64,
 }
 
-/// Called after each node's output is finalized.
+/// Called at three points in a node's lifecycle.
 ///
 /// # Contract
 ///
 /// * **Impls that need async I/O MUST `tokio::spawn` (or equivalent).**
-///   This method runs on the engine's dispatch loop. Awaiting a
-///   database write, network call, or any other latency-bearing
-///   operation inline will stall every downstream node in the workflow.
+///   Every method on this trait runs on the engine's dispatch loop.
+///   Awaiting a database write, network call, or any other latency-
+///   bearing operation inline will stall every downstream node.
 /// * Impls MUST return quickly. Synchronous work MUST be
 ///   side-effect-only and cheap (e.g. incrementing a counter).
-/// * Impls observe output; they do not mutate it. The `output` value
-///   is the exact shape that will propagate to this node's children.
-/// * The engine invokes the hook at most once per node-completion
-///   event. It is not called for skipped, pending, or failed nodes;
-///   failures are surfaced through the consumer's event-persistence
-///   path (e.g. the Talos `EventSink`). A future revision may add
-///   sibling hooks for lifecycle transitions other than success.
+/// * Impls observe output / failure; they do not mutate either.
+/// * The engine invokes each method at most once per corresponding
+///   lifecycle event: `on_node_completed` on success,
+///   `on_node_failed` on terminal node failure,
+///   `on_pipeline_step_completed` once per step inside a batch-
+///   dispatched chain.
 pub trait NodeLifecycleHook: Send + Sync {
     /// Synchronous notification that the node identified by
     /// `ctx.node_id` has produced its final `output`.
     fn on_node_completed(&self, ctx: NodeCompletionContext<'_>, output: &JsonValue);
+
+    /// Synchronous notification that the node failed terminally —
+    /// workflow execution is about to abort with an error.
+    ///
+    /// `error_message` is the human-readable failure reason; `payload`
+    /// is the last output the node produced (if any) before failing
+    /// — typically the error envelope. Consumers typically use this
+    /// to persist a dead-letter-queue row, cancel sibling in-flight
+    /// nodes, or emit an audit event.
+    ///
+    /// Default impl: no-op — consumers that care about failures
+    /// override. Not every impl needs failure semantics (metrics-only
+    /// impls, test capture hooks, ...).
+    fn on_node_failed(
+        &self,
+        _ctx: NodeCompletionContext<'_>,
+        _error_message: &str,
+        _payload: Option<&JsonValue>,
+    ) {
+    }
+
+    /// Synchronous notification that one step of a chain-dispatched
+    /// pipeline produced its output. Fires once per step; fires in
+    /// addition to `on_node_completed` on the chain head.
+    ///
+    /// Use this for side effects that must happen per individual
+    /// module invocation (e.g. persisting a `__memory_write__`
+    /// envelope in the step's output). Do NOT use it for cost
+    /// attribution — pipeline fuel is aggregated at the chain level
+    /// and billing here would double-count.
+    ///
+    /// Default impl: no-op. Consumers without per-step semantics
+    /// rely on `on_node_completed` alone.
+    fn on_pipeline_step_completed(
+        &self,
+        _actor_id: Option<Uuid>,
+        _step_output: &JsonValue,
+    ) {
+    }
 }
