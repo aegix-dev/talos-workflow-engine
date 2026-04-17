@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "talos-workflow-engine-core",
+    "talos-workflow-engine",
+    "talos-workflow-engine-nats",
+    "talos-workflow-engine-test-utils",
+    "talos-workflow-job-protocol",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
