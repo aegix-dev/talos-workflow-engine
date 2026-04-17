@@ -66,10 +66,11 @@
 //!   nodes)" primitive. Owns wire-format construction, signing,
 //!   retry, and result parsing.
 //!
-//! One more trait (`ModuleFetcher`) lives in the controller today
-//! alongside the executor. Its signature mentions a Talos-specific
-//! `WasmModule` shape; it'll migrate into this crate once that shape
-//! is abstracted into a protocol-level `ModuleArtifact` type.
+//! Every trait the executor talks to for external I/O lives in this
+//! crate. The controller ships adapters that wire Talos infrastructure
+//! behind each trait (Postgres for graph + events + checkpoint, a
+//! signed-NATS job protocol for dispatch, `rhai` + `talos-dlp` +
+//! `retry_intelligence` for the policy hooks).
 //!
 //! # What's in this crate, what's not
 //!
@@ -85,9 +86,14 @@ mod context;
 mod dispatcher;
 mod edge;
 mod event_sink;
+mod expression;
 mod graph_store;
+mod module_artifact;
+mod module_fetcher;
 mod node_hook;
 mod retry;
+mod retry_classifier;
+mod sanitizer;
 mod secrets;
 mod system_node;
 mod transport;
@@ -100,9 +106,14 @@ pub use dispatcher::{
 };
 pub use edge::EdgeLogic;
 pub use event_sink::{EventSink, NodeEventWrite};
+pub use expression::ExpressionEvaluator;
 pub use graph_store::WorkflowGraphStore;
+pub use module_artifact::ModuleArtifact;
+pub use module_fetcher::ModuleFetcher;
 pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
 pub use retry::RetryPolicy;
+pub use retry_classifier::RetryClassifier;
+pub use sanitizer::{ExecutionSanitizer, OutputSanitizer};
 pub use secrets::{BoxError, SecretsResolver};
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;
