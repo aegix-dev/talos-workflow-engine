@@ -9,16 +9,75 @@ use uuid::Uuid;
 /// Built-in system node kinds that receive special handling by the
 /// executor, distinct from user-supplied module nodes.
 ///
-/// Consumers that need a kind not listed here should extend the executor's
-/// dispatcher registry rather than forking this enum. The variants below
-/// reflect a practical production set drawn from real workloads and are
-/// likely to be useful to other adopters; the list may grow over time but
-/// existing variants will not silently change shape.
+/// # Choosing a variant
+///
+/// Most workflows reach for fewer than half of the variants. Group by
+/// intent first, then narrow:
+///
+/// | Group | Variants | Use when |
+/// |---|---|---|
+/// | **Iteration** | [`ForEach`], [`Loop`], [`WhileLoop`], [`RepeatLoop`] | You need to fan out per element or repeat a body. |
+/// | **Coordination** | [`FanIn`], [`Collect`], [`Synthesize`] | Multiple branches converge and you need to join, gather, or transform their outputs. |
+/// | **Control flow** | [`Wait`], [`Verify`], [`ErrorHandler`] | You need to pause for input, assert a condition, or branch on an upstream error. |
+/// | **Sub-workflow** | [`SubWorkflow`] | Compose another workflow as a node. |
+/// | **Runtime dispatch** | [`DynamicDispatch`], [`CapabilityDispatch`] | The target workflow / worker is chosen at runtime by an expression or capability set. |
+///
+#[cfg_attr(
+    feature = "llm-primitives",
+    doc = "The `llm-primitives` feature (default on) adds:\n\
+           \n\
+           | Group | Variants | Use when |\n\
+           |---|---|---|\n\
+           | **LLM judging** | [`Judge`], [`Ensemble`], [`ConfidenceGate`] | You're scoring or gating LLM output and need verdict / consensus / confidence semantics. |\n\
+           | **LLM agent loops** | [`AgentLoop`], [`ReActLoop`], [`ReflectiveRetry`] | You're running a tool-using agent body with iteration / retry on failure. |\n\
+           | **LLM dispatch** | [`LlmDispatch`] | A classifier picks which downstream workflow handles the input. |\n"
+)]
+#[cfg_attr(
+    not(feature = "llm-primitives"),
+    doc = "An additional 7 LLM/agent-flavored variants — `Judge`, `Ensemble`, \
+           `ConfidenceGate`, `AgentLoop`, `ReActLoop`, `ReflectiveRetry`, \
+           `LlmDispatch` — are gated behind the `llm-primitives` feature \
+           (default on). They are absent from this enum when the feature is \
+           disabled; the engine rejects equivalent JSON kinds at parse time."
+)]
+///
+/// # Stability
+///
+/// Consumers that need a kind not listed here should extend the
+/// executor's dispatcher registry rather than forking this enum. The
+/// variants below reflect a practical production set drawn from real
+/// workloads and are likely to be useful to other adopters; the list
+/// may grow over time but existing variants will not silently change
+/// shape.
 ///
 /// `PartialEq` is derived but not `Eq`/`Hash`: two variants carry `f64`
 /// thresholds, and `f64` is not totally ordered. Consumers that need a
 /// hashable discriminator should project onto a dedicated `&'static str`
 /// tag instead of hashing the whole value.
+///
+/// [`ForEach`]: SystemNodeKind::ForEach
+/// [`Loop`]: SystemNodeKind::Loop
+/// [`WhileLoop`]: SystemNodeKind::WhileLoop
+/// [`RepeatLoop`]: SystemNodeKind::RepeatLoop
+/// [`FanIn`]: SystemNodeKind::FanIn
+/// [`Collect`]: SystemNodeKind::Collect
+/// [`Synthesize`]: SystemNodeKind::Synthesize
+/// [`Wait`]: SystemNodeKind::Wait
+/// [`Verify`]: SystemNodeKind::Verify
+/// [`ErrorHandler`]: SystemNodeKind::ErrorHandler
+/// [`SubWorkflow`]: SystemNodeKind::SubWorkflow
+/// [`DynamicDispatch`]: SystemNodeKind::DynamicDispatch
+/// [`CapabilityDispatch`]: SystemNodeKind::CapabilityDispatch
+#[cfg_attr(
+    feature = "llm-primitives",
+    doc = "\n[`Judge`]: SystemNodeKind::Judge\n\
+           [`Ensemble`]: SystemNodeKind::Ensemble\n\
+           [`ConfidenceGate`]: SystemNodeKind::ConfidenceGate\n\
+           [`AgentLoop`]: SystemNodeKind::AgentLoop\n\
+           [`ReActLoop`]: SystemNodeKind::ReActLoop\n\
+           [`ReflectiveRetry`]: SystemNodeKind::ReflectiveRetry\n\
+           [`LlmDispatch`]: SystemNodeKind::LlmDispatch"
+)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SystemNodeKind {
     /// Iterate over an array in the parent's output and fan out a branch

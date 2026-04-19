@@ -19,7 +19,7 @@ use talos_workflow_engine::emit_event_spawn;
 use talos_workflow_engine_core::{
     BoxError, ChainDispatchRequest, ChainDispatchResult, ChainStepResult, DispatchJob,
     DispatchResult, EventSink, ExpressionEvaluator, JobTransport, NodeDispatcher, NodeEventWrite,
-    RetryClassifier, StepStatus,
+    RetryClassifier, StepStatus, WorkerSharedKey,
 };
 use talos_workflow_job_protocol::{
     EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
@@ -400,7 +400,7 @@ pub struct NatsNodeDispatcher {
     /// Shared key used for both HMAC signing of the request and
     /// verification of the response. `None` disables signing — used by
     /// test harnesses that don't need the round-trip.
-    worker_shared_key: Option<Arc<Vec<u8>>>,
+    worker_shared_key: Option<WorkerSharedKey>,
     /// Policy trait for classifying dispatch errors into
     /// transient-vs-permanent. Drives the "smart retry default" path
     /// (skip retries on auth / fuel / missing-secret errors even when
@@ -424,7 +424,7 @@ impl NatsNodeDispatcher {
     pub fn new(
         transport: Arc<dyn JobTransport>,
         event_sink: Option<Arc<dyn EventSink>>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<WorkerSharedKey>,
         retry_classifier: Arc<dyn RetryClassifier>,
         expression_evaluator: Arc<dyn ExpressionEvaluator>,
     ) -> Self {
@@ -440,15 +440,10 @@ impl NatsNodeDispatcher {
 
 impl std::fmt::Debug for NatsNodeDispatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `WorkerSharedKey`'s own `Debug` impl is redacted; forwarding to
+        // it keeps the "never log raw key bytes" invariant in one place.
         f.debug_struct("NatsNodeDispatcher")
-            .field(
-                "worker_shared_key",
-                &self
-                    .worker_shared_key
-                    .as_ref()
-                    .map(|k| format!("<redacted; len={}>", k.len()))
-                    .unwrap_or_else(|| "None".to_string()),
-            )
+            .field("worker_shared_key", &self.worker_shared_key)
             .finish_non_exhaustive()
     }
 }
@@ -510,12 +505,16 @@ impl NodeDispatcher for NatsNodeDispatcher {
             expected_wasm_hash: job.expected_wasm_hash,
             max_fuel: job.max_fuel,
             dry_run: job.dry_run,
-            user_id: job.user_id,
+            // Wire format uses `Uuid::nil()` as the "no user context"
+            // sentinel. The trait surface uses `Option<Uuid>`; translate
+            // at the boundary so the engine-side API is explicit while
+            // preserving wire compat with existing workers.
+            user_id: job.user_id.unwrap_or_else(uuid::Uuid::nil),
         };
 
         // 2. Sign.
-        if let Some(key) = self.worker_shared_key.as_deref() {
-            req.sign(key)
+        if let Some(key) = self.worker_shared_key.as_ref() {
+            req.sign(key.as_bytes())
                 .map_err(|e| -> BoxError { format!("Failed to sign job request: {e}").into() })?;
         }
 
@@ -523,17 +522,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
         let payload = serde_json::to_vec(&req)
             .map_err(|e| -> BoxError { format!("Failed to serialize job request: {e}").into() })?;
 
-        // 4. Topic. Map `Uuid::nil()` back to `None` so `None` routes
-        // (edge routing disabled or no user context) stay on the
-        // tenant-agnostic `workflow.jobs` subject instead of being sent
-        // to `workflow.jobs.00000000-...` — which no worker subscribes to
+        // 4. Topic. A `None` user_id stays on the tenant-agnostic
+        // `workflow.jobs` subject instead of being sent to
+        // `workflow.jobs.00000000-...` — which no worker subscribes to
         // under `ENABLE_EDGE_ROUTING=true`.
-        let topic_user = if job.user_id.is_nil() {
-            None
-        } else {
-            Some(job.user_id)
-        };
-        let topic = get_single_job_topic(topic_user, req.priority);
+        let topic = get_single_job_topic(job.user_id, req.priority);
 
         // 5. Retry loop + result verification + event emission.
         // `execute_job_with_retry` owns the outer cancellation wrap,
@@ -553,7 +546,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             job.timeout.as_secs() + TOKIO_WRAP_GRACE_SECS,
             job.max_retries,
             job.backoff_ms,
-            self.worker_shared_key.as_deref().map(Vec::as_slice),
+            self.worker_shared_key.as_ref().map(WorkerSharedKey::as_bytes),
             job.retry_condition.as_deref(),
             job.retry_delay_expr.as_deref(),
             event_sink,
@@ -616,12 +609,15 @@ impl NodeDispatcher for NatsNodeDispatcher {
             share_sandbox: request.share_sandbox,
             signature: vec![],
             job_nonce: String::new(),
-            user_id: request.user_id,
+            // Wire format takes a non-optional `Uuid`; substitute
+            // `Uuid::nil()` at the boundary (same mapping as single-node
+            // dispatch above).
+            user_id: request.user_id.unwrap_or_else(uuid::Uuid::nil),
         };
 
         // 3. Sign (chain-level HMAC, independent of any per-step signing).
-        if let Some(key) = self.worker_shared_key.as_deref() {
-            req.sign(key).map_err(|e| -> BoxError {
+        if let Some(key) = self.worker_shared_key.as_ref() {
+            req.sign(key.as_bytes()).map_err(|e| -> BoxError {
                 format!("Failed to sign pipeline request: {e}").into()
             })?;
         }
@@ -631,13 +627,10 @@ impl NodeDispatcher for NatsNodeDispatcher {
             format!("Failed to serialize pipeline request: {e}").into()
         })?;
 
-        // 5. Topic. Same nil→None mapping as single-node dispatch.
-        let topic_user = if request.user_id.is_nil() {
-            None
-        } else {
-            Some(request.user_id)
-        };
-        let topic = get_pipeline_job_topic(topic_user, max_priority);
+        // 5. Topic. A `None` user_id stays on the tenant-agnostic
+        // `workflow.pipeline.jobs` subject (same contract as single
+        // dispatch above).
+        let topic = get_pipeline_job_topic(request.user_id, max_priority);
 
         // 6. Chain retry loop via `dispatch_with_retry` (not
         // `execute_job_with_retry`). Chain-level retry observability
@@ -661,8 +654,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // 7. Parse + verify.
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
             .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
-        if let Some(key) = self.worker_shared_key.as_deref() {
-            result.verify(key, 300).map_err(|e| -> BoxError {
+        if let Some(key) = self.worker_shared_key.as_ref() {
+            result.verify(key.as_bytes(), 300).map_err(|e| -> BoxError {
                 format!("Pipeline result signature verification failed: {e}").into()
             })?;
         }

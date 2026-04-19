@@ -1184,7 +1184,8 @@ impl WorkerHeartbeat {
 // Shared-key helper
 // ============================================================================
 
-/// Decode the `WORKER_SHARED_KEY` environment variable (64 hex chars → 32 bytes).
+/// Decode the `WORKER_SHARED_KEY` environment variable (64 hex chars → 32 bytes)
+/// and return it wrapped in a [`WorkerSharedKey`].
 ///
 /// Both the controller and the worker must call this at startup and fail-fast
 /// if the key is absent or malformed.
@@ -1202,7 +1203,9 @@ impl WorkerHeartbeat {
 /// coordinated restart, and the failure mode of a botched live rotation
 /// (silent signature bypass) is worse than the failure mode of a staggered
 /// restart (loud, temporary request rejection).
-pub fn load_worker_shared_key() -> Result<Vec<u8>, String> {
+///
+/// [`WorkerSharedKey`]: talos_workflow_engine_core::WorkerSharedKey
+pub fn load_worker_shared_key() -> Result<talos_workflow_engine_core::WorkerSharedKey, String> {
     // Support Docker secrets via WORKER_SHARED_KEY_FILE in addition to direct env var
     let hex_key = std::env::var("WORKER_SHARED_KEY")
         .ok()
@@ -1230,7 +1233,7 @@ pub fn load_worker_shared_key() -> Result<Vec<u8>, String> {
         ));
     }
 
-    Ok(key)
+    Ok(talos_workflow_engine_core::WorkerSharedKey::new(key))
 }
 
 // ============================================================================

@@ -130,12 +130,15 @@ plugs in a slow sink, it won't stall dispatch.
 After receiving a `JobResult`:
 
 ```rust
-if let Some(key) = worker_shared_key {
-    if let Err(e) = job_result.verify(key, 300) {
+if let Some(key) = worker_shared_key.as_ref() {
+    if let Err(e) = job_result.verify(key.as_bytes(), 300) {
         return Err(format!("Job result signature verification failed: {}", e));
     }
 }
 ```
+
+`worker_shared_key` is `Option<WorkerSharedKey>`; `.as_bytes()` exposes the
+underlying `Arc<[u8]>` as a `&[u8]` for the protocol's HMAC verifier.
 
 The `300` is the freshness window in seconds. Results older than 5
 minutes are rejected. **Never skip this verification** — it's the
@@ -178,9 +181,14 @@ synthetic per-attempt event — don't inline new events in
 
 ## Security invariants
 
-- **Worker shared key never appears in `Debug` output.** The
-  `NatsNodeDispatcher::fmt` impl reports `<redacted; len={N}>` only.
-  If you add a new struct that holds the key, write `Debug` by hand.
+- **Worker shared key never appears in `Debug` output.** The key is
+  stored as [`WorkerSharedKey`], whose own `Debug` impl is redacted.
+  Prefer delegating (`f.debug_struct(...).field("key", &self.key)`) over
+  writing a custom redaction per site — one source of truth is harder to
+  get wrong. If you introduce a new type that dereferences to raw
+  `&[u8]`, write `Debug` by hand.
+
+[`WorkerSharedKey`]: https://docs.rs/talos-workflow-engine-core
 - **Encrypted secrets are opaque bytes at this layer.** This crate
   does not decrypt. It publishes ciphertext + nonce; the worker
   decrypts inside its sandbox.

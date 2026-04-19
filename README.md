@@ -121,7 +121,7 @@ Build a graph programmatically with
 use std::time::Duration;
 use serde_json::json;
 use uuid::Uuid;
-use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowGraphBuilder};
+use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowEngineError, WorkflowGraphBuilder};
 use talos_workflow_engine_core::SystemNodeKind;
 
 let module_id = Uuid::new_v4();
@@ -131,22 +131,55 @@ let graph = WorkflowGraphBuilder::new()
     .add_system_node("split", SystemNodeKind::ForEach {
         input_path: "items".into(),
         output_handle: "element".into(),
-    })?
+    })
     .edge("fetch", "split")
-    .build();
+    .build()?;
 
 let mut engine = ParallelWorkflowEngine::new();
 // ... wire adapters via engine.set_* methods ...
 engine.load_graph_from_json(&serde_json::to_string(&graph)?).await?;
+# Ok::<(), WorkflowEngineError>(())
 ```
 
-Or start with [`minimal_engine()`](https://docs.rs/talos-workflow-engine-test-utils/0.1/talos_workflow_engine_test_utils/fn.minimal_engine.html)
-from `talos-workflow-engine-test-utils` for a fully-wired engine with
-in-memory stubs ready to dispatch against.
+### A runnable, end-to-end example
 
-See each crate's README for deeper worked examples and
-[docs/graph-json-schema.md](./docs/graph-json-schema.md) for the
-full graph-JSON shape.
+The fully-wired demo in
+[`talos-workflow-engine/examples/hello_workflow.rs`](./talos-workflow-engine/examples/hello_workflow.rs)
+builds a 3-node fan-out graph, wires every adapter via
+`talos-workflow-engine-test-utils`, scripts a `NodeDispatcher`, runs
+the workflow end-to-end, and prints each node's output. No NATS, no
+wasm runtime, no network — everything is in-process:
+
+```bash
+cargo run --example hello_workflow -p talos-workflow-engine
+```
+
+[`minimal_engine()`](https://docs.rs/talos-workflow-engine-test-utils/0.1/talos_workflow_engine_test_utils/fn.minimal_engine.html)
+from `talos-workflow-engine-test-utils` (used in that example) wires
+in-memory defaults for every trait so a fresh engine can dispatch
+within ten lines of code.
+
+See each crate's README for deeper context and
+[docs/graph-json-schema.md](./docs/graph-json-schema.md) (or the
+embedded
+[`talos_workflow_engine::SCHEMA_DOC`](https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/constant.SCHEMA_DOC.html))
+for the full graph-JSON shape. The
+[`validate_graph_json`](https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/fn.validate_graph_json.html)
+function checks a payload's structure, classifies its nodes, and
+returns a [`GraphSummary`](https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.GraphSummary.html)
+without needing an engine instance — useful for CI lints or editor
+diagnostics.
+
+### Errors
+
+Public methods on `ParallelWorkflowEngine` return
+[`Result<_, WorkflowEngineError>`](https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/error/enum.WorkflowEngineError.html).
+The variant taxonomy splits into documented failure modes
+(`SecretsResolverMissing`, `GraphCyclic`), wrappers around lower-
+level errors (`GraphJson`, `Subflow`), and catch-alls for failure
+modes the engine has not yet promoted to typed variants
+(`LoadGraph`, `Execution`). The variants are stable; the message
+bodies on catch-all variants are not.
 
 ## Feature flags
 
@@ -160,10 +193,13 @@ out, do so on **every** sibling crate in your dependency tree —
 `talos-workflow-engine-core`, `talos-workflow-engine`, and (if used)
 `talos-workflow-engine-nats` and `talos-workflow-engine-test-utils`.
 Mixing (e.g. `-core` with the feature on but `-engine` with it off)
-leaves the LLM variants reachable in the type enum but never dispatched
-by the engine — the engine parses them as `None`-kind and rejects at
-run time. There is no compile-time error for the mismatch; it surfaces
-only at workflow execution.
+would otherwise leave the LLM variants reachable in the type enum but
+never dispatched by the engine.
+
+`talos-workflow-engine` carries a `const _: () = assert!(...)` that
+fires a compile-time error if the feature on `-core` and `-engine` is
+mismatched, so the misconfiguration surfaces during `cargo check`
+rather than at runtime.
 
 ## MSRV
 

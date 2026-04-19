@@ -55,7 +55,7 @@ talos-workflow-engine-core   = "0.1"
 ```rust,ignore
 use std::sync::Arc;
 use uuid::Uuid;
-use talos_workflow_engine::ParallelWorkflowEngine;
+use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowEngineError};
 
 // Build an engine and wire each adapter as an `Arc<dyn Trait>`.
 // All `set_*` methods are `&mut self`; every adapter is optional except
@@ -70,17 +70,46 @@ engine.set_event_sink(Arc::new(MyEventSink::new()));
 //    set_approval_gate, set_node_hook as needed.
 
 // Load a DAG serialized as the engine's graph_json shape.
-engine.load_from_graph_json(&graph_json)?;
+// All public methods return `Result<_, WorkflowEngineError>` —
+// see `talos_workflow_engine::error` for the variant taxonomy.
+engine.load_graph_from_json(&graph_json).await?;
 
 // Dispatch through a transport. Use `talos-workflow-engine-nats` for
 // NATS, or supply your own `NodeDispatcher` impl.
 let ctx = engine
     .run_with_transport(dispatcher, worker_shared_key, Uuid::new_v4())
     .await?;
+# Ok::<(), WorkflowEngineError>(())
 ```
 
-For a full worked example, see `talos-workflow-engine-nats` (NATS transport) and
-`talos-workflow-engine-test-utils` (in-memory trait impls).
+### Runnable example
+
+The fully-wired end-to-end demo in
+[`examples/hello_workflow.rs`](./examples/hello_workflow.rs) builds a
+fan-out DAG, wires every adapter via
+[`talos-workflow-engine-test-utils`](../talos-workflow-engine-test-utils),
+scripts a `NodeDispatcher`, and prints each node's output:
+
+```bash
+cargo run --example hello_workflow -p talos-workflow-engine
+```
+
+For a NATS-backed dispatcher, see
+[`talos-workflow-engine-nats`](../talos-workflow-engine-nats).
+
+### Validating graph JSON without an engine
+
+To check a `graph_json` payload — counts, system-kinds in use, soft
+warnings — without instantiating an engine, use
+[`graph_json::validate`](./src/graph_json.rs):
+
+```rust,ignore
+use talos_workflow_engine::{validate_graph_json, SCHEMA_DOC};
+
+let summary = validate_graph_json(&payload)?;
+println!("{summary}");                  // node + edge counts, kinds, warnings
+println!("schema reference:\n{SCHEMA_DOC}");
+```
 
 ## Adapter wiring
 

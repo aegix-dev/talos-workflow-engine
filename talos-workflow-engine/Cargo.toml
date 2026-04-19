@@ -25,9 +25,15 @@ rhai = { version = "1.19", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+thiserror = "2.0"
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
 uuid = { version = "1.20", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# `examples/` use the test-utils crate to wire the engine with
+# in-memory / no-op adapters so the runnable example stays self-contained.
+talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils", version = "0.1" }
 
 [features]
 default = ["llm-primitives"]

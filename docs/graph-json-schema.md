@@ -25,17 +25,21 @@ engine's parser remains authoritative for what's accepted.
 
 ### Two parser entry points
 
-The engine exposes two parsers with slightly different coverage
-(slated for unification in a later minor release):
+Two public methods share a single authoritative parser — the
+difference is only in input shape and whether post-parse async work
+runs.
 
-| Entry point | Input | Coverage |
+| Entry point | Input | Async follow-ups |
 |---|---|---|
-| `load_graph_from_json(&str)` (async) | JSON string | **Full** — module nodes, system nodes (via `type: "system:<kind>"`), plus async rate-limit pre-load |
-| `load_from_graph_json(&serde_json::Value)` (sync) | Parsed `Value` | Module nodes only (skips system nodes); reads `execution_timeout_secs` |
+| `load_graph_from_json(&str)` (async) | JSON string | Yes — batch rate-limit pre-load and sub-workflow graph prefetch |
+| `load_from_graph_json(&serde_json::Value)` (sync) | Parsed `Value` | None — use when rate-limit / sub-workflow caches are populated later or not needed |
 
-For programmatic consumers, prefer the async variant unless you have
-a pre-parsed `Value` already in hand and know your graph contains
-only module nodes.
+Both accept the same node and edge shape (module nodes, system
+nodes, reserved-key lifts, `execution_timeout_secs`, and full edge
+handles). Both reject graphs with zero nodes with `LoadGraph`. Pick
+the async variant when running the engine end-to-end; the sync one
+fits sub-workflow dispatch sites that already hold a parsed `Value`
+and don't need the async pre-loads.
 
 ## Stability
 
@@ -80,6 +84,7 @@ Unknown top-level keys are ignored.
   // handlers instead of dispatching to a module.
   //
   //   "foreach"       | "wait"            | "sub_workflow"   | "loop"
+  //   "while_loop"    | "repeat_loop"     | "fan_in"         | "error_handler"
   //   "collect"       | "synthesize"      | "verify"         |
   //   "dispatch"      | "capability_dispatch"
   //
@@ -170,7 +175,45 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 
 ### `loop`
 ```jsonc
+// Re-dispatches a separate body node until `condition` returns false
+// or `max_iterations` is hit. The body node id is read from
+// `body_node_id` on the loop node's config at run time.
 { "max_iterations": 10, "condition": "iteration < 5" }
+```
+
+### `while_loop`
+```jsonc
+// Like `loop` but runs the body locally (no module dispatch). Each
+// iteration wraps the previous output under `__loop_input`. Use when
+// the body is pure data transformation and you want a single system
+// node instead of a module + loop pair.
+{ "condition": "cursor != null", "max_iterations": 10 }
+```
+
+### `repeat_loop`
+```jsonc
+// Iterates a fixed number of times with no condition evaluation. Pairs
+// with a body node via edges (see `loop` for the re-dispatch pattern).
+{ "count": 5 }
+```
+
+### `fan_in`
+```jsonc
+// Joins multiple upstream branches according to `join_mode`:
+//   "All"         — wait for every branch (default when omitted)
+//   "Any"         — release on the first completion
+//   "Majority"    — wait for strict majority
+//   {"N": 3}      — wait for exactly N branches
+// Optional `aggregation_expr` transforms the joined outputs.
+{ "join_mode": "All", "aggregation_expr": "sum" }
+```
+
+### `error_handler`
+```jsonc
+// Handles errors from upstream nodes. If `error_pattern` is set, only
+// errors whose message matches (substring or regex, engine-defined)
+// trigger this handler.
+{ "error_pattern": "timeout|rate_limited" }
 ```
 
 ### `verify`

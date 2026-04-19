@@ -118,7 +118,7 @@ mod tests {
             node_id: Uuid::nil(),
             module_id,
             job_id: None,
-            user_id: Uuid::nil(),
+            user_id: None,
             actor_id: None,
             module_uri: "test".into(),
             wasm_bytes: None,

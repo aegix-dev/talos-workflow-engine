@@ -11,6 +11,15 @@ or new required fields bump the major version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: `load_worker_shared_key` now returns
+  `Result<talos_workflow_engine_core::WorkerSharedKey, String>` instead of
+  `Result<Vec<u8>, String>`. The new return type is the opaque,
+  cheap-to-clone, redacted-in-`Debug` signing key type used across the
+  engine's public API. Migrate: wrap downstream uses that previously took
+  `Vec<u8>` in `key.as_bytes()` to recover the raw slice.
+
 ## [0.1.0] — Initial release
 
 - `JobRequest` / `JobResult` — single-node dispatch wire format with

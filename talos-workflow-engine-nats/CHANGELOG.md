@@ -11,6 +11,22 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: `NatsNodeDispatcher::new`, `run_with_nats`, and
+  `run_with_seed_via_nats` now take `Option<WorkerSharedKey>` instead of
+  `Option<Arc<Vec<u8>>>` for the HMAC shared signing key. See
+  `talos-workflow-engine-core`'s changelog for the newtype rationale and
+  migration (`Some(Arc::new(bytes))` → `Some(WorkerSharedKey::new(bytes))`).
+- **Breaking**: `run_with_nats` and `run_with_seed_via_nats` now
+  return `Result<_, talos_workflow_engine::WorkflowEngineError>`,
+  matching the typed-error contract on
+  `ParallelWorkflowEngine::run_with_transport` /
+  `run_with_seed_with_transport`. Migrate by changing your error
+  binding from `String` to `WorkflowEngineError` (or any
+  `Box<dyn std::error::Error>` ancestor) — call-site `?` and
+  `e.to_string()` continue to work without change.
+
 ## [0.1.0] — Initial release
 
 - `NatsNodeDispatcher` — `NodeDispatcher` impl that publishes signed jobs

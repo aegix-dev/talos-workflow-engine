@@ -237,14 +237,33 @@ Tests wire adapters via `talos-workflow-engine-test-utils`.
 ## `secrets_resolver` is required on the abstract entry
 
 `run_with_transport` and `run_with_seed_with_transport` fail closed
-when `self.secrets_resolver` is `None`. This closes the structural
-hole that let the 2026-04-16 loop-node regression ship silently — an
-unset resolver no longer produces empty-ciphertext dispatches.
+with `WorkflowEngineError::SecretsResolverMissing` when
+`self.secrets_resolver` is `None`. This closes the structural hole
+that let the 2026-04-16 loop-node regression ship silently — an unset
+resolver no longer produces empty-ciphertext dispatches.
 
 Don't weaken this check. If a test path needs to run without secrets,
 wire an `InMemorySecretsResolver::new()` (empty) from
 `talos-workflow-engine-test-utils` — that's the sanctioned bypass, and it
 goes through the same code path production does.
+
+## Public errors are typed; internal `String` errors are wrapped
+
+The engine body still returns `Result<_, String>` from internal
+helpers. The public surface — `run_with_transport`,
+`run_with_seed_with_transport`, `load_graph_from_json`,
+`load_from_graph_json`, `add_edge`, `validate_config_patterns`,
+`AdapterSet::into_engine_with_graph` — returns
+`Result<_, WorkflowEngineError>` (see `crate::error`).
+
+The two run methods wrap their large bodies via private
+`_inner` helpers so the scheduling loop can keep its existing
+`?`-on-`String` flow. Public-side promotions to typed variants
+(`SecretsResolverMissing`, `GraphCyclic`) happen in the wrapper
+before the inner method runs; everything else passes through
+`WorkflowEngineError::execution(String)`. When you promote a new
+internal failure mode to a typed variant, do it in the wrapper —
+don't refactor the inner body.
 
 ## Testing
 

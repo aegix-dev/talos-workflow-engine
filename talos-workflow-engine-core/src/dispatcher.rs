@@ -110,12 +110,16 @@ pub struct DispatchJob {
     /// id — letting DB rows and worker log lines correlate.
     pub job_id: Option<Uuid>,
     /// Owning user for this execution. Workers use this for per-user
-    /// quota enforcement and cross-tenant isolation. `Uuid::nil()`
-    /// is the engine's sentinel for "no user context"; impls MUST
-    /// treat it as equivalent to "no user" when routing (for example,
-    /// falling back to a tenant-agnostic subject rather than a
-    /// tenant-scoped one that no worker subscribes to).
-    pub user_id: Uuid,
+    /// quota enforcement and cross-tenant isolation.
+    ///
+    /// `None` means "no user context" — typical for in-process test
+    /// harnesses or one-off diagnostic runs that don't belong to any
+    /// tenant. Impls that route tenant-scoped subjects should fall back
+    /// to a tenant-agnostic subject on `None` (subscribers bound to
+    /// `workflow.jobs.<uuid>` will not see jobs dispatched without a
+    /// user id). Impls whose wire format demands a non-optional value
+    /// may substitute `Uuid::nil()` at their own boundary.
+    pub user_id: Option<Uuid>,
     /// Actor id that owns the execution (if actor-owned), so the
     /// worker can route agent-memory WIT calls to the right rows.
     pub actor_id: Option<Uuid>,
@@ -217,8 +221,10 @@ pub const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 60;
 impl Default for DispatchJob {
     /// Populates every field with its documented default:
     ///
-    /// * All `Uuid` fields → [`Uuid::nil()`]
-    /// * All `Option<...>` fields → `None`
+    /// * Required `Uuid` fields (`execution_id`, `node_id`, `module_id`)
+    ///   → [`Uuid::nil()`]
+    /// * Optional `Uuid` fields (`user_id`, `job_id`) and all other
+    ///   `Option<...>` fields → `None`
     /// * All `Vec<...>` fields → empty
     /// * `input_payload` → `JsonValue::Null`
     /// * `timeout` → [`DEFAULT_DISPATCH_TIMEOUT_SECS`] (60 s). Chosen to
@@ -236,7 +242,7 @@ impl Default for DispatchJob {
             node_id: Uuid::nil(),
             module_id: Uuid::nil(),
             job_id: None,
-            user_id: Uuid::nil(),
+            user_id: None,
             actor_id: None,
             module_uri: String::new(),
             wasm_bytes: None,
@@ -399,8 +405,9 @@ pub struct ChainDispatchRequest {
     /// Workflow execution the chain belongs to.
     pub workflow_execution_id: Uuid,
     /// User owning the execution. Routing / tenant isolation apply
-    /// per the same rules as [`DispatchJob::user_id`].
-    pub user_id: Uuid,
+    /// per the same rules as [`DispatchJob::user_id`]. `None` means
+    /// "no user context"; see that field's docs.
+    pub user_id: Option<Uuid>,
     /// Optional stable chain id. When `None`, impls generate one.
     pub job_id: Option<Uuid>,
     /// The chain's steps, in dispatch order. Each carries its own

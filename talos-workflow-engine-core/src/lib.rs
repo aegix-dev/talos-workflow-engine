@@ -81,6 +81,28 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Compile-time witness for the `llm-primitives` feature on this crate.
+///
+/// Sibling crates that depend on `talos-workflow-engine-core` and also
+/// expose an `llm-primitives` feature use this constant to assert
+/// feature-flag coherence at compile time:
+///
+/// ```ignore
+/// // In talos-workflow-engine/src/lib.rs:
+/// const _: () = assert!(
+///     talos_workflow_engine_core::HAS_LLM_PRIMITIVES
+///         == cfg!(feature = "llm-primitives"),
+///     "feature mismatch — see docs",
+/// );
+/// ```
+///
+/// `true` when the feature is enabled on **this** crate, `false`
+/// otherwise. Cargo unifies features across the dependency graph, so
+/// the only mismatch this catches is the one a misconfigured
+/// `Cargo.toml` can actually produce: enabling `llm-primitives` on
+/// `talos-workflow-engine-core` while disabling it on the engine.
+pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
+
 mod approval_gate;
 mod checkpoint;
 mod context;
@@ -99,6 +121,7 @@ mod retry_classifier;
 mod sanitizer;
 mod secret_envelope;
 mod secrets;
+mod shared_key;
 mod system_node;
 mod transport;
 
@@ -124,5 +147,6 @@ pub use secret_envelope::{
     validate_seal_output, SealValidationError, SecretEnvelope, MIN_SEAL_NONCE_LEN,
 };
 pub use secrets::{BoxError, SecretsResolver};
+pub use shared_key::WorkerSharedKey;
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;

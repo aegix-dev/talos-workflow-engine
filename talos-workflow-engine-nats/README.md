@@ -76,7 +76,8 @@ let transport = Arc::new(NatsTransport::new(client));
 // own Rhai-backed evaluator and error classifier.
 let retry_classifier: Arc<dyn RetryClassifier> = Arc::new(MyClassifier);
 let expr_evaluator: Arc<dyn ExpressionEvaluator> = Arc::new(MyEvaluator);
-let worker_shared_key = Some(Arc::new(load_shared_key_bytes()));
+// `WorkerSharedKey` wraps an `Arc<[u8]>` internally; clone is cheap.
+let worker_shared_key = Some(WorkerSharedKey::new(load_shared_key_bytes()));
 
 let dispatcher = Arc::new(NatsNodeDispatcher::new(
     transport,

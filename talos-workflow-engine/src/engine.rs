@@ -63,7 +63,7 @@ const AGENT_LOOP_MAX_HISTORY: usize = 20;
 use crate::emit_event_spawn;
 use talos_workflow_engine_core::{
     DispatchJob, EdgeLogic, EventSink, ExecutionStartedContext, JoinMode, ModuleFetcher,
-    NodeEventWrite, NodeLifecycleHook, RetryPolicy, SecretsResolver, SystemNodeKind,
+    NodeEventWrite, NodeLifecycleHook, SecretsResolver, SystemNodeKind,
     WorkflowContext, WorkflowGraphStore,
 };
 
@@ -73,151 +73,15 @@ use talos_workflow_engine_core::{
 // holds only an `Arc<dyn CheckpointStore>` and never talks to a
 // database directly.
 
-/// Default sandbox root used when the engine has
-/// [`set_sandbox_root`](ParallelWorkflowEngine::set_sandbox_root)
-/// left at its out-of-the-box value. Configurable at engine-build time.
-pub const DEFAULT_SANDBOX_ROOT: &str = "/tmp/workflow-engine-sandboxes";
+pub use crate::sandbox::DEFAULT_SANDBOX_ROOT;
+use crate::graph_parser::{
+    parse_system_node_kind, read_node_retry_policy_with_actor_cap,
+};
+use crate::sandbox::{create_execution_sandbox, SandboxGuard};
+use crate::secrets_pipeline::{build_encrypted_secrets_for, extract_vault_paths};
+use crate::validation::sanitize_node_output;
 
-/// Create a per-execution sandbox directory under `base`, rooted at
-/// `base/<execution_id>`. Returns a cap-std Dir handle for capability-
-/// based filesystem access from inside module dispatch.
-///
-/// Uses `create_dir_all` on both the base and per-execution paths; the
-/// base is a shared directory created once and reused across executions.
-/// Returns a structured error string; callers log and fall back to a
-/// `None` sandbox, so this function never panics.
-fn create_execution_sandbox(
-    base: &std::path::Path,
-    execution_id: Uuid,
-) -> Result<(Arc<cap_std::fs::Dir>, std::path::PathBuf), String> {
-    std::fs::create_dir_all(base)
-        .map_err(|e| format!("Failed to create sandbox base directory: {e}"))?;
-
-    let sandbox_path = base.join(execution_id.to_string());
-    std::fs::create_dir_all(&sandbox_path)
-        .map_err(|e| format!("Failed to create execution sandbox directory: {e}"))?;
-
-    let dir = cap_std::fs::Dir::open_ambient_dir(&sandbox_path, cap_std::ambient_authority())
-        .map(Arc::new)
-        .map_err(|e| format!("Failed to open sandbox directory with cap-std: {e}"))?;
-    Ok((dir, sandbox_path))
-}
-
-/// RAII guard that removes the execution sandbox directory when
-/// dropped. Carries the full resolved path so cleanup doesn't depend
-/// on the engine's `sandbox_root` still matching what it was at
-/// creation time.
-struct SandboxGuard {
-    execution_id: Uuid,
-    sandbox_path: std::path::PathBuf,
-}
-
-impl Drop for SandboxGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.sandbox_path) {
-            tracing::warn!(
-                "Failed to cleanup execution sandbox {}: {}",
-                self.execution_id,
-                e
-            );
-        } else {
-            tracing::debug!("Cleaned up execution sandbox: {}", self.execution_id);
-        }
-    }
-}
-
-// ============================================================================
-// LINEAR CHAIN DETECTION (Superpower 2)
-// ============================================================================
-
-/// Detect all maximal linear chains in `graph`.
-///
-/// A *linear chain* is a maximal sequence of nodes `[v₀, v₁, …, vₙ]` where:
-/// - Every interior node has in-degree = 1 and out-degree = 1.
-/// - The source `v₀` can have any in-degree, but out-degree = 1.
-/// - The sink `vₙ` can have any out-degree, but in-degree = 1.
-///
-/// Chains of length ≥ 2 benefit from pipeline dispatch: the worker executes all
-/// steps in a single NATS round-trip without intermediate serialisation.
-///
-/// Returns a `Vec` of chains, each chain being a `Vec<NodeIndex>` in topological
-/// order (source → sink).
-pub fn detect_linear_chains(graph: &DiGraph<Uuid, EdgeLogic>) -> Vec<Vec<NodeIndex>> {
-    // Find all potential chain *starts*: nodes with out-degree = 1 whose
-    // predecessor either has out-degree ≠ 1 or is absent.
-    let mut chain_starts: Vec<NodeIndex> = Vec::new();
-
-    for idx in graph.node_indices() {
-        let out_deg = graph.neighbors_directed(idx, Direction::Outgoing).count();
-        if out_deg != 1 {
-            continue; // Can't be an interior node or start of a 2+ chain.
-        }
-        let in_deg = graph.neighbors_directed(idx, Direction::Incoming).count();
-        // A chain starts if:
-        // - it has no predecessor (source), OR
-        // - its predecessor has out-degree ≠ 1 (branches out, so chain starts here).
-        if in_deg == 0 {
-            chain_starts.push(idx);
-        } else {
-            let parent_out_deg = graph
-                .neighbors_directed(idx, Direction::Incoming)
-                .next()
-                .map(|p| graph.neighbors_directed(p, Direction::Outgoing).count())
-                .unwrap_or(0);
-            if parent_out_deg != 1 {
-                chain_starts.push(idx);
-            }
-        }
-    }
-
-    // Expand each start into its maximal chain.
-    let mut visited: HashSet<NodeIndex> = HashSet::new();
-    let mut chains: Vec<Vec<NodeIndex>> = Vec::new();
-
-    for start in chain_starts {
-        if visited.contains(&start) {
-            continue;
-        }
-
-        let mut chain = vec![start];
-        let mut current = start;
-
-        loop {
-            visited.insert(current);
-            // Move to the single successor, if it qualifies as an interior node.
-            let next = graph
-                .neighbors_directed(current, Direction::Outgoing)
-                .next();
-            let Some(next_idx) = next else { break };
-
-            let next_in_deg = graph
-                .neighbors_directed(next_idx, Direction::Incoming)
-                .count();
-            let next_out_deg = graph
-                .neighbors_directed(next_idx, Direction::Outgoing)
-                .count();
-
-            // The next node can continue the chain only if it has exactly one
-            // incoming edge (from `current`).  Out-degree can be anything for the
-            // sink, but if it branches we stop — those children start new chains.
-            if next_in_deg != 1 {
-                break; // Fan-in: `next_idx` belongs to a different sub-graph.
-            }
-            chain.push(next_idx);
-            current = next_idx;
-
-            if next_out_deg != 1 {
-                break; // Sink or fan-out — chain ends here.
-            }
-        }
-
-        if chain.len() >= 2 {
-            chains.push(chain);
-        }
-    }
-
-    chains
-}
+pub(crate) use crate::chain_detect::detect_linear_chains;
 
 // Canonical LLM provider vault paths live in `talos_workflow_job_protocol::LLM_PROVIDER_VAULT_PATHS`.
 // Import from there directly — this crate no longer re-exports to keep one
@@ -342,15 +206,30 @@ impl JudgeVerdict {
 // Suppress dead‑code warnings to keep the CI passing.
 #[allow(dead_code)]
 /// Parallel execution engine based on Kahn's algorithm.
+///
+/// # Accessing internal state
+///
+/// Read access to the engine's graph, node metadata, and per-node
+/// configuration goes through accessor methods — [`graph`](Self::graph),
+/// [`node_map`](Self::node_map), [`node_labels`](Self::node_labels),
+/// [`node_configs`](Self::node_configs), [`node_meta`](Self::node_meta),
+/// [`execution_timeout_secs`](Self::execution_timeout_secs), and
+/// [`dry_run`](Self::dry_run). The corresponding struct fields are
+/// `#[doc(hidden)]` and will become private in a future minor release;
+/// new code should use the accessors.
 pub struct ParallelWorkflowEngine {
+    #[doc(hidden)]
     pub graph: DiGraph<Uuid, EdgeLogic>,
+    #[doc(hidden)]
     pub node_map: HashMap<Uuid, NodeIndex>,
     /// Maps internal node UUIDs back to user-defined node IDs (e.g., "n1", "fetch").
     /// Populated by `load_graph_from_json`. Used to label output with user-friendly keys.
+    #[doc(hidden)]
     pub node_labels: HashMap<Uuid, String>,
     /// Per-node configuration from the workflow graph. Merged into the module
     /// config when dispatching jobs, so template modules receive the config
     /// the user specified at workflow creation time.
+    #[doc(hidden)]
     pub node_configs: HashMap<Uuid, serde_json::Value>,
     /// Pluggable resolver for the wasm module artifact that a node dispatches.
     /// In production wraps [`ModuleRegistry`] (which owns the 4-level fallback
@@ -382,6 +261,7 @@ pub struct ParallelWorkflowEngine {
     /// engine is running in a test/fallback context without a real registry.
     user_id: Option<Uuid>,
     /// Per-node metadata: maps node UUID to (module_id, retry_policy, kind).
+    #[doc(hidden)]
     pub node_meta: HashMap<
         Uuid,
         (
@@ -391,6 +271,7 @@ pub struct ParallelWorkflowEngine {
         ),
     >,
     /// Maximum execution time for the entire workflow in seconds. Default: 300 (5 minutes).
+    #[doc(hidden)]
     pub execution_timeout_secs: u64,
     /// Per-module rate limits (requests per minute), loaded at graph init time.
     rate_limits: HashMap<Uuid, i32>,
@@ -419,6 +300,7 @@ pub struct ParallelWorkflowEngine {
     sub_workflow_cache: HashMap<Uuid, JsonValue>,
     /// When true, non-GET HTTP requests are mocked in the worker (returns 200 with dry_run metadata).
     /// Propagated to each JobRequest so the worker can intercept side effects.
+    #[doc(hidden)]
     pub dry_run: bool,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
@@ -523,7 +405,7 @@ impl AdapterSet {
     pub fn into_engine_with_graph(
         self,
         graph_json: &JsonValue,
-    ) -> Result<ParallelWorkflowEngine, String> {
+    ) -> Result<ParallelWorkflowEngine, crate::WorkflowEngineError> {
         let mut engine = self.into_engine();
         engine.load_from_graph_json(graph_json)?;
         Ok(engine)
@@ -554,454 +436,6 @@ impl AdapterSet {
     }
 }
 
-/// Parse a React-Flow node's retry metadata into a [`RetryPolicy`].
-///
-/// Accepts either top-level fields (`retry_count`, `retry_backoff_ms`,
-/// `retry_condition`, `retry_delay_expression`) or the same keys nested
-/// under `data` — the RF frontend emits both shapes depending on node
-/// type. Returns `None` when the node has no retry config at all; the
-/// engine treats that as "use the workflow-level default."
-fn read_node_retry_policy(node: &JsonValue) -> Option<RetryPolicy> {
-    let retry_count = node
-        .get("retry_count")
-        .or_else(|| node.get("data").and_then(|d| d.get("retry_count")))
-        .and_then(JsonValue::as_u64)
-        .map(|v| v as u32);
-    let retry_backoff = node
-        .get("retry_backoff_ms")
-        .or_else(|| node.get("data").and_then(|d| d.get("retry_backoff_ms")))
-        .and_then(JsonValue::as_u64);
-    let retry_condition = node
-        .get("retry_condition")
-        .or_else(|| node.get("data").and_then(|d| d.get("retry_condition")))
-        .and_then(JsonValue::as_str)
-        .map(String::from);
-    let retry_delay_expression = node
-        .get("retry_delay_expression")
-        .or_else(|| {
-            node.get("data")
-                .and_then(|d| d.get("retry_delay_expression"))
-        })
-        .and_then(JsonValue::as_str)
-        .map(String::from);
-
-    let has_any = retry_count.is_some()
-        || retry_backoff.is_some()
-        || retry_condition.is_some()
-        || retry_delay_expression.is_some();
-    if !has_any {
-        return None;
-    }
-    Some(RetryPolicy {
-        max_retries: retry_count.unwrap_or(2),
-        backoff_ms: retry_backoff.unwrap_or(500),
-        retry_condition,
-        retry_delay_expression,
-    })
-}
-
-/// Extract vault:// secret paths from a node config JSON object.
-/// Returns the paths with the "vault://" prefix stripped.
-///
-/// Thin wrapper over `crate::vault_resolver::extract_vault_refs`
-/// that drops the config-key side of each tuple. The engine doesn't need
-/// per-key tracking because payload substitution happens on the worker
-/// side via [`EncryptedSecrets`].
-///
-/// [`EncryptedSecrets`]: talos_workflow_job_protocol::EncryptedSecrets
-fn extract_vault_paths(config: &serde_json::Value) -> Vec<String> {
-    crate::vault_resolver::extract_vault_refs(config)
-        .into_iter()
-        .map(|(_key, path)| path)
-        .collect()
-}
-
-/// Run the full node-dispatch secret pipeline and return encrypted ciphertext.
-///
-/// This is the **one** place the pipeline lives. It's called by
-/// [`ParallelWorkflowEngine::build_encrypted_secrets`] on `&self`-bound
-/// paths and directly by dispatch closures (agent-loop body, ensemble
-/// child, llm-dispatch target) that run under `async move` and can't
-/// borrow `self`. Previously the pipeline was duplicated at four call
-/// sites, and drift between copies has already caused one production
-/// bug (loop-node secrets injection gap, fixed 2026-04-16).
-///
-/// Pipeline order — preserved across every caller to avoid silent
-/// override differences between copies:
-///
-/// 1. Module-grant secrets for `node_id`.
-/// 2. Statically-declared `extra_paths` (from `wasm_module.allowed_secrets`).
-///    Empty slice for callers without a declared set.
-/// 3. OAuth refresh hook on `vault_paths`.
-/// 4. Dynamic `vault_paths` (extracted from node config). Overwrites any
-///    overlapping keys from steps 1-2 because later writes win in `HashMap::extend`.
-/// 5. Canonical LLM-provider keys for `user_id`.
-/// 6. AES-256-GCM encrypt the combined map under `worker_shared_key`.
-///
-/// Errors at any resolve step are logged and the offending set is
-/// skipped — the node still gets whatever secrets *did* resolve. If the
-/// combined map is empty, the function returns
-/// `EncryptedSecrets::default()` (empty ciphertext) rather than
-/// encrypting an empty map.
-pub(crate) async fn build_encrypted_secrets_for(
-    resolver: &dyn SecretsResolver,
-    envelope: &dyn talos_workflow_engine_core::SecretEnvelope,
-    node_id: Uuid,
-    user_id: Option<Uuid>,
-    vault_paths: &[String],
-    extra_paths: &[String],
-    worker_shared_key: &[u8],
-) -> talos_workflow_job_protocol::EncryptedSecrets {
-    // 1. Module-grant secrets.
-    let mut secrets_map = resolver
-        .resolve_module_secrets(node_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, %node_id, "resolve_module_secrets failed");
-            Default::default()
-        });
-
-    // 2. Statically-declared extra paths (module's `allowed_secrets` list).
-    if !extra_paths.is_empty() {
-        match resolver.resolve_by_paths(extra_paths, user_id).await {
-            Ok(declared) => secrets_map.extend(declared),
-            Err(e) => tracing::warn!(error = %e, "Failed to fetch module declared secrets"),
-        }
-    }
-
-    // 3-4. OAuth refresh + dynamic vault paths.
-    if !vault_paths.is_empty() {
-        resolver.refresh_vault_paths(vault_paths).await;
-        match resolver.resolve_by_paths(vault_paths, user_id).await {
-            Ok(v) => secrets_map.extend(v),
-            Err(e) => tracing::error!(
-                error = %e,
-                ?vault_paths,
-                %node_id,
-                "Failed to pre-fetch vault:// secrets — node will fail"
-            ),
-        }
-    }
-
-    // 5. LLM-provider keys. Errors swallowed: a missing/broken LLM-key
-    // vault shouldn't fail nodes that don't use llm::*.
-    match resolver.resolve_llm_keys(user_id).await {
-        Ok(keys) => secrets_map.extend(keys),
-        Err(e) => tracing::debug!(
-            error = %e,
-            "Failed to pre-fetch LLM vault keys — worker will fall back to env vars"
-        ),
-    }
-
-    // 6. Seal via the pluggable envelope. Empty-map short-circuit
-    // matches the reference impl's sentinel; callers read an empty
-    // ciphertext as "no secrets to forward."
-    if secrets_map.is_empty() {
-        return talos_workflow_job_protocol::EncryptedSecrets::default();
-    }
-    match envelope.seal(&secrets_map, worker_shared_key).await {
-        Ok((ciphertext, nonce)) => {
-            // Validate the seal output structurally — a misconfigured
-            // envelope that returns a short nonce or a mismatched
-            // empty/non-empty pair would send corrupted bytes on the
-            // wire. Fail closed (empty ciphertext → node dispatches
-            // with no secrets → node fails cleanly) rather than
-            // forwarding the bad output.
-            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
-                tracing::error!(
-                    %node_id,
-                    error = %e,
-                    "SecretEnvelope::seal output failed structural validation — dispatching with empty ciphertext"
-                );
-                return talos_workflow_job_protocol::EncryptedSecrets::default();
-            }
-            // Separate check: the envelope accepted the structural
-            // contract (returned the empty-empty sentinel) but did so
-            // on a non-empty input. We forwarded no secrets; the node
-            // is about to fail with a secrets-unavailable error, so
-            // surface the root cause in the logs.
-            if ciphertext.is_empty() && nonce.is_empty() {
-                tracing::error!(
-                    %node_id,
-                    secret_count = secrets_map.len(),
-                    "SecretEnvelope::seal returned the empty sentinel for a non-empty secrets map — node will dispatch without secrets"
-                );
-            }
-            talos_workflow_job_protocol::EncryptedSecrets { ciphertext, nonce }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                %node_id,
-                "SecretEnvelope::seal failed — dispatching node with empty ciphertext"
-            );
-            talos_workflow_job_protocol::EncryptedSecrets::default()
-        }
-    }
-}
-
-/// Validate config values against `pattern` constraints in the config_schema.
-/// Returns Ok(()) if all valid, Err(message) if any pattern match fails.
-pub fn validate_config_patterns(
-    schema: &serde_json::Value,
-    config: &serde_json::Value,
-) -> Result<(), String> {
-    let properties = match schema.get("properties").and_then(|p| p.as_object()) {
-        Some(p) => p,
-        None => return Ok(()), // No schema or no properties — skip validation
-    };
-    let config_obj = match config.as_object() {
-        Some(o) => o,
-        None => return Ok(()),
-    };
-
-    for (key, prop_schema) in properties {
-        if let Some(pattern) = prop_schema.get("pattern").and_then(|p| p.as_str()) {
-            if let Some(value) = config_obj.get(key).and_then(|v| v.as_str()) {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if !re.is_match(value) {
-                            return Err(format!(
-                                "Config key '{}' value does not match required pattern '{}'",
-                                key, pattern
-                            ));
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            key,
-                            pattern,
-                            "Invalid regex pattern in config_schema — skipping validation"
-                        );
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Sanitize node output: cap individual string field lengths to prevent
-/// unbounded LLM-generated outputs from consuming excessive memory when
-/// cloned into downstream node inputs and the final aggregated result.
-/// NOTE: `__` prefixed keys are intentionally NOT stripped — some are
-/// needed internally (`__memory_write__`, `__fuel_consumed__`, etc.).
-fn sanitize_node_output(output: &mut serde_json::Value) {
-    const MAX_STRING_FIELD_BYTES: usize = 10240; // 10 KB per string field
-    if let Some(obj) = output.as_object_mut() {
-        for val in obj.values_mut() {
-            if let Some(s) = val.as_str() {
-                if s.len() > MAX_STRING_FIELD_BYTES {
-                    *val = serde_json::Value::String(format!(
-                        "{}...[truncated at {}B]",
-                        &s[..MAX_STRING_FIELD_BYTES],
-                        MAX_STRING_FIELD_BYTES
-                    ));
-                }
-            }
-        }
-    }
-}
-
-/// Parse an LLM/agent-specific `SystemNodeKind` from a React-Flow
-/// node's `kind` + `data` fields. Returns `None` for kinds this
-/// helper doesn't recognize.
-///
-/// Lives in its own function so the LLM parsing surface can be
-/// cfg-gated as a single unit. When `llm-primitives` is disabled,
-/// the stub body returns `None` for every kind — graphs that
-/// reference these kinds parse as `None`-kind nodes and the engine
-/// rejects them at execution time.
-#[cfg(feature = "llm-primitives")]
-fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKind> {
-    if k == "agent_loop" {
-        let data = node.get("data")?;
-        Some(SystemNodeKind::AgentLoop {
-            body_workflow_id: data.get("body_workflow_id")?.as_str()?.parse().ok()?,
-            max_iterations: data
-                .get("max_iterations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10)
-                .min(50) as u32,
-            inject_history: data
-                .get("inject_history")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            timeout_secs: data
-                .get("timeout_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(60),
-        })
-    } else if k == "judge" {
-        let data = node.get("data").unwrap_or(&JsonValue::Null);
-        let judge_workflow_id = data
-            .get("judge_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .unwrap_or_else(uuid::Uuid::nil);
-        let rubric = data
-            .get("rubric")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
-        Some(SystemNodeKind::Judge {
-            judge_workflow_id,
-            rubric,
-            pass_threshold,
-            timeout_secs,
-        })
-    } else if k == "ensemble" {
-        let data = node.get("data").unwrap_or(&JsonValue::Null);
-        let child_workflow_id = data
-            .get("child_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .unwrap_or_else(uuid::Uuid::nil);
-        let count = data
-            .get("count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3)
-            .min(10)
-            .max(2) as u32;
-        let consensus = data
-            .get("consensus")
-            .and_then(|v| v.as_str())
-            .unwrap_or("majority_vote")
-            .to_string();
-        let judge_workflow_id = data
-            .get("judge_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
-        Some(SystemNodeKind::Ensemble {
-            child_workflow_id,
-            count,
-            consensus,
-            judge_workflow_id,
-            timeout_secs,
-        })
-    } else if k == "confidence_gate" {
-        let data = node.get("data").unwrap_or(&JsonValue::Null);
-        let threshold = data
-            .get("threshold")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.7)
-            .clamp(0.0, 1.0);
-        let confidence_path = data
-            .get("confidence_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("__confidence__")
-            .to_string();
-        let on_low_confidence = data
-            .get("on_low_confidence")
-            .and_then(|v| v.as_str())
-            .unwrap_or("pause")
-            .to_string();
-        Some(SystemNodeKind::ConfidenceGate {
-            threshold,
-            confidence_path,
-            on_low_confidence,
-        })
-    } else if k == "reflective_retry" {
-        let data = node.get("data").unwrap_or(&JsonValue::Null);
-        let child_workflow_id = data
-            .get("child_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .unwrap_or_else(uuid::Uuid::nil);
-        let reflection_workflow_id = data
-            .get("reflection_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .unwrap_or_else(uuid::Uuid::nil);
-        let max_retries = data
-            .get("max_retries")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(2)
-            .min(5)
-            .max(1) as u32;
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
-        Some(SystemNodeKind::ReflectiveRetry {
-            child_workflow_id,
-            reflection_workflow_id,
-            max_retries,
-            timeout_secs,
-        })
-    } else if k == "llm_dispatch" {
-        let data = node.get("data").unwrap_or(&JsonValue::Null);
-        let classifier_workflow_id = data
-            .get("classifier_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .unwrap_or_else(uuid::Uuid::nil);
-        let routes: std::collections::HashMap<String, uuid::Uuid> = data
-            .get("routes")
-            .and_then(|v| v.as_object())
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(k, v)| {
-                        v.as_str()
-                            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                            .map(|uid| (k.clone(), uid))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let fallback_workflow_id = data
-            .get("fallback_workflow_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
-        Some(SystemNodeKind::LlmDispatch {
-            classifier_workflow_id,
-            routes,
-            fallback_workflow_id,
-            timeout_secs,
-        })
-    } else if k == "react_loop" {
-        let data = node.get("data")?;
-        Some(SystemNodeKind::ReActLoop {
-            body_workflow_id: data.get("body_workflow_id")?.as_str()?.parse().ok()?,
-            max_iterations: data
-                .get("max_iterations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10)
-                .min(50) as u32,
-            inject_history: data
-                .get("inject_history")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            timeout_secs: data
-                .get("timeout_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(60),
-        })
-    } else {
-        None
-    }
-}
-
-/// Stub that returns `None` for every input. Active when the
-/// `llm-primitives` feature is disabled — graphs that reference
-/// LLM-flavored kinds parse as `None`-kind nodes.
-#[cfg(not(feature = "llm-primitives"))]
-fn parse_llm_system_node_kind(_k: &str, _node: &JsonValue) -> Option<SystemNodeKind> {
-    None
-}
 
 impl ParallelWorkflowEngine {
     pub fn new() -> Self {
@@ -1034,6 +468,77 @@ impl ParallelWorkflowEngine {
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(std::path::PathBuf::from(DEFAULT_SANDBOX_ROOT)),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Accessors for internal engine state.
+    //
+    // These are the canonical public API for reading engine state.
+    // The corresponding struct fields are `#[doc(hidden)]` and will
+    // become private in a future minor release — new code should not
+    // access them directly.
+    // ──────────────────────────────────────────────────────────────
+
+    /// The directed graph of nodes connected by [`EdgeLogic`] edges.
+    #[must_use]
+    pub fn graph(&self) -> &DiGraph<Uuid, EdgeLogic> {
+        &self.graph
+    }
+
+    /// Mapping from node UUID → `NodeIndex` in the petgraph
+    /// representation. Used by callers that need to traverse the
+    /// topology (e.g. custom validators or graph visualizations).
+    #[must_use]
+    pub fn node_map(&self) -> &HashMap<Uuid, NodeIndex> {
+        &self.node_map
+    }
+
+    /// Mapping from internal node UUID → user-facing node label
+    /// (`"fetch"`, `"n1"`, etc.). Populated by
+    /// [`load_graph_from_json`](Self::load_graph_from_json).
+    #[must_use]
+    pub fn node_labels(&self) -> &HashMap<Uuid, String> {
+        &self.node_labels
+    }
+
+    /// Per-node configuration extracted from the graph JSON. Includes
+    /// both user-supplied fields and engine-reserved keys (for example,
+    /// `__skip_condition` / `__continue_on_error`).
+    #[must_use]
+    pub fn node_configs(&self) -> &HashMap<Uuid, serde_json::Value> {
+        &self.node_configs
+    }
+
+    /// Per-node metadata: `(module_id, retry_policy, system_kind)`.
+    /// `module_id` is `None` for system-only nodes; `system_kind` is
+    /// `None` for plain module nodes.
+    #[must_use]
+    pub fn node_meta(
+        &self,
+    ) -> &HashMap<
+        Uuid,
+        (
+            Option<Uuid>,
+            Option<talos_workflow_engine_core::RetryPolicy>,
+            Option<SystemNodeKind>,
+        ),
+    > {
+        &self.node_meta
+    }
+
+    /// Workflow-level execution timeout in seconds. Default `300`
+    /// (five minutes); overridden by the graph-root
+    /// `execution_timeout_secs` field when a graph is loaded.
+    #[must_use]
+    pub fn execution_timeout_secs(&self) -> u64 {
+        self.execution_timeout_secs
+    }
+
+    /// Whether side-effectful dispatches are mocked out. See
+    /// [`set_dry_run`](Self::set_dry_run).
+    #[must_use]
+    pub fn dry_run(&self) -> bool {
+        self.dry_run
     }
 
     /// Replace the secret-sealing envelope. Accepts any
@@ -1180,99 +685,11 @@ impl ParallelWorkflowEngine {
     /// type.
     ///
     /// [`WorkflowGraphStore`]: talos_workflow_engine_core::WorkflowGraphStore
-    pub fn load_from_graph_json(&mut self, graph: &JsonValue) -> Result<(), String> {
-        let empty_vec = vec![];
-        let nodes = graph
-            .get("nodes")
-            .and_then(|n| n.as_array())
-            .unwrap_or(&empty_vec);
-
-        if let Some(timeout) = graph
-            .get("execution_timeout_secs")
-            .and_then(JsonValue::as_u64)
-        {
-            self.execution_timeout_secs = timeout;
-        }
-
-        // Map React Flow node id → engine node UUID (unique per node, not
-        // per module). `module_id` is stored as metadata so the engine
-        // can load the right wasm at dispatch time.
-        let mut rf_to_node: HashMap<String, Uuid> = HashMap::new();
-
-        for node in nodes {
-            let rf_id = node.get("id").and_then(JsonValue::as_str).unwrap_or("");
-            let module_id_str = node
-                .get("type")
-                .and_then(JsonValue::as_str)
-                .filter(|s| Uuid::parse_str(s).is_ok())
-                .or_else(|| {
-                    node.get("data")
-                        .and_then(|d| d.get("moduleId"))
-                        .and_then(JsonValue::as_str)
-                });
-            let Some(module_id_str) = module_id_str else {
-                continue;
-            };
-            let Ok(module_id) = Uuid::parse_str(module_id_str) else {
-                continue;
-            };
-            // If the RF node id is already a UUID, reuse it for
-            // deterministic graph identity across loads. Otherwise
-            // derive a stable UUID from the string via SHA-256.
-            let node_id = Uuid::parse_str(rf_id).unwrap_or_else(|_| {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(rf_id.as_bytes());
-                let mut bytes = [0u8; 16];
-                bytes.copy_from_slice(&hash[..16]);
-                Uuid::from_bytes(bytes)
-            });
-            rf_to_node.insert(rf_id.to_string(), node_id);
-            self.node_labels.insert(node_id, rf_id.to_string());
-
-            if let Some(data) = node.get("data").cloned() {
-                if data.is_object() && !data.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-                    self.node_configs.insert(node_id, data);
-                }
-            }
-
-            let retry_policy = read_node_retry_policy(node);
-            self.add_node(node_id, Some(module_id), retry_policy, None);
-        }
-
-        let empty_edges = vec![];
-        let edges = graph
-            .get("edges")
-            .and_then(JsonValue::as_array)
-            .unwrap_or(&empty_edges);
-        for edge in edges {
-            let src_rf = edge.get("source").and_then(JsonValue::as_str).unwrap_or("");
-            let tgt_rf = edge.get("target").and_then(JsonValue::as_str).unwrap_or("");
-            let (Some(&src), Some(&tgt)) = (rf_to_node.get(src_rf), rf_to_node.get(tgt_rf)) else {
-                continue;
-            };
-            let condition = edge
-                .get("condition")
-                .and_then(JsonValue::as_str)
-                .map(String::from);
-            let edge_type = edge
-                .get("edge_type")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("default")
-                .to_string();
-            let _ = self.add_edge(
-                src,
-                tgt,
-                EdgeLogic {
-                    source_handle: "output".to_string(),
-                    target_handle: "input".to_string(),
-                    mapping: None,
-                    condition,
-                    edge_type,
-                },
-            );
-        }
-
-        Ok(())
+    pub fn load_from_graph_json(
+        &mut self,
+        graph: &JsonValue,
+    ) -> Result<(), crate::WorkflowEngineError> {
+        self.parse_graph_document(graph)
     }
 
     /// Replace the default graph store. Consumers plug in whatever
@@ -1459,7 +876,7 @@ impl ParallelWorkflowEngine {
     async fn build_encrypted_secrets(
         &self,
         node_id: Uuid,
-        worker_shared_key: &Option<Arc<Vec<u8>>>,
+        worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> talos_workflow_job_protocol::EncryptedSecrets {
         let (Some(resolver), Some(key)) = (self.secrets_resolver.as_ref(), worker_shared_key)
         else {
@@ -1477,7 +894,7 @@ impl ParallelWorkflowEngine {
             self.user_id,
             &vault_paths,
             &[],
-            key,
+            key.as_bytes(),
         )
         .await
     }
@@ -1619,10 +1036,85 @@ impl ParallelWorkflowEngine {
     /// Load a workflow graph from a JSON string (React Flow format).
     ///
     /// Parses nodes and edges from the JSON and populates the internal graph.
-    pub async fn load_graph_from_json(&mut self, graph_json: &str) -> Result<(), String> {
-        let graph: serde_json::Value =
-            serde_json::from_str(graph_json).map_err(|e| format!("Invalid graph JSON: {}", e))?;
+    pub async fn load_graph_from_json(
+        &mut self,
+        graph_json: &str,
+    ) -> Result<(), crate::WorkflowEngineError> {
+        let graph: serde_json::Value = serde_json::from_str(graph_json)
+            .map_err(|e| crate::WorkflowEngineError::GraphJson(e.into()))?;
 
+        // Full synchronous parse — nodes, system nodes, reserved-key
+        // lifts, edges, execution_timeout_secs. The sync entry point
+        // `load_from_graph_json` shares this exact parser, so the two
+        // public methods never diverge.
+        self.parse_graph_document(&graph)?;
+        // Async follow-ups: rate-limit pre-load + sub-workflow graph
+        // prefetch. Kept out of `parse_graph_document` so the sync entry
+        // point doesn't need a runtime.
+        self.preload_rate_limits_and_subflows().await;
+        Ok(())
+    }
+
+    /// Async post-parse: batch-load per-module rate limits and
+    /// pre-fetch all sub-workflow graphs referenced by system nodes.
+    /// Eliminates N+1 queries during node dispatch.
+    async fn preload_rate_limits_and_subflows(&mut self) {
+        if let Some(ref fetcher) = self.module_fetcher {
+            let module_ids: Vec<Uuid> = self
+                .node_meta
+                .values()
+                .filter_map(|(mid, _, _)| *mid)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if !module_ids.is_empty() {
+                let rate_limits = fetcher.load_rate_limits(&module_ids).await;
+                for (id, limit) in rate_limits {
+                    self.rate_limits.insert(id, limit);
+                }
+                if !self.rate_limits.is_empty() {
+                    tracing::info!(
+                        rate_limited_modules = self.rate_limits.len(),
+                        "Loaded module rate limits for workflow",
+                    );
+                }
+            }
+        }
+        self.populate_sub_workflow_cache().await;
+    }
+
+    /// Single authoritative synchronous parser for React-Flow graph JSON.
+    ///
+    /// Accepts both the `&Value` entry point ([`load_from_graph_json`])
+    /// and the `&str` entry point ([`load_graph_from_json`], after JSON
+    /// parsing) delegate here, so the two public methods see exactly the
+    /// same parser semantics:
+    ///
+    /// * Module nodes (`type = <uuid>` or `data.moduleId = <uuid>`) and
+    ///   system nodes (`type = "system:<kind>"` or an explicit `kind`
+    ///   field) are both recognised.
+    /// * `execution_timeout_secs` at the graph root overrides the
+    ///   default.
+    /// * `skip_condition` / `continue_on_error` are lifted into reserved
+    ///   `__skip_condition` / `__continue_on_error` node-config keys.
+    /// * Edges carry `sourceHandle` / `targetHandle` / `condition` /
+    ///   `edge_type` when present.
+    ///
+    /// Returns [`crate::WorkflowEngineError::LoadGraph`] when `nodes` is
+    /// missing or empty (the engine refuses to run a graph with no
+    /// work).
+    ///
+    /// Async follow-ups (rate-limit pre-load, sub-workflow graph
+    /// prefetch) are intentionally out of scope — see
+    /// [`load_graph_from_json`] for where they run.
+    ///
+    /// [`load_from_graph_json`]: Self::load_from_graph_json
+    /// [`load_graph_from_json`]: Self::load_graph_from_json
+    pub(crate) fn parse_graph_document(
+        &mut self,
+        graph: &JsonValue,
+    ) -> Result<(), crate::WorkflowEngineError> {
         let empty_vec = vec![];
         let nodes = graph
             .get("nodes")
@@ -1630,12 +1122,19 @@ impl ParallelWorkflowEngine {
             .unwrap_or(&empty_vec);
 
         if nodes.is_empty() {
-            return Err("Workflow has no nodes".to_string());
+            return Err(crate::WorkflowEngineError::load_graph("Workflow has no nodes"));
         }
 
-        // Map RF node ID → unique engine node UUID.
-        // The node_id in the engine graph MUST be unique per node (not per module)
-        // to allow the same module to be used in multiple nodes without creating
+        if let Some(timeout) = graph
+            .get("execution_timeout_secs")
+            .and_then(JsonValue::as_u64)
+        {
+            self.execution_timeout_secs = timeout;
+        }
+
+        // Map RF node ID → unique engine node UUID. The node_id in the
+        // engine graph MUST be unique per node (not per module) to
+        // allow the same module in multiple nodes without creating
         // false cycle detections.
         let mut rf_to_node: HashMap<String, Uuid> = HashMap::new();
 
@@ -1652,8 +1151,8 @@ impl ParallelWorkflowEngine {
                 });
             if let Some(module_id_str) = module_id_str {
                 if let Ok(module_id) = Uuid::parse_str(module_id_str) {
-                    // Generate unique node ID: reuse RF ID if it's a UUID,
-                    // otherwise derive a deterministic UUID from the RF ID string.
+                    // Reuse RF ID if it's a UUID, else derive a
+                    // deterministic UUID from the string via SHA-256.
                     let node_id = Uuid::parse_str(rf_id).unwrap_or_else(|_| {
                         use sha2::{Digest, Sha256};
                         let hash = Sha256::digest(rf_id.as_bytes());
@@ -1664,15 +1163,13 @@ impl ParallelWorkflowEngine {
                     rf_to_node.insert(rf_id.to_string(), node_id);
                     self.node_labels.insert(node_id, rf_id.to_string());
 
-                    // Store node config from graph_json for use at dispatch time
                     if let Some(data) = node.get("data").cloned() {
                         if data.is_object()
                             && !data.as_object().map(|m| m.is_empty()).unwrap_or(true)
                         {
                             self.node_configs.insert(node_id, data.clone());
                         }
-                        // Extract skip_condition into node_configs under __skip_condition
-                        // Check data, config, and top-level node (handles all graph_json formats)
+                        // skip_condition → reserved `__skip_condition`.
                         if let Some(skip_cond) = data
                             .get("skip_condition")
                             .and_then(|v| v.as_str())
@@ -1694,9 +1191,7 @@ impl ParallelWorkflowEngine {
                                 )
                             });
                         }
-                        // Extract continue_on_error into node_configs under __continue_on_error.
-                        // Check inside data first, then fall back to node top-level since
-                        // add_node_to_workflow stores continue_on_error at the node's top level.
+                        // continue_on_error → reserved `__continue_on_error`.
                         if data
                             .get("continue_on_error")
                             .and_then(|v| v.as_bool())
@@ -1715,7 +1210,7 @@ impl ParallelWorkflowEngine {
                             });
                         }
                     } else {
-                        // Node has no "data" field — check top-level and config.skip_condition
+                        // Node has no "data" — check top-level and config.skip_condition.
                         if let Some(skip_cond) = node
                             .get("skip_condition")
                             .and_then(|v| v.as_str())
@@ -1736,7 +1231,6 @@ impl ParallelWorkflowEngine {
                                 )
                             });
                         }
-                        // Extract continue_on_error (top-level or config)
                         if let Some(true) = node
                             .get("continue_on_error")
                             .and_then(|v| v.as_bool())
@@ -1757,152 +1251,10 @@ impl ParallelWorkflowEngine {
                     }
 
                     let kind = node.get("kind").and_then(|k| k.as_str()).and_then(|k| {
-                        if k == "foreach" {
-                            let data = node.get("data")?;
-                            Some(SystemNodeKind::ForEach {
-                                input_path: data.get("input_path")?.as_str()?.to_string(),
-                                output_handle: data.get("output_handle")?.as_str()?.to_string(),
-                            })
-                        } else if k == "wait" {
-                            Some(SystemNodeKind::Wait {
-                                message: node
-                                    .get("data")
-                                    .and_then(|d| d.get("message"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
-                            })
-                        } else if k == "sub_workflow" {
-                            let data = node.get("data")?;
-                            Some(SystemNodeKind::SubWorkflow {
-                                workflow_id: data.get("sub_workflow_id")?.as_str()?.parse().ok()?,
-                                timeout_secs: data
-                                    .get("timeout_secs")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(30),
-                            })
-                        } else if k == "loop" {
-                            let data = node.get("data")?;
-                            Some(SystemNodeKind::Loop {
-                                max_iterations: data
-                                    .get("max_iterations")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(10)
-                                    .min(100)
-                                    as u32,
-                                condition: data.get("condition")?.as_str()?.to_string(),
-                            })
-                        } else if k == "collect" {
-                            Some(SystemNodeKind::Collect)
-                        } else if k == "synthesize" {
-                            let data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
-                            Some(SystemNodeKind::Synthesize {
-                                synthesis_expr: data
-                                    .get("synthesis_expr")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
-                            })
-                        } else if k == "verify" {
-                            let data = node.get("data")?;
-                            Some(SystemNodeKind::Verify {
-                                condition: data.get("condition")?.as_str()?.to_string(),
-                                check_label: data
-                                    .get("check_label")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
-                                on_failure: data
-                                    .get("on_failure")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("error")
-                                    .to_string(),
-                            })
-                        } else if k == "dispatch" {
-                            let data = node.get("data")?;
-                            Some(SystemNodeKind::DynamicDispatch {
-                                dispatch_expression: data
-                                    .get("dispatch_expression")?
-                                    .as_str()?
-                                    .to_string(),
-                                timeout_secs: data
-                                    .get("timeout_secs")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(30),
-                            })
-                        } else if k == "capability_dispatch" {
-                            let data = node.get("data")?;
-                            let caps = data
-                                .get("required_capabilities")?
-                                .as_array()?
-                                .iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect::<Vec<String>>();
-                            if caps.is_empty() {
-                                return None;
-                            }
-                            Some(SystemNodeKind::CapabilityDispatch {
-                                required_capabilities: caps,
-                                timeout_secs: data
-                                    .get("timeout_secs")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(30),
-                            })
-                        } else {
-                            // LLM/agent-specific kinds (feature-gated).
-                            parse_llm_system_node_kind(k, node)
-                        }
+                        parse_system_node_kind(k, node)
                     });
-                    // Extract per-node retry policy from graph_json
-                    let retry_policy = {
-                        let retry_count = node
-                            .get("retry_count")
-                            .or_else(|| node.get("data").and_then(|d| d.get("retry_count")))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32);
-                        let retry_backoff = node
-                            .get("retry_backoff_ms")
-                            .or_else(|| node.get("data").and_then(|d| d.get("retry_backoff_ms")))
-                            .and_then(|v| v.as_u64());
-                        let retry_condition = node
-                            .get("retry_condition")
-                            .or_else(|| node.get("data").and_then(|d| d.get("retry_condition")))
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        let retry_delay_expression = node
-                            .get("retry_delay_expression")
-                            .or_else(|| {
-                                node.get("data")
-                                    .and_then(|d| d.get("retry_delay_expression"))
-                            })
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                        let has_any = retry_count.is_some()
-                            || retry_backoff.is_some()
-                            || retry_condition.is_some()
-                            || retry_delay_expression.is_some();
-                        if has_any {
-                            // Cap retries for workflows not linked to an actor budget.
-                            // Without a budget ceiling, a near-fuel-exhausting module with
-                            // retry_count=10 can saturate workers for 15+ seconds per trigger.
-                            // Actor-owned executions may set up to their budget ceiling; the
-                            // platform default hard cap is 3 for all unbudgeted executions.
-                            const MAX_RETRIES_UNBUDGETED: u32 = 3;
-                            let requested = retry_count.unwrap_or(2);
-                            let max_retries = if self.actor_id.is_none() {
-                                requested.min(MAX_RETRIES_UNBUDGETED)
-                            } else {
-                                requested
-                            };
-                            Some(RetryPolicy {
-                                max_retries,
-                                backoff_ms: retry_backoff.unwrap_or(500),
-                                retry_condition,
-                                retry_delay_expression,
-                            })
-                        } else {
-                            None
-                        }
-                    };
+                    let retry_policy = read_node_retry_policy_with_actor_cap(node, self.actor_id);
                     self.add_node(node_id, Some(module_id), retry_policy, kind);
-                    // Extract per-node execution timeout from graph_json
                     let node_timeout_secs: Option<u64> = node
                         .get("data")
                         .and_then(|d| d.get("timeout_secs"))
@@ -1918,7 +1270,7 @@ impl ParallelWorkflowEngine {
                 .map(|s| s.starts_with("system:"))
                 .unwrap_or(false)
             {
-                // System node (e.g. system:sub_workflow) — no module_id, but has a kind
+                // System node: no module_id, but has a kind.
                 let node_id = Uuid::parse_str(rf_id).unwrap_or_else(|_| {
                     use sha2::{Digest, Sha256};
                     let hash = Sha256::digest(rf_id.as_bytes());
@@ -1933,8 +1285,6 @@ impl ParallelWorkflowEngine {
                     if data.is_object() && !data.as_object().map(|m| m.is_empty()).unwrap_or(true) {
                         self.node_configs.insert(node_id, data.clone());
                     }
-                    // Extract skip_condition into node_configs under __skip_condition.
-                    // Check inside data first, then fall back to node top-level.
                     if let Some(skip_cond) = data
                         .get("skip_condition")
                         .and_then(|v| v.as_str())
@@ -1948,9 +1298,6 @@ impl ParallelWorkflowEngine {
                             m.insert("__skip_condition".to_string(), serde_json::json!(skip_cond))
                         });
                     }
-                    // Extract continue_on_error into node_configs under __continue_on_error.
-                    // Check inside data first, then fall back to node top-level since
-                    // add_node_to_workflow stores continue_on_error at the node's top level.
                     if data
                         .get("continue_on_error")
                         .and_then(|v| v.as_bool())
@@ -1970,94 +1317,16 @@ impl ParallelWorkflowEngine {
                     }
                 }
 
-                // Derive kind from explicit "kind" field first, then fall back to the
-                // "system:" type suffix (e.g. "system:collect" → "collect").
-                // This handles nodes created by fix_fan_in which omit the "kind" field.
+                // Derive kind from explicit "kind" field first, then fall back
+                // to the "system:" type suffix — handles nodes emitted by
+                // builders that omit the "kind" field redundantly.
                 let kind_str: Option<&str> =
                     node.get("kind").and_then(|k| k.as_str()).or_else(|| {
                         node.get("type")
                             .and_then(|t| t.as_str())
                             .and_then(|t| t.strip_prefix("system:"))
                     });
-                let kind = kind_str.and_then(|k| {
-                    if k == "sub_workflow" {
-                        let data = node.get("data")?;
-                        Some(SystemNodeKind::SubWorkflow {
-                            workflow_id: data.get("sub_workflow_id")?.as_str()?.parse().ok()?,
-                            timeout_secs: data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(30),
-                        })
-                    } else if k == "loop" {
-                        let data = node.get("data")?;
-                        Some(SystemNodeKind::Loop {
-                            max_iterations: data
-                                .get("max_iterations")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(10)
-                                .min(100) as u32,
-                            condition: data.get("condition")?.as_str()?.to_string(),
-                        })
-                    } else if k == "collect" {
-                        Some(SystemNodeKind::Collect)
-                    } else if k == "synthesize" {
-                        let data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
-                        Some(SystemNodeKind::Synthesize {
-                            synthesis_expr: data
-                                .get("synthesis_expr")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()),
-                        })
-                    } else if k == "verify" {
-                        let data = node.get("data")?;
-                        Some(SystemNodeKind::Verify {
-                            condition: data.get("condition")?.as_str()?.to_string(),
-                            check_label: data
-                                .get("check_label")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()),
-                            on_failure: data
-                                .get("on_failure")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("error")
-                                .to_string(),
-                        })
-                    } else if k == "dispatch" {
-                        let data = node.get("data")?;
-                        Some(SystemNodeKind::DynamicDispatch {
-                            dispatch_expression: data
-                                .get("dispatch_expression")?
-                                .as_str()?
-                                .to_string(),
-                            timeout_secs: data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(30),
-                        })
-                    } else if k == "capability_dispatch" {
-                        let data = node.get("data")?;
-                        let caps = data
-                            .get("required_capabilities")?
-                            .as_array()?
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect::<Vec<String>>();
-                        if caps.is_empty() {
-                            return None;
-                        }
-                        Some(SystemNodeKind::CapabilityDispatch {
-                            required_capabilities: caps,
-                            timeout_secs: data
-                                .get("timeout_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(30),
-                        })
-                    } else {
-                        // LLM/agent-specific kinds (feature-gated).
-                        parse_llm_system_node_kind(k, node)
-                    }
-                });
+                let kind = kind_str.and_then(|k| parse_system_node_kind(k, node));
                 self.add_node(node_id, None, None, kind);
             }
         }
@@ -2100,34 +1369,6 @@ impl ParallelWorkflowEngine {
                 );
             }
         }
-
-        // Batch-load rate limits for all module IDs referenced in this graph.
-        if let Some(ref fetcher) = self.module_fetcher {
-            let module_ids: Vec<Uuid> = self
-                .node_meta
-                .values()
-                .filter_map(|(mid, _, _)| *mid)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            if !module_ids.is_empty() {
-                let rate_limits = fetcher.load_rate_limits(&module_ids).await;
-                for (id, limit) in rate_limits {
-                    self.rate_limits.insert(id, limit);
-                }
-                if !self.rate_limits.is_empty() {
-                    tracing::info!(
-                        rate_limited_modules = self.rate_limits.len(),
-                        "Loaded module rate limits for workflow",
-                    );
-                }
-            }
-        }
-
-        // Batch-fetch all sub-workflow graphs referenced by system nodes.
-        // This eliminates N+1 queries during node dispatch in run()/run_with_seed().
-        self.populate_sub_workflow_cache().await;
 
         Ok(())
     }
@@ -2210,15 +1451,18 @@ impl ParallelWorkflowEngine {
     }
 
     #[allow(dead_code)]
-    pub fn add_edge(&mut self, from: Uuid, to: Uuid, logic: EdgeLogic) -> Result<(), String> {
-        let from_idx = *self
-            .node_map
-            .get(&from)
-            .ok_or_else(|| format!("Edge source node {} not found", from))?;
-        let to_idx = *self
-            .node_map
-            .get(&to)
-            .ok_or_else(|| format!("Edge target node {} not found", to))?;
+    pub fn add_edge(
+        &mut self,
+        from: Uuid,
+        to: Uuid,
+        logic: EdgeLogic,
+    ) -> Result<(), crate::WorkflowEngineError> {
+        let from_idx = *self.node_map.get(&from).ok_or_else(|| {
+            crate::WorkflowEngineError::load_graph(format!("Edge source node {} not found", from))
+        })?;
+        let to_idx = *self.node_map.get(&to).ok_or_else(|| {
+            crate::WorkflowEngineError::load_graph(format!("Edge target node {} not found", to))
+        })?;
         self.graph.add_edge(from_idx, to_idx, logic);
         Ok(())
     }
@@ -2265,7 +1509,7 @@ impl ParallelWorkflowEngine {
         consensus_strategy: String,
         judge_wf_id_opt: Option<Uuid>,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> JsonValue {
         let clean_input = if let Some(obj) = inputs.as_object() {
             let mut cleaned = obj.clone();
@@ -2433,7 +1677,7 @@ impl ParallelWorkflowEngine {
         routes: std::collections::HashMap<String, Uuid>,
         fallback_wf_id: Option<Uuid>,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> JsonValue {
         let clean_input = if let Some(obj) = inputs.as_object() {
             let mut cleaned = obj.clone();
@@ -2583,7 +1827,7 @@ impl ParallelWorkflowEngine {
         reflection_wf_id: Uuid,
         max_retries: u32,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> JsonValue {
         let mut current_input = initial_input;
         let mut last_error = String::new();
@@ -2695,7 +1939,7 @@ impl ParallelWorkflowEngine {
         inputs: JsonValue,
         sub_wf_id: Uuid,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> JsonValue {
         // Strip internal metadata keys so sub-workflow input doesn't carry
         // engine internals (`__trigger_input__`, `__fuel_consumed__`, …).
@@ -2756,7 +2000,7 @@ impl ParallelWorkflowEngine {
         rubric: String,
         pass_threshold: Option<f64>,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> JsonValue {
         let judge_input = serde_json::json!({
             "content": &parent_inputs,
@@ -2845,7 +2089,7 @@ impl ParallelWorkflowEngine {
         sub_wf_id: Uuid,
         trigger_input: JsonValue,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> Result<JsonValue, SubflowError> {
         self.module_fetcher
             .as_ref()
@@ -2865,7 +2109,7 @@ impl ParallelWorkflowEngine {
         let mut sub_engine = self.new_subengine();
         sub_engine
             .load_from_graph_json(&graph_json)
-            .map_err(SubflowError::BuildFailed)?;
+            .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
 
         // Synthetic trigger node: seeded with the caller's input, wired to
         // every root so root-level modules actually execute.
@@ -3573,33 +2817,60 @@ impl ParallelWorkflowEngine {
     /// consumers with a different transport supply their own
     /// `NodeDispatcher` impl.
     ///
+    /// # Errors
+    ///
+    /// * [`WorkflowEngineError::SecretsResolverMissing`] when no
+    ///   [`SecretsResolver`] is configured. Fails closed before any
+    ///   dispatch happens because every dispatch site requires one to
+    ///   encrypt per-node secrets — an unset resolver would otherwise
+    ///   produce empty-ciphertext dispatches (silent security
+    ///   regression observed in a prior incident).
+    /// * [`WorkflowEngineError::GraphCyclic`] when the loaded graph
+    ///   has a cycle.
+    /// * [`WorkflowEngineError::Execution`] for other run-time
+    ///   failures the engine has not yet promoted to a typed variant
+    ///   (dispatch error, timeout, sub-workflow failure, etc.); the
+    ///   message body is human-readable but **not** stable for
+    ///   pattern-matching.
+    ///
     /// [`NodeDispatcher`]: talos_workflow_engine_core::NodeDispatcher
+    /// [`SecretsResolver`]: talos_workflow_engine_core::SecretsResolver
+    /// [`WorkflowEngineError::SecretsResolverMissing`]: crate::WorkflowEngineError::SecretsResolverMissing
+    /// [`WorkflowEngineError::GraphCyclic`]: crate::WorkflowEngineError::GraphCyclic
+    /// [`WorkflowEngineError::Execution`]: crate::WorkflowEngineError::Execution
     pub async fn run_with_transport(
         &self,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        execution_id: Uuid,
+    ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
+        // Abstract-entry guard: see `WorkflowEngineError::SecretsResolverMissing`
+        // for the rationale (every dispatch site requires a resolver
+        // to encrypt per-node secrets; an unset resolver would
+        // produce empty-ciphertext dispatches).
+        if self.secrets_resolver.is_none() {
+            return Err(crate::WorkflowEngineError::SecretsResolverMissing);
+        }
+        if petgraph::algo::is_cyclic_directed(&self.graph) {
+            return Err(crate::WorkflowEngineError::GraphCyclic);
+        }
+        self.run_with_transport_inner(dispatcher, worker_shared_key, execution_id)
+            .await
+            .map_err(crate::WorkflowEngineError::execution)
+    }
+
+    /// Internal body of [`Self::run_with_transport`]. Kept on a
+    /// `String` error type so the (large) scheduling loop can use `?`
+    /// against pre-existing internal `Result<_, String>` paths
+    /// without wholesale refactor; the public wrapper promotes
+    /// failures to [`crate::WorkflowEngineError`] and adds the
+    /// typed-variant checks for documented failure modes.
+    async fn run_with_transport_inner(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         execution_id: Uuid,
     ) -> Result<WorkflowContext, String> {
-        // Abstract-entry guard: the engine's public execution path
-        // REQUIRES a configured `SecretsResolver`. Without one, every
-        // dispatch site's `(Some(resolver), Some(key))` guard silently
-        // sends empty-ciphertext `encrypted_secrets` — the exact class
-        // of bug that masked the 2026-04-16 loop-node secret-injection
-        // regression. Fail closed at run start so a misconfigured
-        // engine can never produce a silently-unsecured dispatch.
-        if self.secrets_resolver.is_none() {
-            return Err(
-                "ParallelWorkflowEngine was constructed without a SecretsResolver. \
-                 Use `with_services`, `with_services_and_resolver`, or \
-                 `set_secrets_resolver` before calling run_with_transport. \
-                 Running without a resolver is not permitted on the abstract \
-                 entry point because every dispatch site requires one to encrypt \
-                 per-node secrets; an unset resolver produces empty-ciphertext \
-                 dispatches (silent security regression)."
-                    .to_string(),
-            );
-        }
-
         // Build the execution-scoped DLP context once — used to value-scrub output/errors
         // before DB storage. Regex patterns are applied on top in a second pass.
         // Per-run DLP sanitizer — built once from resolved node configs
@@ -3875,7 +3146,7 @@ impl ParallelWorkflowEngine {
                                                 user_id_clone,
                                                 &vault_paths,
                                                 &[],
-                                                key,
+                                                key.as_bytes(),
                                             )
                                             .await
                                         }
@@ -3890,7 +3161,7 @@ impl ParallelWorkflowEngine {
                                     // the individual `module_executions` rows
                                     // (those use `step_exec_ids` — see below).
                                     job_id: None,
-                                    user_id: uid,
+                                    user_id: Some(uid),
                                     actor_id: self.actor_id,
                                     // Match pre-extraction behavior: the redis fallback
                                     // key is `redis:wasm:{module_id}`, NOT the graph node
@@ -4038,7 +3309,7 @@ impl ParallelWorkflowEngine {
 
                             let chain_request = talos_workflow_engine_core::ChainDispatchRequest {
                                 workflow_execution_id: execution_id,
-                                user_id: uid_for_chain.unwrap_or_else(Uuid::nil),
+                                user_id: uid_for_chain,
                                 job_id: None,
                                 steps: step_jobs,
                                 share_sandbox: true,
@@ -5604,9 +4875,7 @@ impl ParallelWorkflowEngine {
                                                 // module_executions rows; let the adapter
                                                 // mint a fresh job_id.
                                                 job_id: None,
-                                                user_id: self
-                                                    .user_id
-                                                    .unwrap_or_else(uuid::Uuid::nil),
+                                                user_id: self.user_id,
                                                 actor_id: self.actor_id,
                                                 module_uri: wasm_module
                                                     .oci_url
@@ -6056,7 +5325,7 @@ impl ParallelWorkflowEngine {
                                     single_user_id,
                                     &vault_paths,
                                     &wasm_module.allowed_secrets,
-                                    key,
+                                    key.as_bytes(),
                                 )
                                 .await
                             }
@@ -6078,7 +5347,7 @@ impl ParallelWorkflowEngine {
                         // thread it through so the worker's UPDATE lands on the
                         // same row and worker logs stay correlated.
                         job_id: Some(job_id),
-                        user_id: user_id_clone.unwrap_or_else(uuid::Uuid::nil),
+                        user_id: user_id_clone,
                         actor_id: self.actor_id,
                         module_uri: wasm_module
                             .oci_url
@@ -6631,26 +5900,53 @@ impl ParallelWorkflowEngine {
     ///
     /// Uses single-node dispatch — the pipeline chain optimisation is not applied,
     /// keeping the implementation simple for trigger-based workflow runs.
+    ///
+    /// # Errors
+    ///
+    /// Same error contract as [`Self::run_with_transport`].
     pub fn run_with_seed_with_transport(
         &self,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<Arc<Vec<u8>>>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        initial_results: HashMap<Uuid, JsonValue>,
+        execution_id: Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>>
+                + Send
+                + '_,
+        >,
+    > {
+        // Abstract-entry guard: mirrors `run_with_transport`. See
+        // `WorkflowEngineError::SecretsResolverMissing` for rationale.
+        if self.secrets_resolver.is_none() {
+            return Box::pin(async move { Err(crate::WorkflowEngineError::SecretsResolverMissing) });
+        }
+        if petgraph::algo::is_cyclic_directed(&self.graph) {
+            return Box::pin(async move { Err(crate::WorkflowEngineError::GraphCyclic) });
+        }
+        let inner = self.run_with_seed_with_transport_inner(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+        );
+        Box::pin(async move { inner.await.map_err(crate::WorkflowEngineError::execution) })
+    }
+
+    /// Internal body of [`Self::run_with_seed_with_transport`]. Kept
+    /// on a `String` error type so the (large) scheduling loop can
+    /// use `?` against pre-existing internal `Result<_, String>`
+    /// paths without wholesale refactor; the public wrapper promotes
+    /// failures to [`crate::WorkflowEngineError`] and adds the
+    /// typed-variant checks for documented failure modes.
+    fn run_with_seed_with_transport_inner(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<WorkflowContext, String>> + Send + '_>> {
-        // Abstract-entry guard: mirrors `run_with_transport`. See the
-        // equivalent check there for the rationale; not repeating the
-        // commentary here.
-        if self.secrets_resolver.is_none() {
-            return Box::pin(async move {
-                Err(
-                    "ParallelWorkflowEngine was constructed without a SecretsResolver. \
-                     Call `set_secrets_resolver` before \
-                     `run_with_seed_with_transport`."
-                        .to_string(),
-                )
-            });
-        }
         let timeout_secs = self.execution_timeout_secs;
         // Build the execution-scoped DLP context before the closure captures `self` by reference.
         // It is moved into the async closure and used to value-scrub output/errors before persistence.
@@ -7732,7 +7028,7 @@ impl ParallelWorkflowEngine {
                                                 node_id: body_uuid,
                                                 module_id: body_module_id,
                                                 job_id: None,
-                                                user_id: self.user_id.unwrap_or_else(uuid::Uuid::nil),
+                                                user_id: self.user_id,
                                                 actor_id: self.actor_id,
                                                 module_uri: wasm_module.oci_url.clone()
                                                     .unwrap_or_else(|| format!("redis:wasm:{}", body_module_id)),
@@ -8114,7 +7410,7 @@ impl ParallelWorkflowEngine {
                                 user_id_clone,
                                 &vault_paths,
                                 &wasm_module.allowed_secrets,
-                                key,
+                                key.as_bytes(),
                             )
                             .await
                         }
@@ -8130,7 +7426,7 @@ impl ParallelWorkflowEngine {
                         node_id,
                         module_id: module_id_resolved,
                         job_id: Some(job_id),
-                        user_id: user_id_clone.unwrap_or_else(uuid::Uuid::nil),
+                        user_id: user_id_clone,
                         actor_id: self.actor_id,
                         module_uri: wasm_module
                             .oci_url

@@ -11,6 +11,19 @@
 //! [`WorkflowGraphStore`](talos_workflow_engine_core::WorkflowGraphStore)
 //! impl for persistence).
 //!
+//! # Error reporting
+//!
+//! Every configuration-time problem — an `add_system_node` variant the
+//! JSON parser has no branch for, a `with_skip_condition` referencing
+//! an id that doesn't exist — is **accumulated** rather than returned
+//! at the call site. The fluent chain stays unbroken; [`build`] is the
+//! single fallibility point. This design surfaces *all* misconfigurations
+//! in one shot instead of stopping at the first one, and avoids the
+//! common silent-no-op footgun where typos in node ids just drop the
+//! intended configuration on the floor.
+//!
+//! [`build`]: WorkflowGraphBuilder::build
+//!
 //! # Example
 //!
 //! ```
@@ -31,9 +44,9 @@
 //!             output_handle: "element".into(),
 //!         },
 //!     )
-//!     .expect("ForEach is a JSON-round-trippable kind")
 //!     .edge("fetch", "split")
-//!     .build();
+//!     .build()
+//!     .expect("graph is well-formed");
 //!
 //! // `graph` is a JSON value with the same shape React Flow produces.
 //! assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
@@ -59,75 +72,94 @@ use serde_json::{json, Map, Value as JsonValue};
 use talos_workflow_engine_core::SystemNodeKind;
 use uuid::Uuid;
 
-/// Returned from [`WorkflowGraphBuilder::add_system_node`] when the
-/// caller passes a [`SystemNodeKind`] variant the engine's JSON
-/// parser cannot read back.
+/// One configuration-time problem accumulated while building a graph.
 ///
-/// The following variants exist on `SystemNodeKind` for programmatic
-/// graph construction (via `ParallelWorkflowEngine::add_node`) but
-/// have no corresponding `kind` string the JSON parser accepts:
-///
-/// * `FanIn` — no `"fan_in"` parser branch (engine consumes the
-///   `JoinMode` + `aggregation_expr` via graph-topology analysis,
-///   not a serialized node).
-/// * `ErrorHandler` — no `"error_handler"` parser branch.
-/// * `WhileLoop` — the JSON parser emits `SystemNodeKind::Loop` for
-///   any `kind: "loop"` input; there is no dedicated `"while_loop"`
-///   tag.
-/// * `RepeatLoop` — same parser path as `Loop`; requires a
-///   `condition` field that `RepeatLoop` doesn't carry.
-///
-/// Consumers who need these variants should either:
-/// * Construct the engine graph imperatively via
-///   `ParallelWorkflowEngine::add_node(node_id, module_id, retry,
-///   Some(kind))`, OR
-/// * Use [`WorkflowGraphBuilder::add_raw_node`] with a hand-crafted
-///   JSON object that a custom parser downstream knows how to
-///   interpret.
-///
-/// The parser-unification that unblocks these variants is a 0.2
-/// roadmap item; this error type becomes `#[deprecated]` when that
-/// lands.
+/// Surfaced as part of [`BuildError`] when [`WorkflowGraphBuilder::build`]
+/// is called. Each variant names the method that produced it, so error
+/// messages unambiguously point at the offending builder call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedSystemNodeKind {
-    /// Name of the `SystemNodeKind` variant that failed.
-    kind_name: &'static str,
+#[non_exhaustive]
+pub enum WorkflowGraphBuilderError {
+    /// A `.with_*` mutator was called with an `id` that did not match
+    /// any node previously added to the builder. Typical cause: a typo
+    /// in the id string, or calling the mutator before the node was
+    /// added.
+    UnknownNodeId {
+        /// The id the caller passed.
+        id: String,
+        /// The mutator method that rejected it (for instance,
+        /// `"with_skip_condition"`).
+        method: &'static str,
+    },
 }
 
-impl UnsupportedSystemNodeKind {
-    /// Return the variant name that was rejected (e.g. `"FanIn"`).
-    #[must_use]
-    pub fn variant_name(&self) -> &'static str {
-        self.kind_name
-    }
-}
-
-impl fmt::Display for UnsupportedSystemNodeKind {
+impl fmt::Display for WorkflowGraphBuilderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "SystemNodeKind::{} cannot be serialized for JSON graph round-trip \
-             (the engine's parser has no reader for this kind). Construct the \
-             engine graph imperatively via `ParallelWorkflowEngine::add_node` \
-             or emit a custom JSON shape via `add_raw_node`.",
-            self.kind_name
-        )
+        match self {
+            Self::UnknownNodeId { id, method } => write!(
+                f,
+                "{method}: no node with id {id:?} has been added to the builder"
+            ),
+        }
     }
 }
 
-impl std::error::Error for UnsupportedSystemNodeKind {}
+impl std::error::Error for WorkflowGraphBuilderError {}
+
+/// Aggregate of every [`WorkflowGraphBuilderError`] accumulated during
+/// a builder session. Returned by [`WorkflowGraphBuilder::build`] when
+/// at least one error was recorded.
+///
+/// Display formats every contained error, one per line, so forwarding
+/// through `{err}` / `anyhow::Error` produces a readable multi-line
+/// diagnostic. Callers that need the individual errors can match on
+/// [`BuildError::errors`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildError {
+    errors: Vec<WorkflowGraphBuilderError>,
+}
+
+impl BuildError {
+    /// Borrow the individual errors. Always non-empty: a `BuildError`
+    /// is only constructed when at least one problem was recorded.
+    #[must_use]
+    pub fn errors(&self) -> &[WorkflowGraphBuilderError] {
+        &self.errors
+    }
+
+    /// Consume the aggregate and return the owned vector.
+    #[must_use]
+    pub fn into_errors(self) -> Vec<WorkflowGraphBuilderError> {
+        self.errors
+    }
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.errors.len();
+        writeln!(f, "WorkflowGraphBuilder::build failed with {n} error(s):")?;
+        for (i, e) in self.errors.iter().enumerate() {
+            writeln!(f, "  [{}] {e}", i + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BuildError {}
 
 /// Build a React-Flow-shaped `graph_json` programmatically.
 ///
-/// See the [module-level docs](crate::graph_builder) for an example.
-/// The builder is `#[must_use]`-friendly: every mutator returns
-/// `self`, so chained calls compile to `build()` or nothing.
+/// See the [module-level docs](crate::graph_builder) for an example
+/// and the error-reporting model. The builder is `#[must_use]`-friendly:
+/// every mutator returns `self`, so chained calls compile to `build()`
+/// or nothing.
 #[derive(Debug, Default, Clone)]
 #[must_use]
 pub struct WorkflowGraphBuilder {
     nodes: Vec<JsonValue>,
     edges: Vec<JsonValue>,
     execution_timeout_secs: Option<u64>,
+    errors: Vec<WorkflowGraphBuilderError>,
 }
 
 impl WorkflowGraphBuilder {
@@ -174,26 +206,15 @@ impl WorkflowGraphBuilder {
 
     /// Add a built-in system node for a [`SystemNodeKind`] variant.
     ///
-    /// Serializes the variant into the React-Flow `kind` + `data`
-    /// shape the parser accepts. Returns
-    /// [`UnsupportedSystemNodeKind`] when the caller passes a variant
-    /// the parser cannot read back — see that type's docs for the
-    /// current list (`FanIn`, `ErrorHandler`, `WhileLoop`,
-    /// `RepeatLoop`). LLM-flavored variants are only present when
-    /// compiled with the `llm-primitives` feature; passing one
-    /// without the feature is a compile-time error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`UnsupportedSystemNodeKind`] for variants the engine
-    /// parser has no branch for.
-    pub fn add_system_node(
-        mut self,
-        id: impl Into<String>,
-        kind: SystemNodeKind,
-    ) -> Result<Self, UnsupportedSystemNodeKind> {
+    /// Serializes the variant into the React-Flow `kind` + `data` shape
+    /// the engine's parser accepts. Every [`SystemNodeKind`] variant
+    /// round-trips through this method; there is no "unsupported"
+    /// subset. LLM-flavored variants are only present when compiled
+    /// with the `llm-primitives` feature; passing one without the
+    /// feature is a compile-time error.
+    pub fn add_system_node(mut self, id: impl Into<String>, kind: SystemNodeKind) -> Self {
         let id = id.into();
-        let (kind_str, data) = serialize_system_node_kind(&kind)?;
+        let (kind_str, data) = serialize_system_node_kind(&kind);
         let mut node = Map::new();
         node.insert("id".to_string(), JsonValue::String(id));
         // The engine's full parser (`load_graph_from_json`) dispatches
@@ -207,7 +228,7 @@ impl WorkflowGraphBuilder {
         node.insert("kind".to_string(), JsonValue::String(kind_str.to_string()));
         node.insert("data".to_string(), data);
         self.nodes.push(JsonValue::Object(node));
-        Ok(self)
+        self
     }
 
     /// Add a completely custom node shape. Use when a feature isn't
@@ -225,13 +246,13 @@ impl WorkflowGraphBuilder {
 
     /// Attach a skip-condition expression to the node with `id`.
     ///
-    /// The engine reads this into the node's config under the
-    /// reserved `__skip_condition` key; when the expression evaluates
-    /// truthy at dispatch time, the node short-circuits without
-    /// running.
+    /// The engine reads this into the node's config under the reserved
+    /// `__skip_condition` key; when the expression evaluates truthy at
+    /// dispatch time, the node short-circuits without running.
     ///
-    /// No-op when no node with `id` has been added yet — the builder
-    /// doesn't panic on missing ids to keep chains ergonomic.
+    /// If no node with `id` has been added, a
+    /// [`WorkflowGraphBuilderError::UnknownNodeId`] is recorded and
+    /// surfaced at [`build`](Self::build).
     pub fn with_skip_condition(
         mut self,
         id: impl AsRef<str>,
@@ -239,10 +260,14 @@ impl WorkflowGraphBuilder {
     ) -> Self {
         let id = id.as_ref();
         let condition: String = condition.into();
-        if let Some(node) = self.find_node_mut(id) {
-            if let Some(obj) = node.as_object_mut() {
-                obj.insert("skip_condition".to_string(), JsonValue::String(condition));
-            }
+        if let Some(obj) = self.find_node_obj_mut(id) {
+            obj.insert("skip_condition".to_string(), JsonValue::String(condition));
+        } else {
+            self.errors
+                .push(WorkflowGraphBuilderError::UnknownNodeId {
+                    id: id.to_string(),
+                    method: "with_skip_condition",
+                });
         }
         self
     }
@@ -253,13 +278,19 @@ impl WorkflowGraphBuilder {
     /// workflow — downstream nodes still run with the failed node's
     /// error envelope as input.
     ///
-    /// No-op when no node with `id` has been added yet.
+    /// If no node with `id` has been added, a
+    /// [`WorkflowGraphBuilderError::UnknownNodeId`] is recorded and
+    /// surfaced at [`build`](Self::build).
     pub fn with_continue_on_error(mut self, id: impl AsRef<str>) -> Self {
         let id = id.as_ref();
-        if let Some(node) = self.find_node_mut(id) {
-            if let Some(obj) = node.as_object_mut() {
-                obj.insert("continue_on_error".to_string(), JsonValue::Bool(true));
-            }
+        if let Some(obj) = self.find_node_obj_mut(id) {
+            obj.insert("continue_on_error".to_string(), JsonValue::Bool(true));
+        } else {
+            self.errors
+                .push(WorkflowGraphBuilderError::UnknownNodeId {
+                    id: id.to_string(),
+                    method: "with_continue_on_error",
+                });
         }
         self
     }
@@ -274,7 +305,9 @@ impl WorkflowGraphBuilder {
     /// * `delay_expression` — optional expression returning the next
     ///   retry delay in ms, computed from the error output.
     ///
-    /// No-op when no node with `id` has been added yet.
+    /// If no node with `id` has been added, a
+    /// [`WorkflowGraphBuilderError::UnknownNodeId`] is recorded and
+    /// surfaced at [`build`](Self::build).
     pub fn with_retry(
         mut self,
         id: impl AsRef<str>,
@@ -284,17 +317,21 @@ impl WorkflowGraphBuilder {
         delay_expression: Option<String>,
     ) -> Self {
         let id = id.as_ref();
-        if let Some(node) = self.find_node_mut(id) {
-            if let Some(obj) = node.as_object_mut() {
-                obj.insert("retry_count".to_string(), json!(max_retries));
-                obj.insert("retry_backoff_ms".to_string(), json!(backoff_ms));
-                if let Some(c) = condition {
-                    obj.insert("retry_condition".to_string(), JsonValue::String(c));
-                }
-                if let Some(d) = delay_expression {
-                    obj.insert("retry_delay_expression".to_string(), JsonValue::String(d));
-                }
+        if let Some(obj) = self.find_node_obj_mut(id) {
+            obj.insert("retry_count".to_string(), json!(max_retries));
+            obj.insert("retry_backoff_ms".to_string(), json!(backoff_ms));
+            if let Some(c) = condition {
+                obj.insert("retry_condition".to_string(), JsonValue::String(c));
             }
+            if let Some(d) = delay_expression {
+                obj.insert("retry_delay_expression".to_string(), JsonValue::String(d));
+            }
+        } else {
+            self.errors
+                .push(WorkflowGraphBuilderError::UnknownNodeId {
+                    id: id.to_string(),
+                    method: "with_retry",
+                });
         }
         self
     }
@@ -353,21 +390,64 @@ impl WorkflowGraphBuilder {
     /// [`ParallelWorkflowEngine::load_from_graph_json`](crate::ParallelWorkflowEngine::load_from_graph_json)
     /// or a consumer's
     /// [`WorkflowGraphStore`](talos_workflow_engine_core::WorkflowGraphStore).
-    #[must_use]
-    pub fn build(self) -> JsonValue {
-        let mut root = Map::new();
-        root.insert("nodes".to_string(), JsonValue::Array(self.nodes));
-        root.insert("edges".to_string(), JsonValue::Array(self.edges));
-        if let Some(secs) = self.execution_timeout_secs {
-            root.insert("execution_timeout_secs".to_string(), json!(secs));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] containing every
+    /// [`WorkflowGraphBuilderError`] accumulated during the builder
+    /// chain (unknown node ids, unsupported system node kinds, etc.).
+    /// If you need the partial JSON regardless of errors — for example
+    /// to feed a linter or diff tool — use [`build_partial`](Self::build_partial).
+    pub fn build(self) -> Result<JsonValue, BuildError> {
+        if !self.errors.is_empty() {
+            return Err(BuildError {
+                errors: self.errors,
+            });
         }
-        JsonValue::Object(root)
+        Ok(Self::assemble_root(
+            self.nodes,
+            self.edges,
+            self.execution_timeout_secs,
+        ))
     }
 
-    fn find_node_mut(&mut self, id: &str) -> Option<&mut JsonValue> {
+    /// Emit the assembled graph and the accumulated errors side-by-side.
+    ///
+    /// Useful for tooling that wants to show *all* problems while still
+    /// rendering a best-effort graph, or for tests that assert on the
+    /// exact shape of both sides.
+    #[must_use]
+    pub fn build_partial(self) -> (JsonValue, Vec<WorkflowGraphBuilderError>) {
+        let value = Self::assemble_root(self.nodes, self.edges, self.execution_timeout_secs);
+        (value, self.errors)
+    }
+
+    /// Borrow any errors accumulated so far without consuming the
+    /// builder. Useful in tests to assert on mid-chain state.
+    #[must_use]
+    pub fn errors(&self) -> &[WorkflowGraphBuilderError] {
+        &self.errors
+    }
+
+    fn find_node_obj_mut(&mut self, id: &str) -> Option<&mut Map<String, JsonValue>> {
         self.nodes
             .iter_mut()
             .find(|n| n.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|n| n.as_object_mut())
+    }
+
+    fn assemble_root(
+        nodes: Vec<JsonValue>,
+        edges: Vec<JsonValue>,
+        execution_timeout_secs: Option<u64>,
+    ) -> JsonValue {
+        let mut root = Map::new();
+        root.insert("nodes".to_string(), JsonValue::Array(nodes));
+        root.insert("edges".to_string(), JsonValue::Array(edges));
+        if let Some(secs) = execution_timeout_secs {
+            root.insert("execution_timeout_secs".to_string(), json!(secs));
+        }
+        JsonValue::Object(root)
     }
 }
 
@@ -377,14 +457,12 @@ impl WorkflowGraphBuilder {
 /// Kept in one place so parser drift is easy to audit: every variant
 /// here corresponds 1:1 to an `else if k == "..."` branch in
 /// `engine.rs::load_from_graph_json` / `parse_llm_system_node_kind`.
-///
-/// Returns [`UnsupportedSystemNodeKind`] for variants the parser
-/// cannot read back. See the error type's docs for the list.
+/// The match is exhaustive; every [`SystemNodeKind`] variant has a
+/// serialization. Adding a new variant to the enum requires adding a
+/// branch here and in the parser.
 #[allow(clippy::too_many_lines)]
-fn serialize_system_node_kind(
-    kind: &SystemNodeKind,
-) -> Result<(&'static str, JsonValue), UnsupportedSystemNodeKind> {
-    Ok(match kind {
+fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue) {
+    match kind {
         SystemNodeKind::ForEach {
             input_path,
             output_handle,
@@ -402,28 +480,46 @@ fn serialize_system_node_kind(
                 None => json!({}),
             },
         ),
-        // Rejected variants — parser has no reader for these shapes.
-        // See [`UnsupportedSystemNodeKind`] for context. Consumers
-        // needing these build the engine graph imperatively or emit
-        // a custom shape via `add_raw_node`.
-        SystemNodeKind::WhileLoop { .. } => {
-            return Err(UnsupportedSystemNodeKind {
-                kind_name: "WhileLoop",
-            });
-        }
-        SystemNodeKind::RepeatLoop { .. } => {
-            return Err(UnsupportedSystemNodeKind {
-                kind_name: "RepeatLoop",
-            });
-        }
-        SystemNodeKind::ErrorHandler { .. } => {
-            return Err(UnsupportedSystemNodeKind {
-                kind_name: "ErrorHandler",
-            });
-        }
-        SystemNodeKind::FanIn { .. } => {
-            return Err(UnsupportedSystemNodeKind { kind_name: "FanIn" });
-        }
+        SystemNodeKind::WhileLoop {
+            condition,
+            max_iterations,
+        } => (
+            "while_loop",
+            json!({
+                "condition": condition,
+                "max_iterations": max_iterations,
+            }),
+        ),
+        SystemNodeKind::RepeatLoop { count } => (
+            "repeat_loop",
+            json!({
+                "count": count,
+            }),
+        ),
+        SystemNodeKind::ErrorHandler { error_pattern } => (
+            "error_handler",
+            match error_pattern {
+                Some(p) => json!({ "error_pattern": p }),
+                None => json!({}),
+            },
+        ),
+        SystemNodeKind::FanIn {
+            join_mode,
+            aggregation_expr,
+        } => (
+            "fan_in",
+            // `JoinMode` derives Serialize/Deserialize; round-trip uses
+            // the default externally-tagged form (`"All"` / `"Any"` /
+            // `"Majority"` / `{"N": n}`). Keeping the derive output
+            // stable avoids parser/serializer drift.
+            match aggregation_expr {
+                Some(expr) => json!({
+                    "join_mode": join_mode,
+                    "aggregation_expr": expr,
+                }),
+                None => json!({ "join_mode": join_mode }),
+            },
+        ),
         SystemNodeKind::SubWorkflow {
             workflow_id,
             timeout_secs,
@@ -589,7 +685,7 @@ fn serialize_system_node_kind(
                 "timeout_secs": timeout_secs,
             }),
         ),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -598,7 +694,7 @@ mod tests {
 
     #[test]
     fn empty_builder_produces_empty_nodes_and_edges() {
-        let g = WorkflowGraphBuilder::new().build();
+        let g = WorkflowGraphBuilder::new().build().unwrap();
         assert_eq!(g["nodes"].as_array().unwrap().len(), 0);
         assert_eq!(g["edges"].as_array().unwrap().len(), 0);
         assert!(g.get("execution_timeout_secs").is_none());
@@ -608,7 +704,8 @@ mod tests {
     fn execution_timeout_is_rendered() {
         let g = WorkflowGraphBuilder::new()
             .execution_timeout(Duration::from_secs(123))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(g["execution_timeout_secs"].as_u64(), Some(123));
     }
 
@@ -617,7 +714,8 @@ mod tests {
         let module_id = Uuid::new_v4();
         let g = WorkflowGraphBuilder::new()
             .add_module("fetch", module_id, Some(json!({ "url": "x" })))
-            .build();
+            .build()
+            .unwrap();
         let node = &g["nodes"][0];
         assert_eq!(node["id"].as_str(), Some("fetch"));
         assert_eq!(node["type"].as_str(), Some(module_id.to_string().as_str()));
@@ -634,8 +732,8 @@ mod tests {
                     output_handle: "element".into(),
                 },
             )
-            .unwrap()
-            .build();
+            .build()
+            .unwrap();
         let node = &g["nodes"][0];
         assert_eq!(node["id"].as_str(), Some("split"));
         assert_eq!(node["type"].as_str(), Some("system:foreach"));
@@ -645,35 +743,60 @@ mod tests {
     }
 
     #[test]
-    fn add_system_node_rejects_fan_in() {
-        let err = WorkflowGraphBuilder::new()
+    fn add_system_node_fan_in_round_trips() {
+        let g = WorkflowGraphBuilder::new()
             .add_system_node(
                 "join",
                 SystemNodeKind::FanIn {
-                    join_mode: talos_workflow_engine_core::JoinMode::All,
+                    join_mode: talos_workflow_engine_core::JoinMode::Majority,
+                    aggregation_expr: Some("sum".to_string()),
+                },
+            )
+            .build()
+            .unwrap();
+        let node = &g["nodes"][0];
+        assert_eq!(node["kind"].as_str(), Some("fan_in"));
+        assert_eq!(node["type"].as_str(), Some("system:fan_in"));
+        assert_eq!(node["data"]["join_mode"].as_str(), Some("Majority"));
+        assert_eq!(node["data"]["aggregation_expr"].as_str(), Some("sum"));
+    }
+
+    #[test]
+    fn add_system_node_fan_in_with_n_variant_round_trips() {
+        let g = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "join",
+                SystemNodeKind::FanIn {
+                    join_mode: talos_workflow_engine_core::JoinMode::N(3),
                     aggregation_expr: None,
                 },
             )
-            .expect_err("FanIn must fail round-trip");
-        assert_eq!(err.variant_name(), "FanIn");
+            .build()
+            .unwrap();
+        let node = &g["nodes"][0];
+        assert_eq!(node["data"]["join_mode"]["N"].as_u64(), Some(3));
+        assert!(node["data"].get("aggregation_expr").is_none());
     }
 
     #[test]
-    fn add_system_node_rejects_error_handler() {
-        let err = WorkflowGraphBuilder::new()
+    fn add_system_node_error_handler_round_trips() {
+        let g = WorkflowGraphBuilder::new()
             .add_system_node(
                 "eh",
                 SystemNodeKind::ErrorHandler {
-                    error_pattern: None,
+                    error_pattern: Some("timeout".to_string()),
                 },
             )
-            .expect_err("ErrorHandler must fail round-trip");
-        assert_eq!(err.variant_name(), "ErrorHandler");
+            .build()
+            .unwrap();
+        let node = &g["nodes"][0];
+        assert_eq!(node["kind"].as_str(), Some("error_handler"));
+        assert_eq!(node["data"]["error_pattern"].as_str(), Some("timeout"));
     }
 
     #[test]
-    fn add_system_node_rejects_while_loop() {
-        let err = WorkflowGraphBuilder::new()
+    fn add_system_node_while_loop_round_trips() {
+        let g = WorkflowGraphBuilder::new()
             .add_system_node(
                 "w",
                 SystemNodeKind::WhileLoop {
@@ -681,21 +804,28 @@ mod tests {
                     max_iterations: 5,
                 },
             )
-            .expect_err("WhileLoop must fail round-trip");
-        assert_eq!(err.variant_name(), "WhileLoop");
+            .build()
+            .unwrap();
+        let node = &g["nodes"][0];
+        assert_eq!(node["kind"].as_str(), Some("while_loop"));
+        assert_eq!(node["data"]["condition"].as_str(), Some("x < 10"));
+        assert_eq!(node["data"]["max_iterations"].as_u64(), Some(5));
     }
 
     #[test]
-    fn add_system_node_rejects_repeat_loop() {
-        let err = WorkflowGraphBuilder::new()
+    fn add_system_node_repeat_loop_round_trips() {
+        let g = WorkflowGraphBuilder::new()
             .add_system_node("r", SystemNodeKind::RepeatLoop { count: 3 })
-            .expect_err("RepeatLoop must fail round-trip");
-        assert_eq!(err.variant_name(), "RepeatLoop");
+            .build()
+            .unwrap();
+        let node = &g["nodes"][0];
+        assert_eq!(node["kind"].as_str(), Some("repeat_loop"));
+        assert_eq!(node["data"]["count"].as_u64(), Some(3));
     }
 
     #[test]
     fn edge_default_handles() {
-        let g = WorkflowGraphBuilder::new().edge("a", "b").build();
+        let g = WorkflowGraphBuilder::new().edge("a", "b").build().unwrap();
         let edge = &g["edges"][0];
         assert_eq!(edge["source"].as_str(), Some("a"));
         assert_eq!(edge["target"].as_str(), Some("b"));
@@ -708,7 +838,8 @@ mod tests {
         let g = WorkflowGraphBuilder::new()
             .edge("a", "b")
             .edge_condition("b", "c", "ok == true")
-            .build();
+            .build()
+            .unwrap();
         let second = &g["edges"][1];
         assert_eq!(second["source"].as_str(), Some("b"));
         assert_eq!(second["condition"].as_str(), Some("ok == true"));
@@ -723,7 +854,8 @@ mod tests {
             .add_module("fetch", module_id, None)
             .with_skip_condition("fetch", "upstream.skip")
             .with_continue_on_error("fetch")
-            .build();
+            .build()
+            .unwrap();
         let node = &g["nodes"][0];
         assert_eq!(node["skip_condition"].as_str(), Some("upstream.skip"));
         assert_eq!(node["continue_on_error"].as_bool(), Some(true));
@@ -741,7 +873,8 @@ mod tests {
                 Some("error_code == 429".into()),
                 Some("min(5000, base * 2)".into()),
             )
-            .build();
+            .build()
+            .unwrap();
         let node = &g["nodes"][0];
         assert_eq!(node["retry_count"].as_u64(), Some(3));
         assert_eq!(node["retry_backoff_ms"].as_u64(), Some(500));
@@ -753,11 +886,54 @@ mod tests {
     }
 
     #[test]
-    fn with_missing_id_is_noop() {
-        let g = WorkflowGraphBuilder::new()
+    fn with_missing_id_records_unknown_node_error() {
+        let err = WorkflowGraphBuilder::new()
             .with_skip_condition("nonexistent", "something")
-            .build();
-        assert_eq!(g["nodes"].as_array().unwrap().len(), 0);
+            .build()
+            .expect_err("typo in id must fail build");
+        assert_eq!(err.errors().len(), 1);
+        // The enum is `#[non_exhaustive]` and carries only `UnknownNodeId`
+        // today; the bare `match` still compiles if new variants land, at
+        // which point this test should expand.
+        match &err.errors()[0] {
+            WorkflowGraphBuilderError::UnknownNodeId { id, method } => {
+                assert_eq!(id, "nonexistent");
+                assert_eq!(*method, "with_skip_condition");
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_errors_all_surface_at_build() {
+        let err = WorkflowGraphBuilder::new()
+            .with_skip_condition("typo_a", "x")
+            .with_continue_on_error("typo_b")
+            .with_retry("typo_c", 1, 100, None, None)
+            .build()
+            .expect_err("multiple errors must fail build");
+        assert_eq!(err.errors().len(), 3);
+        // Display of the aggregate surfaces every one.
+        let rendered = format!("{err}");
+        assert!(rendered.contains("typo_a"));
+        assert!(rendered.contains("typo_b"));
+        assert!(rendered.contains("typo_c"));
+    }
+
+    #[test]
+    fn build_partial_returns_graph_and_errors_side_by_side() {
+        let module_id = Uuid::new_v4();
+        let (graph, errors) = WorkflowGraphBuilder::new()
+            .add_module("fetch", module_id, None)
+            .with_skip_condition("typo", "x")
+            .build_partial();
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn errors_accessor_exposes_mid_chain_state() {
+        let builder = WorkflowGraphBuilder::new().with_skip_condition("typo", "x");
+        assert_eq!(builder.errors().len(), 1);
     }
 
     #[test]
@@ -765,7 +941,8 @@ mod tests {
         let g = WorkflowGraphBuilder::new()
             .add_raw_node(json!({ "id": "custom", "type": "experimental" }))
             .add_raw_edge(json!({ "source": "a", "target": "b", "edge_type": "on_failure" }))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(g["nodes"][0]["type"].as_str(), Some("experimental"));
         assert_eq!(g["edges"][0]["edge_type"].as_str(), Some("on_failure"));
     }
@@ -774,8 +951,8 @@ mod tests {
     fn system_node_collect_has_empty_data() {
         let g = WorkflowGraphBuilder::new()
             .add_system_node("c", SystemNodeKind::Collect)
-            .unwrap()
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(g["nodes"][0]["kind"].as_str(), Some("collect"));
         assert!(g["nodes"][0]["data"].as_object().unwrap().is_empty());
     }
@@ -790,22 +967,91 @@ mod tests {
                     timeout_secs: 30,
                 },
             )
-            .unwrap()
-            .build();
+            .build()
+            .unwrap();
         let caps = &g["nodes"][0]["data"]["required_capabilities"];
         assert_eq!(caps[0].as_str(), Some("llm"));
         assert_eq!(caps[1].as_str(), Some("rag"));
     }
 
     #[tokio::test]
+    async fn previously_unsupported_kinds_round_trip_through_parser() {
+        // End-to-end: builder emits → engine parses → engine dispatches
+        // the right handler. Catches drift between `serialize_system_node_kind`
+        // and the kind-decoding branches in `load_graph_from_json`.
+        use crate::ParallelWorkflowEngine;
+
+        let graph = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "fan",
+                SystemNodeKind::FanIn {
+                    join_mode: talos_workflow_engine_core::JoinMode::N(2),
+                    aggregation_expr: Some("count".into()),
+                },
+            )
+            .add_system_node(
+                "eh",
+                SystemNodeKind::ErrorHandler {
+                    error_pattern: Some("rate_limited".into()),
+                },
+            )
+            .add_system_node(
+                "w",
+                SystemNodeKind::WhileLoop {
+                    condition: "cursor != null".into(),
+                    max_iterations: 7,
+                },
+            )
+            .add_system_node("r", SystemNodeKind::RepeatLoop { count: 4 })
+            .build()
+            .unwrap();
+
+        let json_str = serde_json::to_string(&graph).unwrap();
+
+        let mut engine = ParallelWorkflowEngine::new();
+        engine
+            .load_graph_from_json(&json_str)
+            .await
+            .expect("parser accepts builder output for all four kinds");
+        assert_eq!(engine.graph().node_count(), 4);
+
+        // node_meta should carry the decoded kind. Each label maps to
+        // a UUID via `node_labels`; we check the expected variant.
+        let find = |label: &str| {
+            engine
+                .node_labels()
+                .iter()
+                .find(|(_, l)| l.as_str() == label)
+                .map(|(u, _)| *u)
+                .and_then(|u| engine.node_meta().get(&u))
+                .and_then(|(_, _, k)| k.clone())
+                .unwrap_or_else(|| panic!("no kind decoded for {label}"))
+        };
+
+        assert!(matches!(
+            find("fan"),
+            SystemNodeKind::FanIn {
+                join_mode: talos_workflow_engine_core::JoinMode::N(2),
+                aggregation_expr: Some(ref e),
+            } if e == "count"
+        ));
+        assert!(matches!(
+            find("eh"),
+            SystemNodeKind::ErrorHandler { error_pattern: Some(ref p) } if p == "rate_limited"
+        ));
+        assert!(matches!(
+            find("w"),
+            SystemNodeKind::WhileLoop {
+                condition: ref c,
+                max_iterations: 7,
+            } if c == "cursor != null"
+        ));
+        assert!(matches!(find("r"), SystemNodeKind::RepeatLoop { count: 4 }));
+    }
+
+    #[tokio::test]
     async fn round_trip_through_load_graph_from_json() {
         // End-to-end: build a graph, serialize, parse, verify topology.
-        //
-        // We test the async `load_graph_from_json(&str)` because it's
-        // the canonical full-feature entry point (handles system
-        // nodes; the sync `load_from_graph_json(&Value)` only handles
-        // module nodes — a pre-existing parser-divergence the engine
-        // carries and a 0.2 unification candidate).
         use crate::ParallelWorkflowEngine;
 
         let module_id = Uuid::new_v4();
@@ -819,12 +1065,11 @@ mod tests {
                     output_handle: "element".into(),
                 },
             )
-            .unwrap()
             .add_system_node("aggregate", SystemNodeKind::Collect)
-            .unwrap()
             .edge("fetch", "split")
             .edge("split", "aggregate")
-            .build();
+            .build()
+            .unwrap();
 
         let json_str = serde_json::to_string(&graph).unwrap();
 
@@ -834,21 +1079,15 @@ mod tests {
             .await
             .expect("parser accepts builder output");
 
-        // Both parsers read nodes + edges identically — assert on
-        // those. `execution_timeout_secs` is only read by the sync
-        // parser today; the builder emits it regardless so the sync
-        // parser path picks it up when used.
-        assert_eq!(engine.graph.node_count(), 3);
-        assert_eq!(engine.graph.edge_count(), 2);
+        // Both parsers read nodes + edges identically — assert on those.
+        assert_eq!(engine.graph().node_count(), 3);
+        assert_eq!(engine.graph().edge_count(), 2);
     }
 
     #[test]
     fn round_trip_through_load_from_graph_json_module_only() {
         // Complement to the async round-trip test: exercise the sync
-        // `load_from_graph_json(&Value)` path. This parser only
-        // accepts module nodes; use it here to verify the
-        // execution_timeout propagation path that the async parser
-        // currently skips.
+        // `load_from_graph_json(&Value)` path.
         use crate::ParallelWorkflowEngine;
 
         let m1 = Uuid::new_v4();
@@ -858,16 +1097,67 @@ mod tests {
             .add_module("a", m1, None)
             .add_module("b", m2, None)
             .edge("a", "b")
-            .build();
+            .build()
+            .unwrap();
 
         let mut engine = ParallelWorkflowEngine::new();
         engine
             .load_from_graph_json(&graph)
             .expect("parser accepts builder output");
 
-        assert_eq!(engine.graph.node_count(), 2);
-        assert_eq!(engine.graph.edge_count(), 1);
-        assert_eq!(engine.execution_timeout_secs, 42);
+        assert_eq!(engine.graph().node_count(), 2);
+        assert_eq!(engine.graph().edge_count(), 1);
+        assert_eq!(engine.execution_timeout_secs(), 42);
+    }
+
+    #[test]
+    fn sync_parser_now_accepts_system_nodes() {
+        // Regression test for the parser unification. Before the two
+        // parsers were merged, `load_from_graph_json(&Value)` skipped
+        // any node without a module_id — so a pure-system-node graph
+        // would load as empty. After unification, the sync parser
+        // handles system nodes identically to the async parser.
+        use crate::ParallelWorkflowEngine;
+
+        let graph = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "split",
+                SystemNodeKind::ForEach {
+                    input_path: "items".into(),
+                    output_handle: "element".into(),
+                },
+            )
+            .add_system_node("collect", SystemNodeKind::Collect)
+            .edge("split", "collect")
+            .build()
+            .unwrap();
+
+        let mut engine = ParallelWorkflowEngine::new();
+        engine
+            .load_from_graph_json(&graph)
+            .expect("sync parser accepts system-only graphs");
+
+        // Previously 0 — the sync parser dropped system nodes silently.
+        assert_eq!(engine.graph().node_count(), 2);
+        assert_eq!(engine.graph().edge_count(), 1);
+    }
+
+    #[test]
+    fn sync_parser_rejects_empty_nodes() {
+        // Regression test for the empty-nodes policy unification.
+        // Pre-Phase 3 the sync parser accepted empty graphs; both
+        // entry points now reject them consistently.
+        use crate::ParallelWorkflowEngine;
+
+        let graph = WorkflowGraphBuilder::new().build().unwrap();
+        let mut engine = ParallelWorkflowEngine::new();
+        let err = engine
+            .load_from_graph_json(&graph)
+            .expect_err("empty-nodes graph must be rejected");
+        // `LoadGraph` is the catch-all for graph-load rejections; the
+        // message body is informational only, variant check is what
+        // consumers should match on.
+        assert!(matches!(err, crate::WorkflowEngineError::LoadGraph(_)));
     }
 
     #[cfg(feature = "llm-primitives")]
@@ -884,8 +1174,8 @@ mod tests {
                     timeout_secs: 60,
                 },
             )
-            .unwrap()
-            .build();
+            .build()
+            .unwrap();
         let node = &g["nodes"][0];
         assert_eq!(node["kind"].as_str(), Some("judge"));
         assert_eq!(
