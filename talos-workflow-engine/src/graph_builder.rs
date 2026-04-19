@@ -31,6 +31,7 @@
 //!             output_handle: "element".into(),
 //!         },
 //!     )
+//!     .expect("ForEach is a JSON-round-trippable kind")
 //!     .edge("fetch", "split")
 //!     .build();
 //!
@@ -51,11 +52,70 @@
 //! All three produce `serde_json::Value`s with the same shape; the
 //! engine's parser is the single source of truth for what's accepted.
 
+use std::fmt;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value as JsonValue};
 use talos_workflow_engine_core::SystemNodeKind;
 use uuid::Uuid;
+
+/// Returned from [`WorkflowGraphBuilder::add_system_node`] when the
+/// caller passes a [`SystemNodeKind`] variant the engine's JSON
+/// parser cannot read back.
+///
+/// The following variants exist on `SystemNodeKind` for programmatic
+/// graph construction (via `ParallelWorkflowEngine::add_node`) but
+/// have no corresponding `kind` string the JSON parser accepts:
+///
+/// * `FanIn` — no `"fan_in"` parser branch (engine consumes the
+///   `JoinMode` + `aggregation_expr` via graph-topology analysis,
+///   not a serialized node).
+/// * `ErrorHandler` — no `"error_handler"` parser branch.
+/// * `WhileLoop` — the JSON parser emits `SystemNodeKind::Loop` for
+///   any `kind: "loop"` input; there is no dedicated `"while_loop"`
+///   tag.
+/// * `RepeatLoop` — same parser path as `Loop`; requires a
+///   `condition` field that `RepeatLoop` doesn't carry.
+///
+/// Consumers who need these variants should either:
+/// * Construct the engine graph imperatively via
+///   `ParallelWorkflowEngine::add_node(node_id, module_id, retry,
+///   Some(kind))`, OR
+/// * Use [`WorkflowGraphBuilder::add_raw_node`] with a hand-crafted
+///   JSON object that a custom parser downstream knows how to
+///   interpret.
+///
+/// The parser-unification that unblocks these variants is a 0.2
+/// roadmap item; this error type becomes `#[deprecated]` when that
+/// lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSystemNodeKind {
+    /// Name of the `SystemNodeKind` variant that failed.
+    kind_name: &'static str,
+}
+
+impl UnsupportedSystemNodeKind {
+    /// Return the variant name that was rejected (e.g. `"FanIn"`).
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        self.kind_name
+    }
+}
+
+impl fmt::Display for UnsupportedSystemNodeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SystemNodeKind::{} cannot be serialized for JSON graph round-trip \
+             (the engine's parser has no reader for this kind). Construct the \
+             engine graph imperatively via `ParallelWorkflowEngine::add_node` \
+             or emit a custom JSON shape via `add_raw_node`.",
+            self.kind_name
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSystemNodeKind {}
 
 /// Build a React-Flow-shaped `graph_json` programmatically.
 ///
@@ -112,15 +172,28 @@ impl WorkflowGraphBuilder {
         self
     }
 
-    /// Add a built-in system node for any [`SystemNodeKind`] variant.
+    /// Add a built-in system node for a [`SystemNodeKind`] variant.
     ///
     /// Serializes the variant into the React-Flow `kind` + `data`
-    /// shape the parser accepts. LLM-flavored variants are only
-    /// present when compiled with the `llm-primitives` feature;
-    /// passing one without the feature is a compile-time error.
-    pub fn add_system_node(mut self, id: impl Into<String>, kind: SystemNodeKind) -> Self {
+    /// shape the parser accepts. Returns
+    /// [`UnsupportedSystemNodeKind`] when the caller passes a variant
+    /// the parser cannot read back — see that type's docs for the
+    /// current list (`FanIn`, `ErrorHandler`, `WhileLoop`,
+    /// `RepeatLoop`). LLM-flavored variants are only present when
+    /// compiled with the `llm-primitives` feature; passing one
+    /// without the feature is a compile-time error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsupportedSystemNodeKind`] for variants the engine
+    /// parser has no branch for.
+    pub fn add_system_node(
+        mut self,
+        id: impl Into<String>,
+        kind: SystemNodeKind,
+    ) -> Result<Self, UnsupportedSystemNodeKind> {
         let id = id.into();
-        let (kind_str, data) = serialize_system_node_kind(&kind);
+        let (kind_str, data) = serialize_system_node_kind(&kind)?;
         let mut node = Map::new();
         node.insert("id".to_string(), JsonValue::String(id));
         // The engine's full parser (`load_graph_from_json`) dispatches
@@ -134,7 +207,7 @@ impl WorkflowGraphBuilder {
         node.insert("kind".to_string(), JsonValue::String(kind_str.to_string()));
         node.insert("data".to_string(), data);
         self.nodes.push(JsonValue::Object(node));
-        self
+        Ok(self)
     }
 
     /// Add a completely custom node shape. Use when a feature isn't
@@ -304,9 +377,14 @@ impl WorkflowGraphBuilder {
 /// Kept in one place so parser drift is easy to audit: every variant
 /// here corresponds 1:1 to an `else if k == "..."` branch in
 /// `engine.rs::load_from_graph_json` / `parse_llm_system_node_kind`.
+///
+/// Returns [`UnsupportedSystemNodeKind`] for variants the parser
+/// cannot read back. See the error type's docs for the list.
 #[allow(clippy::too_many_lines)]
-fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue) {
-    match kind {
+fn serialize_system_node_kind(
+    kind: &SystemNodeKind,
+) -> Result<(&'static str, JsonValue), UnsupportedSystemNodeKind> {
+    Ok(match kind {
         SystemNodeKind::ForEach {
             input_path,
             output_handle,
@@ -324,34 +402,28 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 None => json!({}),
             },
         ),
-        SystemNodeKind::WhileLoop {
-            condition,
-            max_iterations,
-        } => (
-            "loop",
-            json!({
-                "condition": condition,
-                "max_iterations": max_iterations,
-            }),
-        ),
-        SystemNodeKind::RepeatLoop { count } => ("loop", json!({ "count": count })),
-        SystemNodeKind::ErrorHandler { error_pattern } => (
-            "error_handler",
-            match error_pattern {
-                Some(p) => json!({ "error_pattern": p }),
-                None => json!({}),
-            },
-        ),
-        SystemNodeKind::FanIn {
-            join_mode,
-            aggregation_expr,
-        } => (
-            "fan_in",
-            json!({
-                "join_mode": format!("{join_mode:?}").to_lowercase(),
-                "aggregation_expr": aggregation_expr,
-            }),
-        ),
+        // Rejected variants — parser has no reader for these shapes.
+        // See [`UnsupportedSystemNodeKind`] for context. Consumers
+        // needing these build the engine graph imperatively or emit
+        // a custom shape via `add_raw_node`.
+        SystemNodeKind::WhileLoop { .. } => {
+            return Err(UnsupportedSystemNodeKind {
+                kind_name: "WhileLoop",
+            });
+        }
+        SystemNodeKind::RepeatLoop { .. } => {
+            return Err(UnsupportedSystemNodeKind {
+                kind_name: "RepeatLoop",
+            });
+        }
+        SystemNodeKind::ErrorHandler { .. } => {
+            return Err(UnsupportedSystemNodeKind {
+                kind_name: "ErrorHandler",
+            });
+        }
+        SystemNodeKind::FanIn { .. } => {
+            return Err(UnsupportedSystemNodeKind { kind_name: "FanIn" });
+        }
         SystemNodeKind::SubWorkflow {
             workflow_id,
             timeout_secs,
@@ -517,7 +589,7 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "timeout_secs": timeout_secs,
             }),
         ),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -562,6 +634,7 @@ mod tests {
                     output_handle: "element".into(),
                 },
             )
+            .unwrap()
             .build();
         let node = &g["nodes"][0];
         assert_eq!(node["id"].as_str(), Some("split"));
@@ -569,6 +642,55 @@ mod tests {
         assert_eq!(node["kind"].as_str(), Some("foreach"));
         assert_eq!(node["data"]["input_path"].as_str(), Some("items"));
         assert_eq!(node["data"]["output_handle"].as_str(), Some("element"));
+    }
+
+    #[test]
+    fn add_system_node_rejects_fan_in() {
+        let err = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "join",
+                SystemNodeKind::FanIn {
+                    join_mode: talos_workflow_engine_core::JoinMode::All,
+                    aggregation_expr: None,
+                },
+            )
+            .expect_err("FanIn must fail round-trip");
+        assert_eq!(err.variant_name(), "FanIn");
+    }
+
+    #[test]
+    fn add_system_node_rejects_error_handler() {
+        let err = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "eh",
+                SystemNodeKind::ErrorHandler {
+                    error_pattern: None,
+                },
+            )
+            .expect_err("ErrorHandler must fail round-trip");
+        assert_eq!(err.variant_name(), "ErrorHandler");
+    }
+
+    #[test]
+    fn add_system_node_rejects_while_loop() {
+        let err = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "w",
+                SystemNodeKind::WhileLoop {
+                    condition: "x < 10".into(),
+                    max_iterations: 5,
+                },
+            )
+            .expect_err("WhileLoop must fail round-trip");
+        assert_eq!(err.variant_name(), "WhileLoop");
+    }
+
+    #[test]
+    fn add_system_node_rejects_repeat_loop() {
+        let err = WorkflowGraphBuilder::new()
+            .add_system_node("r", SystemNodeKind::RepeatLoop { count: 3 })
+            .expect_err("RepeatLoop must fail round-trip");
+        assert_eq!(err.variant_name(), "RepeatLoop");
     }
 
     #[test]
@@ -652,6 +774,7 @@ mod tests {
     fn system_node_collect_has_empty_data() {
         let g = WorkflowGraphBuilder::new()
             .add_system_node("c", SystemNodeKind::Collect)
+            .unwrap()
             .build();
         assert_eq!(g["nodes"][0]["kind"].as_str(), Some("collect"));
         assert!(g["nodes"][0]["data"].as_object().unwrap().is_empty());
@@ -667,6 +790,7 @@ mod tests {
                     timeout_secs: 30,
                 },
             )
+            .unwrap()
             .build();
         let caps = &g["nodes"][0]["data"]["required_capabilities"];
         assert_eq!(caps[0].as_str(), Some("llm"));
@@ -695,7 +819,9 @@ mod tests {
                     output_handle: "element".into(),
                 },
             )
+            .unwrap()
             .add_system_node("aggregate", SystemNodeKind::Collect)
+            .unwrap()
             .edge("fetch", "split")
             .edge("split", "aggregate")
             .build();
@@ -758,6 +884,7 @@ mod tests {
                     timeout_secs: 60,
                 },
             )
+            .unwrap()
             .build();
         let node = &g["nodes"][0];
         assert_eq!(node["kind"].as_str(), Some("judge"));

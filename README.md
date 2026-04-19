@@ -131,7 +131,7 @@ let graph = WorkflowGraphBuilder::new()
     .add_system_node("split", SystemNodeKind::ForEach {
         input_path: "items".into(),
         output_handle: "element".into(),
-    })
+    })?
     .edge("fetch", "split")
     .build();
 
