@@ -43,6 +43,7 @@ pub mod graph_builder;
 pub mod graph_json;
 mod graph_parser;
 mod sandbox;
+mod scheduler_handlers;
 mod secrets_pipeline;
 mod validation;
 pub mod vault_resolver;

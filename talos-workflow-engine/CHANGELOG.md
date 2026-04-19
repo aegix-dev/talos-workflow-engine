@@ -49,9 +49,20 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
   into `chain_detect` (linear-chain detection), `graph_parser` (JSON →
   `SystemNodeKind` decoding, retry-policy parsing), `sandbox`
   (per-execution scratch dir + RAII guard), `secrets_pipeline` (node
-  secret resolution + envelope sealing), and `validation` (config
-  pattern validator + output sanitizer). The public API is unchanged
-  apart from the additions noted above.
+  secret resolution + envelope sealing), `validation` (config pattern
+  validator + output sanitizer), and `scheduler_handlers` (per-
+  `SystemNodeKind` dispatch methods lifted from the reactor body).
+  The scheduler body in `run_with_transport_inner` shrank from 3,025
+  lines to ~2,430 by extracting 12 local-computation and
+  sub-workflow-dispatch handlers (Collect, Synthesize, Verify,
+  WhileLoop, RepeatLoop, ConfidenceGate, Judge, Ensemble,
+  ReflectiveRetry, LlmDispatch, SubWorkflow, Loop). A shared
+  `unblock_successors` helper replaces ~12 copies of the decrement-
+  and-enqueue boilerplate. Remaining large inline blocks (AgentLoop,
+  DynamicDispatch, CapabilityDispatch, single-node, pipeline-chain)
+  and the parallel body in `run_with_seed_with_transport_inner` are
+  follow-up work. The public API is unchanged apart from the
+  additions noted above.
 - **Breaking** (behavior, not signature): `load_from_graph_json`
   (sync, `&Value`) and `load_graph_from_json` (async, `&str`) now share
   a single authoritative parser. The sync entry point previously

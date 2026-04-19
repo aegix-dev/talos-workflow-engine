@@ -795,7 +795,7 @@ impl ParallelWorkflowEngine {
     // wires these via `wire_default_policy_adapters`, so the fallbacks
     // never fire on real traffic; they're only for bare `new()` test engines.
 
-    fn eval_bool(&self, expression: &str, context: &JsonValue) -> bool {
+    pub(crate) fn eval_bool(&self, expression: &str, context: &JsonValue) -> bool {
         self.expression_evaluator
             .as_ref()
             .map(|e| e.eval_bool(expression, context))
@@ -873,7 +873,7 @@ impl ParallelWorkflowEngine {
     /// Thin wrapper around [`build_encrypted_secrets_for`] that sources
     /// `vault_paths` from the node's own config and has no additional
     /// declared paths. Prefer this form on call sites that hold `&self`.
-    async fn build_encrypted_secrets(
+    pub(crate) async fn build_encrypted_secrets(
         &self,
         node_id: Uuid,
         worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
@@ -1423,7 +1423,7 @@ impl ParallelWorkflowEngine {
     /// Resolve the actual module UUID for a node.
     /// Nodes have their own unique IDs in the graph; the module_id (which WASM to load)
     /// is stored in node_meta. Falls back to node_id for backwards compatibility.
-    fn resolve_module_id(&self, node_id: Uuid) -> Uuid {
+    pub(crate) fn resolve_module_id(&self, node_id: Uuid) -> Uuid {
         self.node_meta
             .get(&node_id)
             .and_then(|(mid, _, _)| *mid)
@@ -2272,7 +2272,11 @@ impl ParallelWorkflowEngine {
     /// - **Single parent**: passes the parent output directly (unwrapped)
     /// - **Multiple parents**: wraps outputs in an object keyed by user-defined
     ///   node label (from `node_labels`) or falling back to the internal UUID.
-    fn gather_inputs(&self, node_idx: NodeIndex, results: &HashMap<Uuid, JsonValue>) -> JsonValue {
+    pub(crate) fn gather_inputs(
+        &self,
+        node_idx: NodeIndex,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> JsonValue {
         let parents: Vec<(Uuid, &JsonValue)> = self
             .graph
             .neighbors_directed(node_idx, Direction::Incoming)
@@ -2312,7 +2316,7 @@ impl ParallelWorkflowEngine {
     /// [`ModuleFetcher`] which owns the real resolution pipeline
     /// (primary lookup, stale-ref-by-name, template fallback,
     /// precompiled-template fallback, Redis cache warm-up).
-    async fn fetch_module(
+    pub(crate) async fn fetch_module(
         &self,
         node_id: Uuid,
     ) -> Result<talos_workflow_engine_core::WasmModuleArtifact, String> {
@@ -2425,7 +2429,7 @@ impl ParallelWorkflowEngine {
     ///
     /// Strips engine-internal metadata (`__`-prefixed keys) from each branch
     /// output and wraps them in `{"items": [...], "count": N}`.
-    fn collect_parent_outputs_for_node(
+    pub(crate) fn collect_parent_outputs_for_node(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,
@@ -2505,7 +2509,7 @@ impl ParallelWorkflowEngine {
     /// Collects parent outputs (stripping `__`-prefixed metadata), optionally
     /// evaluates a Rhai `synthesis_expr`, and returns the synthesized value.
     /// Array size is capped at 500 to match Rhai limits.
-    fn synthesize_parent_outputs(
+    pub(crate) fn synthesize_parent_outputs(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,
@@ -2573,7 +2577,7 @@ impl ParallelWorkflowEngine {
     /// Returns `(result_json, passed)` where `passed` indicates whether the
     /// verification condition was satisfied.  The caller uses `passed` to
     /// select the event status string ("Completed" vs "Failed").
-    fn evaluate_verify_node(
+    pub(crate) fn evaluate_verify_node(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,
@@ -2644,7 +2648,7 @@ impl ParallelWorkflowEngine {
     /// `Err(waiting_json)` when the gate is paused awaiting approval.
     /// The caller must handle the `Err` case by early-returning from the
     /// reactor loop with a `waiting: true` WorkflowContext.
-    async fn evaluate_confidence_gate(
+    pub(crate) async fn evaluate_confidence_gate(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,
@@ -2771,7 +2775,53 @@ impl ParallelWorkflowEngine {
     /// collapsed system nodes (Collect, Synthesize, Verify) whose
     /// downstream observers reconstruct per-node timelines from the
     /// events table.
-    fn emit_node_lifecycle_events(
+    /// Owning user id for this execution, if any. See
+    /// [`set_user_id`](Self::set_user_id) for the setter.
+    #[must_use]
+    pub(crate) fn user_id(&self) -> Option<Uuid> {
+        self.user_id
+    }
+
+    /// Actor id that owns this execution, if any. See
+    /// [`set_actor_id`](Self::set_actor_id) for the setter.
+    #[must_use]
+    pub(crate) fn actor_id(&self) -> Option<Uuid> {
+        self.actor_id
+    }
+
+    /// Per-node execution-timeout override set on the graph JSON, or
+    /// `None` to use the scheduler's default. Exposed as a helper so
+    /// the scheduler-handler module can read the value without
+    /// touching the private map directly.
+    #[must_use]
+    pub(crate) fn node_timeout_for(&self, node_id: Uuid) -> Option<u64> {
+        self.node_timeouts.get(&node_id).copied()
+    }
+
+    /// Fire-and-forget emit of a `loop_iteration` event. Used by the
+    /// `Loop`-variant handler to log progress without blocking the
+    /// dispatch loop on the event sink.
+    pub(crate) fn emit_loop_iteration_event(
+        &self,
+        execution_id: Uuid,
+        node_id: Uuid,
+        iteration: u32,
+        max_iters: u32,
+    ) {
+        emit_event_spawn(
+            &self.event_sink,
+            NodeEventWrite {
+                execution_id,
+                event_type: "loop_iteration".to_string(),
+                node_id: Some(node_id),
+                status: "Running".to_string(),
+                log_message: Some(format!("Loop iteration {iteration}/{max_iters}")),
+                iteration_index: Some(iteration as i32),
+            },
+        );
+    }
+
+    pub(crate) fn emit_node_lifecycle_events(
         &self,
         execution_id: Uuid,
         node_id: Uuid,
@@ -3524,236 +3574,78 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Collect dispatch (local computation — chain reactor) ─────
-                if let Some((_, _, Some(SystemNodeKind::Collect))) = self.node_meta.get(&node_id) {
-                    let collected = self.collect_parent_outputs_for_node(node_idx, &results);
-                    let parent_count = collected.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-
-                    results.insert(node_id, collected);
-
-                    self.emit_node_lifecycle_events(
-                        execution_id,
-                        node_id,
-                        "Completed",
-                        format!("collected {} branch outputs into items array", parent_count),
-                    );
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if *cnt == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                if let Some(output) =
+                    self.try_dispatch_collect(node_idx, node_id, execution_id, &results)
+                {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── Synthesize dispatch (collect + optional Rhai synthesis) ──
-                if let Some((_, _, Some(SystemNodeKind::Synthesize { ref synthesis_expr }))) =
-                    self.node_meta.get(&node_id)
+                if let Some(output) =
+                    self.try_dispatch_synthesize(node_idx, node_id, execution_id, &results)
                 {
-                    let synthesis_expr = synthesis_expr.clone();
-                    let synthesized =
-                        self.synthesize_parent_outputs(node_idx, &results, &synthesis_expr);
-
-                    // Recover parent_count for event logging from the synthesized output
-                    // (it may be an object with "count" if no expression was applied, or
-                    // arbitrary if a Rhai expression transformed it).
-                    let parent_count = synthesized
-                        .get("count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-
-                    results.insert(node_id, synthesized);
-
-                    self.emit_node_lifecycle_events(
-                        execution_id,
-                        node_id,
-                        "Completed",
-                        format!("synthesized {} branch outputs", parent_count),
-                    );
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if *cnt == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── Verify dispatch (step-level output verification) ─────────
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::Verify {
-                        ref condition,
-                        ref check_label,
-                        ref on_failure,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) =
+                    self.try_dispatch_verify(node_idx, node_id, execution_id, &results)
                 {
-                    let check_label = check_label
-                        .clone()
-                        .unwrap_or_else(|| "output quality".to_string());
-                    let (verify_result, passed) = self.evaluate_verify_node(
-                        node_idx,
-                        &results,
-                        condition,
-                        &check_label,
-                        on_failure,
-                    );
-
-                    results.insert(node_id, verify_result);
-
-                    self.emit_node_lifecycle_events(
-                        execution_id,
-                        node_id,
-                        if passed { "Completed" } else { "Failed" },
-                        format!(
-                            "Verify '{}': {}",
-                            check_label,
-                            if passed { "PASSED" } else { "FAILED" }
-                        ),
-                    );
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if *cnt == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── Judge dispatch (LLM-as-Judge evaluation) ─────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::Judge {
-                        judge_workflow_id,
-                        ref rubric,
-                        pass_threshold,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_judge(node_idx, node_id, &dispatcher, &worker_shared_key, &results)
+                    .await
                 {
-                    let judge_wf_id = *judge_workflow_id;
-                    let rubric = rubric.clone();
-                    let pass_threshold = *pass_threshold;
-                    let parent_inputs = self.gather_inputs(node_idx, &results);
-
-                    let judge_result = self
-                        .dispatch_judge(
-                            parent_inputs,
-                            judge_wf_id,
-                            rubric,
-                            pass_threshold,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, judge_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── Ensemble dispatch (self-consistency / ensemble voting) ────
                 #[cfg(feature = "llm-primitives")]
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::Ensemble {
-                        child_workflow_id,
-                        count,
-                        ref consensus,
-                        judge_workflow_id,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_ensemble(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let child_wf_id = *child_workflow_id;
-                    let run_count = *count;
-                    let consensus_strategy = consensus.clone();
-                    let judge_wf_id_opt = *judge_workflow_id;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    let ensemble_result = self
-                        .dispatch_ensemble(
-                            inputs,
-                            child_wf_id,
-                            run_count,
-                            consensus_strategy,
-                            judge_wf_id_opt,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, ensemble_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── ConfidenceGate dispatch ───────────────────────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::ConfidenceGate {
-                        threshold,
-                        ref confidence_path,
-                        ref on_low_confidence,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(outcome) = self
+                    .try_dispatch_confidence_gate(node_idx, node_id, execution_id, &results)
+                    .await
                 {
-                    match self
-                        .evaluate_confidence_gate(
-                            node_idx,
-                            &results,
-                            execution_id,
-                            *threshold,
-                            confidence_path,
-                            on_low_confidence,
-                        )
-                        .await
-                    {
-                        Ok(gate_result) => {
-                            results.insert(node_id, gate_result);
+                    use crate::scheduler_handlers::ConfidenceGateOutcome;
+                    match outcome {
+                        ConfidenceGateOutcome::Proceed(output) => {
+                            results.insert(node_id, output);
+                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                            continue;
                         }
-                        Err(waiting_json) => {
-                            // Pending approval — pause execution
-                            results.insert(node_id, waiting_json);
+                        ConfidenceGateOutcome::Pause { waiting_output } => {
+                            // Pending approval — pause execution with the
+                            // fully-accumulated results map so resume sees
+                            // every completed node's output.
+                            results.insert(node_id, waiting_output);
                             return Ok(WorkflowContext {
                                 results,
                                 waiting: true,
@@ -3761,102 +3653,39 @@ impl ParallelWorkflowEngine {
                             });
                         }
                     }
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
-                    continue;
                 }
 
                 // ── ReflectiveRetry dispatch ──────────────────────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::ReflectiveRetry {
-                        child_workflow_id,
-                        reflection_workflow_id,
-                        max_retries,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_reflective_retry(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let child_wf_id = *child_workflow_id;
-                    let reflection_wf_id = *reflection_workflow_id;
-                    let max_retries = *max_retries;
-                    let initial_input = self.gather_inputs(node_idx, &results);
-
-                    let reflective_result = self
-                        .dispatch_reflective_retry(
-                            initial_input,
-                            child_wf_id,
-                            reflection_wf_id,
-                            max_retries,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, reflective_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── LlmDispatch dispatch (LLM-based routing) ──────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::LlmDispatch {
-                        classifier_workflow_id,
-                        ref routes,
-                        fallback_workflow_id,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_llm_dispatch(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let classifier_wf_id = *classifier_workflow_id;
-                    let routes = routes.clone();
-                    let fallback_wf_id = *fallback_workflow_id;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    let llm_dispatch_result = self
-                        .dispatch_llm_dispatch(
-                            inputs,
-                            classifier_wf_id,
-                            routes,
-                            fallback_wf_id,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, llm_dispatch_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
@@ -4113,136 +3942,32 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── WhileLoop dispatch (local computation) ──────────────────
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::WhileLoop {
-                        ref condition,
-                        max_iterations,
-                    }),
-                )) = self.node_meta.get(&node_id)
-                {
-                    let condition = condition.clone();
-                    let max_iters = *max_iterations;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    // WhileLoop runs the body inline, checking the condition after each iteration.
-                    let mut current_output = inputs;
-                    let mut iteration = 0u32;
-
-                    while iteration < max_iters {
-                        // Evaluate condition against current output
-                        if !self.eval_bool(&condition, &current_output) {
-                            break;
-                        }
-                        iteration += 1;
-                        // Store iteration result (each iteration overwrites)
-                        current_output = serde_json::json!({
-                            "__loop_iteration": iteration,
-                            "__loop_input": current_output,
-                        });
-                    }
-
-                    if iteration >= max_iters {
-                        tracing::warn!(
-                            node_id = %node_id,
-                            max_iterations = max_iters,
-                            "WhileLoop reached maximum iterations"
-                        );
-                    }
-
-                    results.insert(
-                        node_id,
-                        serde_json::json!({
-                            "iterations": iteration,
-                            "output": current_output,
-                        }),
-                    );
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                if let Some(output) = self.try_dispatch_while_loop(node_idx, node_id, &results) {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── RepeatLoop dispatch (local computation) ─────────────────
-                if let Some((_, _, Some(SystemNodeKind::RepeatLoop { count }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let count = *count;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    results.insert(
-                        node_id,
-                        serde_json::json!({
-                            "iterations": count,
-                            "input": inputs,
-                        }),
-                    );
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                if let Some(output) = self.try_dispatch_repeat_loop(node_idx, node_id, &results) {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── SubWorkflow dispatch (real execution) ─────────────────
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::SubWorkflow {
-                        workflow_id: sub_wf_id,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_sub_workflow(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let sub_wf_id = *sub_wf_id;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        sub_workflow_id = %sub_wf_id,
-                        "SubWorkflow node — executing sub-workflow"
-                    );
-
-                    let sub_result = self
-                        .dispatch_subworkflow(
-                            inputs,
-                            sub_wf_id,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, sub_result);
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
@@ -4697,287 +4422,19 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Loop dispatch (re-dispatches body node while condition is true) ──
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::Loop {
-                        ref condition,
-                        max_iterations,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_loop(
+                        node_idx,
+                        node_id,
+                        execution_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let condition = condition.clone();
-                    let max_iters = *max_iterations;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    // Find the body_node_id from node config
-                    let body_node_id_str = self
-                        .node_configs
-                        .get(&node_id)
-                        .and_then(|c| c.get("body_node_id"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    let loop_result = if let Some(body_rf_id) = body_node_id_str {
-                        // Resolve the body node's module_id via node_labels
-                        let body_uuid = self
-                            .node_labels
-                            .iter()
-                            .find(|(_, label)| label.as_str() == body_rf_id)
-                            .map(|(uuid, _)| *uuid);
-
-                        if let Some(body_uuid) = body_uuid {
-                            let body_module_id =
-                                self.node_meta.get(&body_uuid).and_then(|(mid, _, _)| *mid);
-
-                            if let Some(body_module_id) = body_module_id {
-                                let mut current_input = inputs.clone();
-                                let mut iteration = 0u32;
-                                let mut last_output = current_input.clone();
-
-                                // Extract __trigger_input__ to inject into every loop iteration.
-                                // Search: (1) gathered inputs, (2) the __trigger__ node's output in results
-                                let trigger_input_val = inputs
-                                    .as_object()
-                                    .and_then(|o| o.get("__trigger_input__"))
-                                    .cloned()
-                                    .or_else(|| {
-                                        // Find the trigger node by label and use its value
-                                        self.node_labels
-                                            .iter()
-                                            .find(|(_, label)| label.as_str() == "__trigger__")
-                                            .and_then(|(uuid, _)| results.get(uuid))
-                                            .cloned()
-                                    });
-
-                                while iteration < max_iters {
-                                    // Evaluate condition against current output + loop metadata.
-                                    // `iteration_count` is injected so conditions like
-                                    // `iteration_count < 3` work without the body having
-                                    // to explicitly echo the counter in its output.
-                                    if iteration > 0 {
-                                        let condition_ctx = if let Some(mut obj) =
-                                            last_output.as_object().cloned()
-                                        {
-                                            obj.entry("iteration_count".to_string())
-                                                .or_insert(serde_json::json!(iteration));
-                                            obj.entry("iteration".to_string())
-                                                .or_insert(serde_json::json!(iteration));
-                                            serde_json::Value::Object(obj)
-                                        } else {
-                                            serde_json::json!({
-                                                "iteration_count": iteration,
-                                                "iteration": iteration,
-                                                "output": last_output,
-                                            })
-                                        };
-                                        if !self.eval_bool(&condition, &condition_ctx) {
-                                            break;
-                                        }
-                                    }
-
-                                    iteration += 1;
-
-                                    // Log iteration event
-                                    emit_event_spawn(
-                                        &self.event_sink,
-                                        NodeEventWrite {
-                                            execution_id,
-                                            event_type: "loop_iteration".to_string(),
-                                            node_id: Some(node_id),
-                                            status: "Running".to_string(),
-                                            log_message: Some(format!(
-                                                "Loop iteration {}/{}",
-                                                iteration, max_iters
-                                            )),
-                                            iteration_index: Some(iteration as i32),
-                                        },
-                                    );
-
-                                    // Dispatch the body node's module
-                                    // Use fetch_module for full resolution (wasm_modules → template_id → node_templates)
-                                    let fetch_result = self
-                                        .fetch_module(body_uuid)
-                                        .await
-                                        .map_err(|e| anyhow::anyhow!(e));
-
-                                    match fetch_result {
-                                        Ok(wasm_module) => {
-                                            // Flat-merge input + config (same pattern as regular node dispatch)
-                                            let mut merged_input = serde_json::Map::new();
-                                            // Spread current_input fields at root level
-                                            if let Some(obj) = current_input.as_object() {
-                                                for (k, v) in obj {
-                                                    merged_input.insert(k.clone(), v.clone());
-                                                }
-                                            }
-                                            // Add config sub-key if present
-                                            if let Some(cfg) = self.node_configs.get(&body_uuid) {
-                                                if cfg.is_object()
-                                                    && !cfg
-                                                        .as_object()
-                                                        .map(|m| m.is_empty())
-                                                        .unwrap_or(true)
-                                                {
-                                                    merged_input
-                                                        .insert("config".to_string(), cfg.clone());
-                                                    // Also spread config fields at root for templates that read them directly
-                                                    if let Some(obj) = cfg.as_object() {
-                                                        for (k, v) in obj {
-                                                            merged_input
-                                                                .entry(k.clone())
-                                                                .or_insert(v.clone());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // Include input sub-key for modules that read it explicitly
-                                            if !current_input.is_null()
-                                                && current_input != serde_json::json!({})
-                                            {
-                                                merged_input
-                                                    .entry("input".to_string())
-                                                    .or_insert(current_input.clone());
-                                            }
-                                            // Inject __trigger_input__ into each loop iteration
-                                            if let Some(ref ti) = trigger_input_val {
-                                                merged_input.insert(
-                                                    "__trigger_input__".to_string(),
-                                                    ti.clone(),
-                                                );
-                                            }
-                                            // Inject loop counter so body modules can read it.
-                                            // `iteration` is already incremented (1-based).
-                                            merged_input
-                                                .entry("iteration_count".to_string())
-                                                .or_insert(serde_json::json!(iteration));
-                                            merged_input
-                                                .entry("iteration".to_string())
-                                                .or_insert(serde_json::json!(iteration));
-                                            let job_input = serde_json::Value::Object(merged_input);
-
-                                            let body_timeout_secs = self
-                                                .node_timeouts
-                                                .get(&body_uuid)
-                                                .copied()
-                                                .unwrap_or(30);
-                                            let encrypted_secrets = self
-                                                .build_encrypted_secrets(
-                                                    body_module_id,
-                                                    &worker_shared_key,
-                                                )
-                                                .await;
-                                            let body_job = DispatchJob {
-                                                execution_id,
-                                                node_id: body_uuid,
-                                                module_id: body_module_id,
-                                                // Loop-body iterations don't pre-INSERT
-                                                // module_executions rows; let the adapter
-                                                // mint a fresh job_id.
-                                                job_id: None,
-                                                user_id: self.user_id,
-                                                actor_id: self.actor_id,
-                                                module_uri: wasm_module
-                                                    .oci_url
-                                                    .clone()
-                                                    .unwrap_or_else(|| {
-                                                        format!("redis:wasm:{}", body_module_id)
-                                                    }),
-                                                wasm_bytes: None,
-                                                expected_wasm_hash: Some(
-                                                    wasm_module.content_hash.clone(),
-                                                ),
-                                                capability_world: Some(
-                                                    wasm_module.capability_world.clone(),
-                                                ),
-                                                integration_name: wasm_module
-                                                    .integration_name
-                                                    .clone(),
-                                                input_payload: job_input,
-                                                timeout: std::time::Duration::from_secs(
-                                                    body_timeout_secs,
-                                                ),
-                                                max_fuel: (wasm_module.max_fuel).min(50_000_000),
-                                                allowed_hosts: wasm_module.allowed_hosts.clone(),
-                                                allowed_methods: wasm_module
-                                                    .allowed_methods
-                                                    .clone(),
-                                                allowed_secrets: wasm_module
-                                                    .allowed_secrets
-                                                    .clone(),
-                                                allowed_sql_operations: vec![],
-                                                allow_tier2_exposure: false,
-                                                encrypted_secrets_ciphertext: encrypted_secrets
-                                                    .ciphertext,
-                                                encrypted_secrets_nonce: encrypted_secrets.nonce,
-                                                priority: 100,
-                                                dry_run: self.dry_run,
-                                                max_retries: 2,
-                                                backoff_ms: 500,
-                                                retry_condition: None,
-                                                retry_delay_expr: None,
-                                                // Retries inside a loop iteration are
-                                                // internal to the iteration and should not
-                                                // inflate workflow-level retry metrics.
-                                                emit_retry_events: false,
-                                            };
-                                            match dispatcher.dispatch(body_job).await {
-                                                Ok(result) => {
-                                                    // Unwrap the engine envelope so the next iteration
-                                                    // receives clean output, not double-wrapped input
-                                                    let clean =
-                                                        Self::unwrap_output(&result.output).clone();
-                                                    last_output = clean.clone();
-                                                    current_input = clean;
-                                                }
-                                                Err(e) => {
-                                                    last_output = serde_json::json!({"__error": true, "error_message": e.to_string()});
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            last_output = serde_json::json!({"__error": true, "error_message": format!("Module fetch failed: {}", e)});
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if iteration >= max_iters {
-                                    tracing::warn!(
-                                        node_id = %node_id,
-                                        max_iterations = max_iters,
-                                        "Loop reached maximum iterations"
-                                    );
-                                }
-
-                                serde_json::json!({
-                                    "iterations": iteration,
-                                    "output": last_output,
-                                })
-                            } else {
-                                serde_json::json!({"__error": true, "error_message": format!("Body node '{}' has no module_id", body_rf_id)})
-                            }
-                        } else {
-                            serde_json::json!({"__error": true, "error_message": format!("Body node '{}' not found in workflow", body_rf_id)})
-                        }
-                    } else {
-                        serde_json::json!({"__error": true, "error_message": "Loop node missing body_node_id in config"})
-                    };
-
-                    results.insert(node_id, loop_result);
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
