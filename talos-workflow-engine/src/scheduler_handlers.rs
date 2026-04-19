@@ -19,7 +19,9 @@ use std::sync::Arc;
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
 use serde_json::{json, Value as JsonValue};
-use talos_workflow_engine_core::{DispatchJob, NodeDispatcher, SystemNodeKind, WorkerSharedKey};
+use talos_workflow_engine_core::{DispatchJob, EdgeLogic, NodeDispatcher, SystemNodeKind, WorkerSharedKey};
+
+use crate::engine::AGENT_LOOP_MAX_HISTORY;
 use uuid::Uuid;
 
 use crate::engine::ParallelWorkflowEngine;
@@ -405,6 +407,657 @@ impl ParallelWorkflowEngine {
         )
     }
 
+    /// [`SystemNodeKind::FanIn`] — join parent-branch outputs per the
+    /// configured [`JoinMode`](talos_workflow_engine_core::JoinMode)
+    /// and (optionally) transform via an aggregation expression.
+    pub(crate) fn try_dispatch_fan_in(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let (
+            _,
+            _,
+            Some(SystemNodeKind::FanIn {
+                join_mode,
+                aggregation_expr,
+            }),
+        ) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        Some(self.aggregate_fan_in(node_idx, results, join_mode, aggregation_expr))
+    }
+
+    /// Generic skip-condition check that fires before any node-kind
+    /// handler. When the node's `__skip_condition` expression evaluates
+    /// truthy, returns `Some(__skipped envelope)`; the scheduler
+    /// inserts the envelope into `results` and unblocks successors
+    /// without dispatching the node.
+    ///
+    /// The trigger node's output is overlaid onto the skip-condition
+    /// context so expressions can reference trigger-level fields
+    /// without every upstream chain explicitly propagating them.
+    pub(crate) fn check_skip_condition(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        execution_id: Uuid,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let skip_cond = self
+            .node_configs
+            .get(&node_id)
+            .and_then(|cfg| cfg.get("__skip_condition"))
+            .and_then(|v| v.as_str())?;
+        let mut skip_context = self.gather_inputs(node_idx, results);
+        if let Some(trigger_id) = self
+            .node_labels
+            .iter()
+            .find(|(_, label)| label.as_str() == "__trigger__")
+            .map(|(uuid, _)| *uuid)
+        {
+            if let Some(trigger_val) = results.get(&trigger_id) {
+                if let (Some(obj), Some(ctx_obj)) =
+                    (trigger_val.as_object(), skip_context.as_object_mut())
+                {
+                    for (k, v) in obj {
+                        ctx_obj.entry(k.clone()).or_insert(v.clone());
+                    }
+                }
+            }
+        }
+        if !self.eval_bool(skip_cond, &skip_context) {
+            return None;
+        }
+        tracing::info!(
+            %node_id,
+            skip_condition = %skip_cond,
+            "Node skipped by skip_condition"
+        );
+        self.emit_node_skipped_event(execution_id, node_id);
+        Some(serde_json::json!({
+            "__skipped": true,
+            "reason": "skip_condition",
+        }))
+    }
+
+    /// [`SystemNodeKind::ErrorHandler`] — filter by error pattern.
+    ///
+    /// Returns `None` when the node either isn't an `ErrorHandler` or
+    /// its pattern (if any) matched the upstream error — the scheduler
+    /// falls through to regular single-node dispatch. Returns
+    /// `Some(__skipped envelope)` when the pattern was set and did not
+    /// match — the node is short-circuited without running its module.
+    pub(crate) fn try_dispatch_error_handler(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let (_, _, Some(SystemNodeKind::ErrorHandler { error_pattern })) =
+            self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        // No pattern → fall through to regular dispatch. The handler
+        // module runs on *every* upstream error.
+        let pattern = error_pattern.as_ref()?;
+        let inputs = self.gather_inputs(node_idx, results);
+        let error_msg = inputs
+            .get("error_message")
+            .or_else(|| {
+                // Check parent outputs for `__error` payloads.
+                inputs
+                    .as_object()
+                    .and_then(|obj| obj.values().find_map(|v| v.get("error_message")))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if error_msg.contains(pattern.as_str()) {
+            // Pattern matched: let regular dispatch handle this error.
+            return None;
+        }
+        // Pattern didn't match: short-circuit; the handler module
+        // doesn't run and the error propagates down untouched.
+        Some(serde_json::json!({
+            "__skipped": true,
+            "reason": "error_pattern_mismatch",
+        }))
+    }
+
+    /// [`SystemNodeKind::DynamicDispatch`] — evaluate a Rhai
+    /// expression against the gathered input to select a target
+    /// workflow (by UUID or name), then run it via the adapter set's
+    /// sub-engine path.
+    pub(crate) async fn try_dispatch_dynamic_dispatch(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        dispatcher: &Arc<dyn NodeDispatcher>,
+        worker_shared_key: &Option<WorkerSharedKey>,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let (
+            _,
+            _,
+            Some(SystemNodeKind::DynamicDispatch {
+                dispatch_expression,
+                timeout_secs: _,
+            }),
+        ) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let expression = dispatch_expression.clone();
+        let inputs = self.gather_inputs(node_idx, results);
+
+        tracing::info!(
+            %node_id,
+            expression = %expression,
+            "DynamicDispatch node — evaluating dispatch expression"
+        );
+
+        let dispatch_target = evaluate_dispatch_expression(&expression, &inputs);
+
+        let dispatch_result = match dispatch_target {
+            Err(e) => serde_json::json!({ "__error": true, "error_message": e }),
+            Ok(target_id_or_name) => {
+                let target_wf_id: Option<Uuid> =
+                    if let Ok(id) = Uuid::parse_str(&target_id_or_name) {
+                        Some(id)
+                    } else if let Some(store) = self.graph_store_arc() {
+                        store
+                            .resolve_by_name(
+                                &target_id_or_name,
+                                self.user_id().unwrap_or_else(Uuid::nil),
+                            )
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(error = %e, "DB query failed during execution");
+                                e
+                            })
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+
+                match target_wf_id {
+                    None => serde_json::json!({
+                        "__error": true,
+                        "error_message": format!("Could not resolve dispatch target: {target_id_or_name}"),
+                    }),
+                    Some(sub_wf_id) => {
+                        tracing::info!(
+                            %node_id,
+                            dispatched_workflow_id = %sub_wf_id,
+                            "DynamicDispatch resolved to workflow"
+                        );
+                        self.run_dispatched_subworkflow(
+                            sub_wf_id,
+                            &inputs,
+                            dispatcher,
+                            worker_shared_key,
+                            DispatchedOrigin::DynamicDispatch,
+                        )
+                        .await
+                    }
+                }
+            }
+        };
+
+        Some(dispatch_result)
+    }
+
+    /// [`SystemNodeKind::CapabilityDispatch`] — find the best-matching
+    /// workflow for the declared required capabilities and run it.
+    pub(crate) async fn try_dispatch_capability_dispatch(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        dispatcher: &Arc<dyn NodeDispatcher>,
+        worker_shared_key: &Option<WorkerSharedKey>,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let (
+            _,
+            _,
+            Some(SystemNodeKind::CapabilityDispatch {
+                required_capabilities,
+                timeout_secs: _,
+            }),
+        ) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let caps = required_capabilities.clone();
+        let inputs = self.gather_inputs(node_idx, results);
+
+        tracing::info!(
+            %node_id,
+            capabilities = ?caps,
+            "CapabilityDispatch node — finding best matching workflow"
+        );
+
+        let Some(store) = self.graph_store_arc() else {
+            return Some(serde_json::json!({
+                "__error": true,
+                "error_message": "Registry not available for capability dispatch",
+            }));
+        };
+
+        let matching_row = store
+            .resolve_by_capabilities(&caps, self.user_id().unwrap_or_else(Uuid::nil))
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "DB query failed during execution");
+                e
+            })
+            .ok()
+            .flatten();
+
+        let Some((sub_wf_id, sub_wf_name)) = matching_row else {
+            return Some(serde_json::json!({
+                "__error": true,
+                "error_message": format!("No workflow found matching capabilities: {caps:?}"),
+            }));
+        };
+        tracing::info!(
+            %node_id,
+            dispatched_workflow_id = %sub_wf_id,
+            dispatched_workflow_name = %sub_wf_name,
+            "CapabilityDispatch resolved to workflow"
+        );
+
+        Some(
+            self.run_dispatched_subworkflow(
+                sub_wf_id,
+                &inputs,
+                dispatcher,
+                worker_shared_key,
+                DispatchedOrigin::CapabilityDispatch {
+                    workflow_name: sub_wf_name,
+                    matched_capabilities: caps,
+                },
+            )
+            .await,
+        )
+    }
+
+    /// Shared body for [`SystemNodeKind::DynamicDispatch`] and
+    /// [`SystemNodeKind::CapabilityDispatch`]: hydrate a sub-engine
+    /// from the target workflow's graph JSON, inject a `__trigger__`
+    /// node carrying the parent input, run via
+    /// `run_with_seed_with_transport`, and fold the labeled outputs
+    /// into a result envelope.
+    async fn run_dispatched_subworkflow(
+        &self,
+        sub_wf_id: Uuid,
+        inputs: &JsonValue,
+        dispatcher: &Arc<dyn NodeDispatcher>,
+        worker_shared_key: &Option<WorkerSharedKey>,
+        origin: DispatchedOrigin,
+    ) -> JsonValue {
+        if !self.has_module_fetcher() {
+            return serde_json::json!({
+                "__error": true,
+                "error_message": "Registry not available for dispatch execution",
+            });
+        }
+        let Some(graph_json) = self
+            .get_sub_workflow_graph(sub_wf_id, self.user_id().unwrap_or_else(Uuid::nil))
+            .await
+        else {
+            return origin.not_found_error(sub_wf_id);
+        };
+        let mut sub_engine = match self.adapter_set().into_engine_with_graph(&graph_json) {
+            Ok(e) => e,
+            Err(e) => return origin.build_error(e),
+        };
+
+        let clean_input = if let Some(obj) = inputs.as_object() {
+            let mut cleaned = obj.clone();
+            cleaned.retain(|k, _| !k.starts_with("__"));
+            serde_json::Value::Object(cleaned)
+        } else {
+            inputs.clone()
+        };
+
+        let trigger_node_id = Uuid::new_v4();
+        sub_engine.add_node(trigger_node_id, None, None, None);
+        sub_engine
+            .node_labels
+            .insert(trigger_node_id, "__trigger__".to_string());
+        let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
+            .graph
+            .node_indices()
+            .filter(|&idx| {
+                sub_engine.graph[idx] != trigger_node_id
+                    && sub_engine
+                        .graph
+                        .neighbors_directed(idx, Direction::Incoming)
+                        .count()
+                        == 0
+            })
+            .collect();
+        for root_idx in &root_indices {
+            let root_id = sub_engine.graph[*root_idx];
+            let _ = sub_engine.add_edge(
+                trigger_node_id,
+                root_id,
+                EdgeLogic {
+                    source_handle: "output".to_string(),
+                    target_handle: "input".to_string(),
+                    mapping: None,
+                    condition: None,
+                    edge_type: "default".to_string(),
+                },
+            );
+        }
+
+        let mut initial_results = HashMap::new();
+        initial_results.insert(trigger_node_id, clean_input);
+        let sub_labels = sub_engine.node_labels.clone();
+        let sub_execution_id = Uuid::new_v4();
+        match sub_engine
+            .run_with_seed_with_transport(
+                dispatcher.clone(),
+                worker_shared_key.clone(),
+                initial_results,
+                sub_execution_id,
+            )
+            .await
+        {
+            Ok(ctx) => {
+                let mut sub_outputs = serde_json::Map::new();
+                origin.stamp_prelude(&mut sub_outputs, sub_wf_id);
+                for (nid, output) in &ctx.results {
+                    if output
+                        .get("__skipped")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let key = sub_labels
+                        .get(nid)
+                        .cloned()
+                        .unwrap_or_else(|| nid.to_string());
+                    if key == "__trigger__" {
+                        continue;
+                    }
+                    sub_outputs.insert(key, ParallelWorkflowEngine::unwrap_output(output).clone());
+                }
+                serde_json::Value::Object(sub_outputs)
+            }
+            Err(e) => origin.run_error(sub_wf_id, e),
+        }
+    }
+
+    /// [`SystemNodeKind::AgentLoop`] — ReAct-style iteration that
+    /// re-invokes a sub-workflow body with per-iteration history
+    /// injection, stopping when the body emits a `finished: true`
+    /// signal or `max_iterations` is reached.
+    ///
+    /// Returns `None` when the node is not an `AgentLoop`; otherwise
+    /// the loop's aggregated output (or an error envelope when the
+    /// pre-conditions aren't met: no user context, missing body
+    /// workflow, etc.).
+    #[cfg(feature = "llm-primitives")]
+    pub(crate) async fn try_dispatch_agent_loop(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        dispatcher: &Arc<dyn NodeDispatcher>,
+        worker_shared_key: &Option<WorkerSharedKey>,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let (
+            _,
+            _,
+            Some(SystemNodeKind::AgentLoop {
+                body_workflow_id,
+                max_iterations,
+                inject_history,
+                timeout_secs,
+            }),
+        ) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let body_wf_id = *body_workflow_id;
+        let max_iters = *max_iterations;
+        let do_inject_history = *inject_history;
+        let timeout_secs = *timeout_secs;
+        let inputs = self.gather_inputs(node_idx, results);
+
+        tracing::info!(
+            %node_id,
+            body_workflow_id = %body_wf_id,
+            max_iterations = max_iters,
+            "AgentLoop — starting ReAct iteration loop"
+        );
+
+        if !self.has_module_fetcher() {
+            return Some(serde_json::json!({
+                "__error": true,
+                "error_message": "Registry not available for AgentLoop execution",
+            }));
+        }
+        let Some(user_id) = self.user_id() else {
+            return Some(serde_json::json!({
+                "__error": true,
+                "error_message": "user_id required for sub-workflow execution",
+            }));
+        };
+        let Some(graph_json) = self.get_sub_workflow_graph(body_wf_id, user_id).await else {
+            return Some(serde_json::json!({
+                "__error": true,
+                "error_message": format!("AgentLoop body workflow {body_wf_id} not found"),
+            }));
+        };
+
+        let dispatcher_al = dispatcher.clone();
+        let worker_shared_key_al = worker_shared_key.clone();
+        let adapter_set_al = self.adapter_set();
+        let inputs_al = inputs.clone();
+        let agent_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            async move {
+                let mut history: Vec<JsonValue> = Vec::new();
+                let mut last_output = serde_json::json!({});
+                let mut finished = false;
+                // Track total iterations separately from history.len() —
+                // history is capped at AGENT_LOOP_MAX_HISTORY entries
+                // (sliding window), so history.len() would under-report
+                // when max_iters > AGENT_LOOP_MAX_HISTORY.
+                let mut iterations_run: u32 = 0;
+
+                for iteration in 1..=max_iters {
+                    // Build iteration input: start with clean parent inputs.
+                    let mut iter_input = if let Some(obj) = inputs_al.as_object() {
+                        let mut cleaned = obj.clone();
+                        cleaned.retain(|k, _| !k.starts_with("__"));
+                        cleaned
+                    } else {
+                        serde_json::Map::new()
+                    };
+
+                    iter_input.insert(
+                        "__agent_iteration__".to_string(),
+                        serde_json::json!(iteration),
+                    );
+
+                    if do_inject_history && !history.is_empty() {
+                        iter_input.insert(
+                            "__agent_history__".to_string(),
+                            serde_json::Value::Array(history.clone()),
+                        );
+                    }
+
+                    let iter_input_value = serde_json::Value::Object(iter_input);
+
+                    let iter_result = match adapter_set_al
+                        .clone()
+                        .into_engine_with_graph(&graph_json)
+                    {
+                        Ok(mut sub_engine) => {
+                            let sub_execution_id = Uuid::new_v4();
+                            let trigger_node_id = Uuid::new_v4();
+                            sub_engine.add_node(trigger_node_id, None, None, None);
+                            sub_engine
+                                .node_labels
+                                .insert(trigger_node_id, "__trigger__".to_string());
+
+                            let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
+                                .graph
+                                .node_indices()
+                                .filter(|&idx| {
+                                    sub_engine.graph[idx] != trigger_node_id
+                                        && sub_engine
+                                            .graph
+                                            .neighbors_directed(idx, Direction::Incoming)
+                                            .count()
+                                            == 0
+                                })
+                                .collect();
+                            for root_idx in &root_indices {
+                                let root_id = sub_engine.graph[*root_idx];
+                                let _ = sub_engine.add_edge(
+                                    trigger_node_id,
+                                    root_id,
+                                    EdgeLogic {
+                                        source_handle: "output".to_string(),
+                                        target_handle: "input".to_string(),
+                                        mapping: None,
+                                        condition: None,
+                                        edge_type: "default".to_string(),
+                                    },
+                                );
+                            }
+
+                            let mut initial_results = HashMap::new();
+                            initial_results.insert(trigger_node_id, iter_input_value);
+
+                            let sub_labels = sub_engine.node_labels.clone();
+                            match sub_engine
+                                .run_with_seed_with_transport(
+                                    dispatcher_al.clone(),
+                                    worker_shared_key_al.clone(),
+                                    initial_results,
+                                    sub_execution_id,
+                                )
+                                .await
+                            {
+                                Ok(ctx) => {
+                                    let mut sub_outputs = serde_json::Map::new();
+                                    for (nid, output) in &ctx.results {
+                                        if output
+                                            .get("__skipped")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            continue;
+                                        }
+                                        let key = sub_labels
+                                            .get(nid)
+                                            .cloned()
+                                            .unwrap_or_else(|| nid.to_string());
+                                        if key == "__trigger__" {
+                                            continue;
+                                        }
+                                        sub_outputs.insert(
+                                            key,
+                                            ParallelWorkflowEngine::unwrap_output(output).clone(),
+                                        );
+                                    }
+                                    serde_json::Value::Object(sub_outputs)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        iteration,
+                                        error = %e,
+                                        "AgentLoop body workflow failed on iteration"
+                                    );
+                                    serde_json::json!({
+                                        "__error": true,
+                                        "error_message": e.to_string(),
+                                    })
+                                }
+                            }
+                        }
+                        Err(e) => serde_json::json!({
+                            "__error": true,
+                            "error_message": format!("Failed to build agent body: {e}"),
+                        }),
+                    };
+
+                    // Check for finish signals in the iteration output.
+                    let iter_finished = iter_result
+                        .get("finished")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || iter_result
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.eq_ignore_ascii_case("FINISH"))
+                            .unwrap_or(false);
+
+                    // Cap history entries to prevent unbounded memory
+                    // growth when inject_history is true and iterations
+                    // produce large outputs. Keep the last
+                    // AGENT_LOOP_MAX_HISTORY entries (sufficient for
+                    // ReAct reasoning chains).
+                    iterations_run += 1;
+                    if history.len() >= AGENT_LOOP_MAX_HISTORY {
+                        history.remove(0);
+                    }
+                    history.push(iter_result.clone());
+                    last_output = iter_result;
+
+                    if iter_finished {
+                        finished = true;
+                        break;
+                    }
+                }
+
+                if !finished {
+                    tracing::warn!(
+                        max_iterations = max_iters,
+                        "AgentLoop reached max_iterations without finish signal"
+                    );
+                }
+
+                serde_json::json!({
+                    "iterations": iterations_run,
+                    "finished": finished,
+                    "history": history,
+                    "final_output": last_output,
+                })
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    %node_id,
+                    timeout_secs,
+                    "AgentLoop timed out"
+                );
+                serde_json::json!({
+                    "__error": true,
+                    "error_message": format!("AgentLoop timed out after {timeout_secs}s"),
+                })
+            }
+        };
+
+        Some(agent_result)
+    }
+
     /// [`SystemNodeKind::Loop`] — re-dispatch a body node until
     /// `condition` returns false or `max_iterations` is hit.
     ///
@@ -777,5 +1430,139 @@ impl ParallelWorkflowEngine {
             )
             .await,
         )
+    }
+}
+
+/// Where a dispatched sub-workflow originated, for shaping the output
+/// envelope and error messages. `DynamicDispatch` and
+/// `CapabilityDispatch` share the sub-engine-build machinery but need
+/// different `__`-prefixed metadata keys in the returned envelope.
+enum DispatchedOrigin {
+    DynamicDispatch,
+    CapabilityDispatch {
+        workflow_name: String,
+        matched_capabilities: Vec<String>,
+    },
+}
+
+impl DispatchedOrigin {
+    fn not_found_error(&self, sub_wf_id: Uuid) -> JsonValue {
+        match self {
+            Self::DynamicDispatch => serde_json::json!({
+                "__error": true,
+                "error_message": format!("Dispatched workflow {sub_wf_id} not found"),
+            }),
+            Self::CapabilityDispatch { .. } => serde_json::json!({
+                "__error": true,
+                "error_message": format!("Capability-dispatched workflow {sub_wf_id} graph not found"),
+            }),
+        }
+    }
+
+    fn build_error(&self, e: impl std::fmt::Display) -> JsonValue {
+        match self {
+            Self::DynamicDispatch => serde_json::json!({
+                "__error": true,
+                "error_message": format!("Failed to build dispatched workflow engine: {e}"),
+            }),
+            Self::CapabilityDispatch { .. } => serde_json::json!({
+                "__error": true,
+                "error_message": format!("Failed to build capability-dispatched engine: {e}"),
+            }),
+        }
+    }
+
+    fn run_error(&self, sub_wf_id: Uuid, e: impl std::fmt::Display) -> JsonValue {
+        match self {
+            Self::DynamicDispatch => {
+                tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Dispatched workflow failed");
+                serde_json::json!({
+                    "__error": true,
+                    "error_message": format!("Dispatched workflow failed: {e}"),
+                })
+            }
+            Self::CapabilityDispatch { .. } => {
+                tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Capability-dispatched workflow failed");
+                serde_json::json!({
+                    "__error": true,
+                    "error_message": format!("Capability-dispatched workflow failed: {e}"),
+                })
+            }
+        }
+    }
+
+    /// Seed the output envelope with origin-specific metadata keys
+    /// before the labeled per-node outputs get folded in.
+    fn stamp_prelude(&self, out: &mut serde_json::Map<String, JsonValue>, sub_wf_id: Uuid) {
+        out.insert(
+            "__dispatched_workflow_id__".to_string(),
+            serde_json::json!(sub_wf_id.to_string()),
+        );
+        if let Self::CapabilityDispatch {
+            workflow_name,
+            matched_capabilities,
+        } = self
+        {
+            out.insert(
+                "__dispatched_by".to_string(),
+                serde_json::json!("capability_dispatch"),
+            );
+            out.insert(
+                "__dispatched_workflow_name".to_string(),
+                serde_json::json!(workflow_name),
+            );
+            out.insert(
+                "__matched_capabilities".to_string(),
+                serde_json::json!(matched_capabilities),
+            );
+        }
+    }
+}
+
+/// Evaluate a `DynamicDispatch` Rhai expression against the node's
+/// gathered input and return the result as a string (typically a
+/// workflow UUID or name).
+///
+/// The Rhai engine is configured with a 10,000-operation cap, `eval`
+/// disabled, and a dummy module resolver to bound runtime and
+/// dependency surface.
+fn evaluate_dispatch_expression(
+    expression: &str,
+    inputs: &JsonValue,
+) -> Result<String, String> {
+    let mut rhai_engine = rhai::Engine::new();
+    rhai_engine.set_max_operations(10_000);
+    rhai_engine.disable_symbol("eval");
+    rhai_engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
+    let mut scope = rhai::Scope::new();
+    if let Some(obj) = inputs.as_object() {
+        for (k, v) in obj {
+            let dyn_val: rhai::Dynamic = match v {
+                serde_json::Value::String(s) => rhai::Dynamic::from(s.clone()),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        rhai::Dynamic::from(i)
+                    } else if let Some(f) = n.as_f64() {
+                        rhai::Dynamic::from(f)
+                    } else {
+                        rhai::Dynamic::from(n.to_string())
+                    }
+                }
+                serde_json::Value::Bool(b) => rhai::Dynamic::from(*b),
+                _ => rhai::Dynamic::from(v.to_string()),
+            };
+            scope.push(k.clone(), dyn_val);
+        }
+    }
+    match rhai_engine.eval_with_scope::<rhai::Dynamic>(&mut scope, expression) {
+        Ok(result) => {
+            let s = result.to_string();
+            if s.is_empty() {
+                Err("Dispatch expression returned empty string".to_string())
+            } else {
+                Ok(s)
+            }
+        }
+        Err(e) => Err(format!("Dispatch expression evaluation failed: {e}")),
     }
 }

@@ -58,7 +58,7 @@ const MAX_PREFETCH_SUCCESSORS: usize = 8;
 
 /// Maximum history entries maintained in AgentLoop's sliding window.
 /// Keeps the last N iteration outputs injected as `__agent_history__`.
-const AGENT_LOOP_MAX_HISTORY: usize = 20;
+pub(crate) const AGENT_LOOP_MAX_HISTORY: usize = 20;
 
 use crate::emit_event_spawn;
 use talos_workflow_engine_core::{
@@ -1013,7 +1013,11 @@ impl ParallelWorkflowEngine {
     /// Look up a sub-workflow's graph JSON, checking the pre-populated cache first.
     /// Falls back to an individual DB query on cache miss (e.g., DynamicDispatch
     /// targets that are resolved at runtime).
-    async fn get_sub_workflow_graph(&self, sub_wf_id: Uuid, user_id: Uuid) -> Option<JsonValue> {
+    pub(crate) async fn get_sub_workflow_graph(
+        &self,
+        sub_wf_id: Uuid,
+        user_id: Uuid,
+    ) -> Option<JsonValue> {
         // Fast path: cache hit.
         if let Some(cached) = self.sub_workflow_cache.get(&sub_wf_id) {
             return Some(cached.clone());
@@ -2381,7 +2385,7 @@ impl ParallelWorkflowEngine {
     /// `join_mode`.  If `aggregation_expr` is provided, it is evaluated as a
     /// Rhai condition against the aggregated value — on failure the result is
     /// replaced with `{"__aggregation_failed": true}`.
-    fn aggregate_fan_in(
+    pub(crate) fn aggregate_fan_in(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,
@@ -2782,6 +2786,21 @@ impl ParallelWorkflowEngine {
         self.user_id
     }
 
+    /// `true` when a [`ModuleFetcher`] is wired in. Used by handlers
+    /// that gate sub-workflow execution on registry availability.
+    #[must_use]
+    pub(crate) fn has_module_fetcher(&self) -> bool {
+        self.module_fetcher.is_some()
+    }
+
+    /// Clone of the configured [`WorkflowGraphStore`] `Arc`, or `None`
+    /// if the engine was built without one. Used by dispatch handlers
+    /// that need to resolve target workflows by name or capability.
+    #[must_use]
+    pub(crate) fn graph_store_arc(&self) -> Option<Arc<dyn WorkflowGraphStore>> {
+        self.graph_store.clone()
+    }
+
     /// Actor id that owns this execution, if any. See
     /// [`set_actor_id`](Self::set_actor_id) for the setter.
     #[must_use]
@@ -2796,6 +2815,851 @@ impl ParallelWorkflowEngine {
     #[must_use]
     pub(crate) fn node_timeout_for(&self, node_id: Uuid) -> Option<u64> {
         self.node_timeouts.get(&node_id).copied()
+    }
+
+    /// Build and await the full pipeline-chain dispatch future.
+    ///
+    /// Runs when a linear chain is detected (`detect_linear_chains`)
+    /// and the scheduler is at the chain head. Fetches each step's
+    /// module artifact, runs the approval gate per step, encrypts the
+    /// per-step secrets, assembles a `ChainDispatchRequest`, and hands
+    /// it to the [`NodeDispatcher::dispatch_chain`] impl.
+    ///
+    /// Extracted from the reactor loop for the same reason as
+    /// [`run_single_node_dispatch`](Self::run_single_node_dispatch) —
+    /// the scheduler reads as a sequence of handler calls rather than
+    /// a ~490-line inline closure. Semantics are preserved verbatim.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn run_pipeline_chain_dispatch(
+        &self,
+        chain: Vec<NodeIndex>,
+        chain_input: JsonValue,
+        accumulated_snapshot: Option<JsonValue>,
+        execution_id: Uuid,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+    ) -> (NodeIndex, Result<JsonValue, String>) {
+        let chain_tail = chain[chain.len() - 1];
+        let chain_node_ids: Vec<Uuid> = chain.iter().map(|&n| self.graph[n]).collect();
+        // Pre-resolve graph node UUIDs → module UUIDs. Graph node IDs
+        // are SHA256-derived from the node label string and don't
+        // match any `wasm_modules` row; `resolve_module_id` maps them
+        // back to the template / module UUID stored in `node_meta` at
+        // graph load time.
+        let chain_module_ids: Vec<Uuid> = chain_node_ids
+            .iter()
+            .map(|&nid| self.resolve_module_id(nid))
+            .collect();
+        let chain_head_id = chain_node_ids[0];
+        let chain_retry = self
+            .node_meta
+            .get(&chain_head_id)
+            .and_then(|(_, rp, _)| rp.clone())
+            .unwrap_or_default();
+
+        // Resolve user_id early — required for all module-fetcher calls.
+        let uid_for_chain: Option<Uuid> = if self.module_fetcher.is_some() {
+            match self.user_id {
+                Some(u) => Some(u),
+                None => {
+                    return (
+                        chain_tail,
+                        Err("Module execution requires user context (user_id not set)".to_string()),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        // Build `DispatchJob`s for every node in the chain. The
+        // dispatcher's `dispatch_chain` adapter maps these into
+        // whatever batch wire format its backing transport uses (the
+        // reference NATS dispatcher emits a signed
+        // `PipelineJobRequest`; an in-process test dispatcher might
+        // just loop `dispatch` via `dispatch_chain_sequential`).
+        let mut step_jobs: Vec<DispatchJob> = Vec::with_capacity(chain.len());
+        for (i, &_step_idx) in chain.iter().enumerate() {
+            let step_node_id = chain_node_ids[i];
+            let step_module_id = chain_module_ids[i];
+            let uid = match uid_for_chain {
+                Some(u) => u,
+                None => {
+                    return (
+                        chain_tail,
+                        Err(format!("Missing user ID for module {step_node_id} in chain")),
+                    );
+                }
+            };
+
+            // Fetch the step's module artifact. `WasmModuleArtifact.config`
+            // mirrors `wasm_modules.config` — same data the pre-extraction
+            // code read via `reg.get_execution_info`. The Redis cache-warm
+            // that used to fire here is dropped: `wasm_bytes` is embedded
+            // in the dispatched chain, so the worker doesn't depend on it.
+            let (artifact, module_config) = match self.module_fetcher.as_ref() {
+                Some(fetcher) => match fetcher.fetch(step_module_id, uid).await {
+                    Ok(a) => {
+                        let config = a
+                            .config
+                            .clone()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        (Some(a), config)
+                    }
+                    Err(e) => {
+                        return (
+                            chain_tail,
+                            Err(format!("Failed to prepare module: {e}")),
+                        );
+                    }
+                },
+                None => (None, serde_json::json!({})),
+            };
+
+            // Approval gate (per pipeline step).
+            let requires_approval: Vec<String> = artifact
+                .as_ref()
+                .map(|a| a.requires_approval_for.clone())
+                .unwrap_or_default();
+            if !requires_approval.is_empty() {
+                if let Some(ref gate) = self.approval_gate {
+                    let approval_webhook = module_config
+                        .get("NOTIFICATION_WEBHOOK")
+                        .and_then(|v| v.as_str());
+                    match gate
+                        .check_or_request(
+                            execution_id,
+                            step_node_id,
+                            &requires_approval,
+                            approval_webhook,
+                        )
+                        .await
+                    {
+                        Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {}
+                        Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
+                            return (
+                                chain_tail,
+                                Err(format!(
+                                    "Execution paused: module {step_node_id} requires approval for {requires_approval:?}. \
+                                     An approval request has been created."
+                                )),
+                            );
+                        }
+                        Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
+                            return (chain_tail, Err(reason));
+                        }
+                        Err(e) => {
+                            return (chain_tail, Err(format!("Approval gate check failed: {e}")));
+                        }
+                    }
+                }
+            }
+
+            // Extract vault:// paths from module_config before it is
+            // moved into the DispatchJob below.
+            let vault_paths = extract_vault_paths(&module_config);
+
+            // Per-node fuel precedence: node-config `max_fuel` > module
+            // default > 1M fallback. Capped at 50M.
+            let module_default_fuel = artifact
+                .as_ref()
+                .map(|a| a.max_fuel)
+                .filter(|f| *f > 0)
+                .unwrap_or(1_000_000);
+            let node_max_fuel = module_config
+                .get("max_fuel")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(module_default_fuel)
+                .min(50_000_000);
+
+            let encrypted_secrets =
+                match (self.secrets_resolver.as_ref(), &worker_shared_key) {
+                    (Some(resolver), Some(key)) => {
+                        build_encrypted_secrets_for(
+                            resolver.as_ref(),
+                            self.secret_envelope.as_ref(),
+                            step_node_id,
+                            self.user_id,
+                            &vault_paths,
+                            &[],
+                            key.as_bytes(),
+                        )
+                        .await
+                    }
+                    _ => Default::default(),
+                };
+            step_jobs.push(DispatchJob {
+                execution_id,
+                node_id: step_node_id,
+                module_id: step_node_id,
+                // Chain-level wire format derives a single `job_id`;
+                // per-step ids aren't correlated to individual
+                // `module_executions` rows (those use `step_exec_ids`).
+                job_id: None,
+                user_id: Some(uid),
+                actor_id: self.actor_id,
+                // Match pre-extraction behavior: the redis fallback key
+                // is `redis:wasm:{module_id}` keyed on `step_module_id`
+                // to match the worker's redis-key convention.
+                module_uri: artifact
+                    .as_ref()
+                    .and_then(|a| a.oci_url.clone())
+                    .unwrap_or_else(|| format!("redis:wasm:{step_module_id}")),
+                wasm_bytes: None,
+                expected_wasm_hash: artifact.as_ref().map(|a| a.content_hash.clone()),
+                // Pipeline dispatch uses a chain-level capability
+                // world; the adapter drops the per-step value.
+                capability_world: None,
+                integration_name: artifact.as_ref().and_then(|a| a.integration_name.clone()),
+                // `PipelineStep` calls this `config`; the adapter maps
+                // `input_payload` to it.
+                input_payload: module_config,
+                timeout: std::time::Duration::from_secs(
+                    self.node_timeouts.get(&step_node_id).copied().unwrap_or(30),
+                ),
+                max_fuel: node_max_fuel,
+                allowed_hosts: artifact
+                    .as_ref()
+                    .map(|a| a.allowed_hosts.clone())
+                    .unwrap_or_default(),
+                allowed_methods: artifact
+                    .as_ref()
+                    .map(|a| a.allowed_methods.clone())
+                    .unwrap_or_default(),
+                allowed_secrets: artifact
+                    .as_ref()
+                    .map(|a| a.allowed_secrets.clone())
+                    .unwrap_or_default(),
+                allowed_sql_operations: vec![],
+                allow_tier2_exposure: false,
+                encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
+                encrypted_secrets_nonce: encrypted_secrets.nonce,
+                priority: 100,
+                dry_run: self.dry_run,
+                max_retries: 0,
+                backoff_ms: 0,
+                retry_condition: None,
+                retry_delay_expr: None,
+                // Chain-level retry emits under the chain's aggregate
+                // policy, not per-step.
+                emit_retry_events: false,
+            });
+        }
+
+        // First-step input wrapping: inject gathered inputs under
+        // `pipeline_input`, preserve the original `config`, and fold in
+        // any accumulated prior-node context and actor memory.
+        if let Some(first) = step_jobs.first_mut() {
+            let mut wrapped = serde_json::json!({
+                "pipeline_input": chain_input,
+                "config": first.input_payload,
+            });
+            if let Some(ref acc) = accumulated_snapshot {
+                if let Some(obj) = wrapped.as_object_mut() {
+                    obj.insert("__accumulated__".to_string(), acc.clone());
+                }
+            }
+            if let Some(ref ctx) = self.actor_context {
+                if let Some(obj) = wrapped.as_object_mut() {
+                    obj.insert("__actor_context__".to_string(), ctx.clone());
+                }
+            }
+            first.input_payload = wrapped;
+        }
+
+        // Pre-INSERT `module_executions` rows for each step so
+        // observers can see the chain's in-flight state. Row ids
+        // (`step_exec_ids`) are engine-level bookkeeping; the wire
+        // format doesn't carry them. The post-dispatch UPDATE below
+        // targets the right row by id.
+        let mut step_exec_ids = Vec::new();
+        if let Some(ref store) = self.module_execution_store {
+            for (i, &step_node_id) in chain_node_ids.iter().enumerate() {
+                let step_exec_id = Uuid::new_v4();
+                step_exec_ids.push(step_exec_id);
+                let input_for_db = if i == 0 {
+                    serde_json::json!({ "input": chain_input })
+                } else {
+                    serde_json::json!(null)
+                };
+                let actual_mid = store.resolve_module_id(step_node_id).await;
+                if let Err(db_err) = store
+                    .record_started(ExecutionStartedContext {
+                        id: step_exec_id,
+                        module_id: actual_mid,
+                        user_id: uid_for_chain.unwrap_or_else(Uuid::new_v4),
+                        workflow_execution_id: execution_id,
+                        input: &input_for_db,
+                        trigger_type: "webhook",
+                        // Pipeline steps dispatch as a unit — no concurrent
+                        // sibling to race against.
+                        race_safe_status: false,
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        "module_execution_store.record_started failed: {}",
+                        db_err
+                    );
+                }
+            }
+        }
+
+        // Aggregate timeout = sum of per-step budgets + 5s NATS
+        // overhead, clamped to the operator-configurable
+        // `TALOS_NATS_TIMEOUT_SECS` floor.
+        static NATS_TIMEOUT_FLOOR_SECS: OnceLock<u64> = OnceLock::new();
+        let nats_floor = *NATS_TIMEOUT_FLOOR_SECS.get_or_init(|| {
+            std::env::var("TALOS_NATS_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+        let chain_computed_secs: u64 = chain_node_ids
+            .iter()
+            .map(|id| self.node_timeouts.get(id).copied().unwrap_or(30))
+            .sum::<u64>()
+            + 5;
+        let timeout_secs = chain_computed_secs.max(nats_floor);
+
+        let chain_request = talos_workflow_engine_core::ChainDispatchRequest {
+            workflow_execution_id: execution_id,
+            user_id: uid_for_chain,
+            job_id: None,
+            steps: step_jobs,
+            share_sandbox: true,
+            total_timeout: std::time::Duration::from_secs(timeout_secs),
+            max_retries: chain_retry.max_retries,
+            backoff_ms: chain_retry.backoff_ms,
+            retry_condition: chain_retry.retry_condition.clone(),
+            retry_delay_expr: chain_retry.retry_delay_expression.clone(),
+        };
+
+        let chain_result = match dispatcher.dispatch_chain(chain_request).await {
+            Ok(r) => r,
+            Err(e) => return (chain_tail, Err(e.to_string())),
+        };
+
+        // Per-step post-processing: update `module_executions` rows
+        // with status/output/error; persist `__memory_write__`
+        // payloads for successful steps via the node-lifecycle hook.
+        if let Some(ref store) = self.module_execution_store {
+            for (i, step_result) in chain_result.steps.iter().enumerate() {
+                if let Some(&step_exec_id) = step_exec_ids.get(i) {
+                    let status_str = match step_result.status {
+                        talos_workflow_engine_core::StepStatus::Success => "completed",
+                        talos_workflow_engine_core::StepStatus::TimedOut => "timeout",
+                        talos_workflow_engine_core::StepStatus::Failed => "failed",
+                    };
+                    let error_msg = step_result
+                        .error
+                        .as_deref()
+                        .map(|s| self.redact_str(s));
+                    let duration = i32::try_from(step_result.execution_time_ms)
+                        .unwrap_or(i32::MAX);
+                    if let Err(db_err) = store
+                        .record_completed(
+                            step_exec_id,
+                            status_str,
+                            &self.redact_json(&step_result.output),
+                            duration,
+                            error_msg.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            "module_execution_store.record_completed failed: {}",
+                            db_err
+                        );
+                    }
+
+                    // `__memory_write__` protocol for pipeline steps:
+                    // only fire the hook on success (failed steps may
+                    // carry partial/corrupt output). The hook owns
+                    // extraction + spawn semantics; the engine just
+                    // forwards per-step outputs.
+                    if matches!(
+                        step_result.status,
+                        talos_workflow_engine_core::StepStatus::Success
+                    ) {
+                        if let Some(hook) = self.node_hook.as_ref() {
+                            hook.on_pipeline_step_completed(self.actor_id, &step_result.output);
+                        }
+                    }
+                }
+            }
+            // Mark any unexecuted trailing steps as aborted so the
+            // module-executions audit log shows them as failed rather
+            // than lingering forever in "running".
+            for i in chain_result.steps.len()..step_exec_ids.len() {
+                if let Some(&step_exec_id) = step_exec_ids.get(i) {
+                    if let Err(db_err) = store
+                        .record_completed(
+                            step_exec_id,
+                            "failed",
+                            &serde_json::Value::Null,
+                            0,
+                            Some("Pipeline aborted before this step"),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            "Database operation failed in engine: {}",
+                            db_err
+                        );
+                    }
+                }
+            }
+        }
+
+        match chain_result.overall_status {
+            talos_workflow_engine_core::StepStatus::Success => {
+                (chain_tail, Ok(chain_result.final_output))
+            }
+            _ => (
+                chain_tail,
+                Err(format!(
+                    "Pipeline execution failed: {:?}",
+                    chain_result.final_output
+                )),
+            ),
+        }
+    }
+
+    /// Evict stale entries, then apply the per-module rate limit for
+    /// `node_id`'s resolved module id. Returns `Some(error_envelope)`
+    /// when the limit was exceeded — the scheduler treats that as a
+    /// completed-node-with-error path (insert into results, unblock
+    /// successors, continue). Returns `None` when the dispatch may
+    /// proceed.
+    pub(crate) fn check_rate_limit(&self, node_id: Uuid) -> Option<JsonValue> {
+        evict_stale_rate_limits();
+        let module_id_resolved = self.resolve_module_id(node_id);
+        let limit = *self.rate_limits.get(&module_id_resolved)?;
+        if limit <= 0 {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        let mut entry = MODULE_RATE_LIMITS
+            .entry(module_id_resolved)
+            .or_insert((now, 0));
+        if now.duration_since(entry.0) > std::time::Duration::from_secs(60) {
+            entry.0 = now;
+            entry.1 = 0;
+        }
+        entry.1 += 1;
+        if entry.1 > limit as u32 {
+            tracing::warn!(
+                %node_id,
+                module_id = %module_id_resolved,
+                rate_limit = limit,
+                "Module rate limit exceeded"
+            );
+            Some(serde_json::json!({
+                "__error": true,
+                "error_message": format!("Module rate limit exceeded ({}/min)", limit),
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// Kick off background fetches for direct successors of `node_idx`
+    /// when the current node opts in via `speculative_prefetch: true`
+    /// on its config. Safety caps: max 8 successors prefetched, 5-
+    /// second per-fetch timeout.
+    pub(crate) fn maybe_speculative_prefetch(&self, node_id: Uuid, node_idx: NodeIndex) {
+        if !self
+            .node_configs
+            .get(&node_id)
+            .and_then(|c| c.get("speculative_prefetch"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        for succ_idx in self
+            .graph
+            .neighbors_directed(node_idx, Direction::Outgoing)
+            .take(MAX_PREFETCH_SUCCESSORS)
+        {
+            let succ_id = self.graph[succ_idx];
+            // Skip system nodes — they have no module in the registry
+            // (resolve_module_id returns the node UUID as a fallback).
+            // Fetching would waste a 5-second timeout and generate
+            // noisy debug log entries for every system successor.
+            let Some(succ_module_id) =
+                self.node_meta.get(&succ_id).and_then(|(mid, _, _)| *mid)
+            else {
+                continue;
+            };
+            let prefetch_cache = Arc::clone(&self.module_prefetch_cache);
+            let Some(fetcher) = self.module_fetcher.as_ref() else {
+                continue;
+            };
+            let fetcher = Arc::clone(fetcher);
+            let uid = self.user_id;
+            tokio::spawn(async move {
+                // Atomic duplicate suppression via vacant-entry check:
+                // only one spawn proceeds to fetch; others see the key
+                // already present and return immediately.
+                if prefetch_cache.contains_key(&succ_id) {
+                    return;
+                }
+                let Some(uid) = uid else {
+                    return;
+                };
+                // 5-second timeout: prevents hung prefetch tasks from
+                // leaking tokio task slots if the registry is
+                // unresponsive.
+                let fetch_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    fetcher.fetch(succ_module_id, uid),
+                )
+                .await;
+                match fetch_result {
+                    Ok(Ok(artifact)) => {
+                        // Use entry().or_insert to avoid overwriting a
+                        // result that another concurrent spawn already
+                        // stored.
+                        prefetch_cache.entry(succ_id).or_insert(artifact);
+                        tracing::debug!(
+                            %succ_id,
+                            "speculative prefetch: module cached"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            %succ_id,
+                            error = %e,
+                            "speculative prefetch: fetch failed (normal dispatch will retry)"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            %succ_id,
+                            "speculative prefetch: timed out (normal dispatch will fetch)"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// Build and await the full single-node dispatch future.
+    ///
+    /// Runs the approval gate, merges module + node configs, emits an
+    /// input-preview event, records the `module_executions` start row,
+    /// resolves encrypted secrets, assembles a [`DispatchJob`], and
+    /// hands it to the [`NodeDispatcher`]. Returns the scheduler's
+    /// `(NodeIndex, Result<JsonValue, String>)` completion tuple.
+    ///
+    /// Extracted from the reactor loop so the scheduler body reads as
+    /// a sequence of handler dispatches rather than a 370-line inline
+    /// closure. Semantics are preserved verbatim.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_single_node_dispatch(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        execution_id: Uuid,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        inputs: JsonValue,
+        accumulated_snapshot: Option<JsonValue>,
+        _execution_sandbox: Option<Arc<cap_std::fs::Dir>>,
+    ) -> (NodeIndex, Result<JsonValue, String>) {
+        let module_id_resolved = self.resolve_module_id(node_id);
+        let retry = self
+            .node_meta
+            .get(&node_id)
+            .and_then(|(_, rp, _)| rp.clone())
+            .unwrap_or_default();
+
+        let wasm_module = match self.fetch_module(node_id).await {
+            Ok(m) => m,
+            Err(e) => return (node_idx, Err(e)),
+        };
+
+        // Approval gate: verify an approved record exists when the
+        // module declares `requires_approval_for`.
+        if !wasm_module.requires_approval_for.is_empty() {
+            if let Some(ref gate) = self.approval_gate {
+                let approval_webhook = self
+                    .node_configs
+                    .get(&node_id)
+                    .and_then(|cfg| cfg.get("NOTIFICATION_WEBHOOK"))
+                    .and_then(|v| v.as_str());
+                match gate
+                    .check_or_request(
+                        execution_id,
+                        node_id,
+                        &wasm_module.requires_approval_for,
+                        approval_webhook,
+                    )
+                    .await
+                {
+                    Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {}
+                    Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
+                        return (
+                            node_idx,
+                            Err(format!(
+                                "Execution paused: module {} requires approval for {:?}. \
+                                 An approval request has been created.",
+                                node_id, wasm_module.requires_approval_for
+                            )),
+                        );
+                    }
+                    Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
+                        return (node_idx, Err(reason));
+                    }
+                    Err(e) => {
+                        tracing::error!(%node_id, "Approval gate check failed: {}", e);
+                        return (node_idx, Err(format!("Approval gate check failed: {e}")));
+                    }
+                }
+            }
+        }
+
+        if self.user_id.is_none() {
+            return (
+                node_idx,
+                Err("Module execution requires user context (user_id not set)".to_string()),
+            );
+        }
+
+        // Module-level config from the artifact, merged with any
+        // graph-JSON-level node config (graph JSON wins; reserved
+        // engine keys are filtered out before the merge lands on the
+        // worker).
+        let module_config = wasm_module
+            .config
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let module_config = if let Some(node_cfg) = self.node_configs.get(&node_id) {
+            if module_config.is_object() && node_cfg.is_object() {
+                let mut merged = module_config.as_object().cloned().unwrap_or_default();
+                if let Some(node_cfg_obj) = node_cfg.as_object() {
+                    for (k, v) in node_cfg_obj {
+                        if k == "__skip_condition"
+                            || k == "skip_condition"
+                            || k == "__continue_on_error"
+                            || k == "continue_on_error"
+                        {
+                            continue;
+                        }
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(merged)
+            } else if module_config == serde_json::json!({}) {
+                node_cfg.clone()
+            } else {
+                module_config
+            }
+        } else {
+            module_config
+        };
+
+        // Merge config and input into a flat object so templates can
+        // find their fields at the top level (e.g., "text", "URL").
+        // Also include "config" and "input" sub-objects for templates
+        // that explicitly read from those keys.
+        let wrapped_input = {
+            let mut merged = serde_json::Map::new();
+            if let Some(obj) = module_config.as_object() {
+                for (k, v) in obj {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(obj) = inputs.as_object() {
+                for (k, v) in obj {
+                    merged.insert(k.clone(), v.clone());
+                }
+            } else if !inputs.is_null() {
+                merged.insert("input".to_string(), inputs.clone());
+            }
+            if module_config != serde_json::json!({}) {
+                merged.insert("config".to_string(), module_config.clone());
+            }
+            let is_empty_object = inputs
+                .as_object()
+                .map(|m| m.is_empty())
+                .unwrap_or(false);
+            if !inputs.is_null() && !is_empty_object {
+                merged.insert("input".to_string(), inputs.clone());
+            }
+            if let Some(acc) = &accumulated_snapshot {
+                merged.insert("__accumulated__".to_string(), acc.clone());
+            }
+            if let Some(ref ctx) = self.actor_context {
+                merged.insert("__actor_context__".to_string(), ctx.clone());
+            }
+            serde_json::Value::Object(merged)
+        };
+
+        // Truncated input preview for the node-I/O inspector.
+        {
+            let input_preview = {
+                let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
+                if s.len() > 4096 {
+                    format!("{}...(truncated)", &s[..4096])
+                } else {
+                    s
+                }
+            };
+            emit_event_spawn(
+                &self.event_sink,
+                NodeEventWrite {
+                    execution_id,
+                    event_type: "node_input".to_string(),
+                    node_id: Some(node_id),
+                    status: "Input".to_string(),
+                    log_message: Some(input_preview),
+                    iteration_index: None,
+                },
+            );
+        }
+
+        let job_id = Uuid::new_v4();
+        if let Some(ref store) = self.module_execution_store {
+            // Resolve the actual wasm_modules.id for the FK.
+            // `module_id_resolved` may be a node_template UUID
+            // (Fallback 2 path) not present in wasm_modules; the
+            // store's resolver maps template → wasm_modules by
+            // most-recent compile.
+            let actual_module_id = store.resolve_module_id(module_id_resolved).await;
+            if let Err(db_err) = store
+                .record_started(ExecutionStartedContext {
+                    id: job_id,
+                    module_id: actual_module_id,
+                    user_id: self.user_id.unwrap_or_else(Uuid::new_v4),
+                    workflow_execution_id: execution_id,
+                    input: &inputs,
+                    trigger_type: "webhook",
+                    // Race-safe: if a sibling has already failed the
+                    // workflow, this row enters as 'cancelled' rather
+                    // than 'running', closing the race with the
+                    // failure-path UPDATE.
+                    race_safe_status: true,
+                })
+                .await
+            {
+                tracing::error!(
+                    "module_execution_store.record_started failed: {}",
+                    db_err
+                );
+            }
+        }
+
+        // Per-node fuel limit: config override > module default, capped at 50M.
+        let node_max_fuel = module_config
+            .get("max_fuel")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(wasm_module.max_fuel)
+            .min(50_000_000);
+
+        // Resolve encrypted secrets payload (opaque bytes at this layer).
+        let encrypted_secrets =
+            match (self.secrets_resolver.as_ref(), &worker_shared_key) {
+                (Some(resolver), Some(key)) => {
+                    let vault_paths = extract_vault_paths(&module_config);
+                    build_encrypted_secrets_for(
+                        resolver.as_ref(),
+                        self.secret_envelope.as_ref(),
+                        module_id_resolved,
+                        self.user_id,
+                        &vault_paths,
+                        &wasm_module.allowed_secrets,
+                        key.as_bytes(),
+                    )
+                    .await
+                }
+                _ => Default::default(),
+            };
+
+        // Wire-format WASM budget. The dispatcher internally adds its
+        // own Tokio-outer grace on top (see TOKIO_WRAP_GRACE_SECS).
+        let node_timeout_secs = self
+            .node_timeouts
+            .get(&node_id)
+            .copied()
+            .unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
+
+        let job = DispatchJob {
+            execution_id,
+            node_id,
+            module_id: module_id_resolved,
+            // Pre-INSERTed module_executions row is keyed by this id.
+            job_id: Some(job_id),
+            user_id: self.user_id,
+            actor_id: self.actor_id,
+            module_uri: wasm_module
+                .oci_url
+                .clone()
+                .unwrap_or_else(|| format!("redis:wasm:{module_id_resolved}")),
+            // Embed bytes directly so the worker doesn't depend on
+            // Redis pre-warm — bypasses the `wasm:{uid}:{id}` vs
+            // `wasm:{id}` key mismatch and template-UUID issues.
+            wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
+                None
+            } else {
+                Some(wasm_module.wasm_bytes.clone())
+            },
+            // OCI modules (empty wasm_bytes) commit the expected hash
+            // so the worker verifies fetched content matches what the
+            // engine compiled. Inline bytes don't need this — HMAC
+            // already covers sha256(inline_bytes).
+            expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
+                Some(wasm_module.content_hash.clone())
+            } else {
+                None
+            },
+            capability_world: Some(wasm_module.capability_world.clone()),
+            integration_name: wasm_module.integration_name.clone(),
+            input_payload: wrapped_input,
+            timeout: std::time::Duration::from_secs(node_timeout_secs),
+            max_fuel: node_max_fuel,
+            allowed_hosts: wasm_module.allowed_hosts.clone(),
+            allowed_methods: wasm_module.allowed_methods.clone(),
+            allowed_secrets: wasm_module.allowed_secrets.clone(),
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
+            encrypted_secrets_nonce: encrypted_secrets.nonce,
+            priority: 100,
+            dry_run: self.dry_run,
+            max_retries: retry.max_retries,
+            backoff_ms: retry.backoff_ms,
+            retry_condition: retry.retry_condition.clone(),
+            retry_delay_expr: retry.retry_delay_expression.clone(),
+            emit_retry_events: true,
+        };
+
+        match dispatcher.dispatch(job).await {
+            Ok(result) => {
+                tracing::info!(%node_id, "Node execution succeeded");
+                (node_idx, Ok(result.output))
+            }
+            Err(e) => (node_idx, Err(e.to_string())),
+        }
+    }
+
+    /// Fire-and-forget emit of a `node_skipped` event. Used by the
+    /// skip-condition pre-filter so the scheduler's standard dispatch
+    /// branches don't each have to remember to log the skip.
+    pub(crate) fn emit_node_skipped_event(&self, execution_id: Uuid, node_id: Uuid) {
+        emit_event_spawn(
+            &self.event_sink,
+            NodeEventWrite {
+                execution_id,
+                event_type: "node_skipped".to_string(),
+                node_id: Some(node_id),
+                status: "Skipped".to_string(),
+                log_message: None,
+                iteration_index: None,
+            },
+        );
     }
 
     /// Fire-and-forget emit of a `loop_iteration` event. Used by the
@@ -2998,578 +3862,49 @@ impl ParallelWorkflowEngine {
             while let Some(node_idx) = ready.pop_front() {
                 // ── Pipeline dispatch (chain head) ───────────────────────────
                 if let Some(&chain_idx) = node_to_chain.get(&node_idx) {
-                    // Only dispatch when we're at the chain head.
-                    if chain_heads.contains(&node_idx) {
-                        let chain = &chains[chain_idx];
-                        let chain_node_ids: Vec<Uuid> =
-                            chain.iter().map(|&n| self.graph[n]).collect();
-                        // Pre-resolve graph node UUIDs → module UUIDs before
-                        // entering the tokio::spawn block (which can't borrow
-                        // self). Graph node IDs are SHA256-derived from the
-                        // node label string ("fetch-upcoming" → deterministic
-                        // UUID) and don't match any wasm_modules row.
-                        // resolve_module_id maps them back to the template/
-                        // module UUID stored in node_meta at graph load time.
-                        let chain_module_ids: Vec<Uuid> = chain_node_ids
-                            .iter()
-                            .map(|&nid| self.resolve_module_id(nid))
-                            .collect();
-
-                        // Gather input for the chain's first node.
-                        let chain_input = self.gather_inputs(node_idx, &results);
-                        let chain_head_id = self.graph[node_idx];
-                        let chain_retry = self
-                            .node_meta
-                            .get(&chain_head_id)
-                            .and_then(|(_, rp, _)| rp.clone())
-                            .unwrap_or_default();
-                        let dispatcher_clone = dispatcher.clone();
-                        let user_id_clone = self.user_id;
-                        let module_fetcher_clone = self.module_fetcher.clone();
-                        let approval_gate = self.approval_gate.clone();
-                        let secrets_resolver = self.secrets_resolver.clone();
-                        let secret_envelope = self.secret_envelope.clone();
-                        let chain_clone = chain.clone();
-                        let chain_user_id = self.user_id;
-                        let worker_shared_key_clone = worker_shared_key.clone();
-                        let _node_configs_clone = self.node_configs.clone();
-                        let node_timeouts_clone = self.node_timeouts.clone();
-                        // Accumulated context snapshot for pipeline's first step.
-                        let accumulated_snapshot =
-                            Self::build_accumulated_context(&self.node_labels, &results);
-
-                        let fut = async move {
-                            // Resolve user_id early — required for all module-fetcher calls.
-                            let uid_for_chain: Option<Uuid> = if module_fetcher_clone.is_some() {
-                                match chain_user_id {
-                                    Some(u) => Some(u),
-                                    None => {
-                                        return (
-                                            chain_clone[chain_clone.len() - 1],
-                                            Err("Module execution requires user context (user_id not set)".to_string()),
-                                        )
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-
-                            // Build DispatchJobs for every node in the chain. The
-                            // dispatcher's `dispatch_chain` adapter maps these into
-                            // whatever batch wire format its backing dispatcher uses
-                            // (the reference NATS dispatcher emits a signed
-                            // `PipelineJobRequest`; an in-process test dispatcher
-                            // might just loop `dispatch` via
-                            // `talos_workflow_engine_core::dispatch_chain_sequential`).
-                            let mut step_jobs: Vec<DispatchJob> =
-                                Vec::with_capacity(chain_clone.len());
-
-                            for (i, &_step_idx) in chain_clone.iter().enumerate() {
-                                let step_node_id = chain_node_ids[i];
-                                // Use the resolved module UUID (template ID)
-                                // for registry lookups so get_execution_info
-                                // finds the correct allowed_hosts/secrets/fuel.
-                                let step_module_id = chain_module_ids[i];
-
-                                let uid = match uid_for_chain {
-                                    Some(u) => u,
-                                    None => {
-                                        return (
-                                            chain_clone[chain_clone.len() - 1],
-                                            Err(format!(
-                                                "Missing user ID for module {} in chain",
-                                                step_node_id
-                                            )),
-                                        )
-                                    }
-                                };
-
-                                // Fetch the pipeline step's module artifact via the
-                                // trait; `WasmModuleArtifact.config` mirrors
-                                // `wasm_modules.config`, same data the pre-extraction
-                                // code read via `reg.get_execution_info`. Dropping
-                                // the Redis cache warm that used to fire here —
-                                // wasm_bytes is embedded in the dispatched chain,
-                                // so the worker doesn't depend on the pre-warm.
-                                let (artifact, module_config) = match module_fetcher_clone.as_ref()
-                                {
-                                    Some(fetcher) => {
-                                        match fetcher.fetch(step_module_id, uid).await {
-                                            Ok(a) => {
-                                                let config = a
-                                                    .config
-                                                    .clone()
-                                                    .unwrap_or_else(|| serde_json::json!({}));
-                                                (Some(a), config)
-                                            }
-                                            Err(e) => {
-                                                return (
-                                                    chain_clone[chain_clone.len() - 1],
-                                                    Err(format!("Failed to prepare module: {}", e)),
-                                                )
-                                            }
-                                        }
-                                    }
-                                    None => (None, serde_json::json!({})),
-                                };
-
-                                // ── Approval gate (pipeline step) ────────────
-                                let requires_approval: Vec<String> = artifact
-                                    .as_ref()
-                                    .map(|a| a.requires_approval_for.clone())
-                                    .unwrap_or_default();
-                                if !requires_approval.is_empty() {
-                                    if let Some(ref gate) = approval_gate {
-                                        let approval_webhook = module_config
-                                            .get("NOTIFICATION_WEBHOOK")
-                                            .and_then(|v| v.as_str());
-                                        match gate
-                                            .check_or_request(
-                                                execution_id,
-                                                step_node_id,
-                                                &requires_approval,
-                                                approval_webhook,
-                                            )
-                                            .await
-                                        {
-                                            Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {
-                                                /* proceed */
-                                            }
-                                            Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
-                                                return (
-                                                    chain_clone[chain_clone.len() - 1],
-                                                    Err(format!(
-                                                        "Execution paused: module {} requires approval for {:?}. \
-                                                         An approval request has been created.",
-                                                        step_node_id, requires_approval
-                                                    )),
-                                                );
-                                            }
-                                            Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
-                                                return (
-                                                    chain_clone[chain_clone.len() - 1],
-                                                    Err(reason),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                return (
-                                                    chain_clone[chain_clone.len() - 1],
-                                                    Err(format!(
-                                                        "Approval gate check failed: {}",
-                                                        e
-                                                    )),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Extract vault:// paths from module_config before it
-                                // is moved into PipelineStep below.
-                                let vault_paths = extract_vault_paths(&module_config);
-
-                                // Per-node fuel limit precedence:
-                                //   1. node config `max_fuel` (highest)
-                                //   2. wasm_modules.max_fuel from the artifact
-                                //   3. 1M default
-                                // Capped at 50M. Previously hardcoded the
-                                // fallback to 1M, silently discarding any
-                                // DB-level bump on template-dispatched paths.
-                                let module_default_fuel = artifact
-                                    .as_ref()
-                                    .map(|a| a.max_fuel)
-                                    .filter(|f| *f > 0)
-                                    .unwrap_or(1_000_000);
-                                let node_max_fuel = module_config
-                                    .get("max_fuel")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(module_default_fuel)
-                                    .min(50_000_000);
-
-                                let encrypted_secrets =
-                                    match (secrets_resolver.as_ref(), &worker_shared_key_clone) {
-                                        (Some(resolver), Some(key)) => {
-                                            build_encrypted_secrets_for(
-                                                resolver.as_ref(),
-                                                secret_envelope.as_ref(),
-                                                step_node_id,
-                                                user_id_clone,
-                                                &vault_paths,
-                                                &[],
-                                                key.as_bytes(),
-                                            )
-                                            .await
-                                        }
-                                        _ => Default::default(),
-                                    };
-                                step_jobs.push(DispatchJob {
-                                    execution_id,
-                                    node_id: step_node_id,
-                                    module_id: step_node_id,
-                                    // Chain-level wire format derives a single
-                                    // `job_id`; per-step ids are not correlated to
-                                    // the individual `module_executions` rows
-                                    // (those use `step_exec_ids` — see below).
-                                    job_id: None,
-                                    user_id: Some(uid),
-                                    actor_id: self.actor_id,
-                                    // Match pre-extraction behavior: the redis fallback
-                                    // key is `redis:wasm:{module_id}`, NOT the graph node
-                                    // UUID. Before 73060b9, `ModuleExecutionInfo.module_uri`
-                                    // already applied this mapping inside the registry;
-                                    // now that we read `oci_url` directly, the fallback
-                                    // must use `step_module_id` to match the worker's
-                                    // redis-key convention.
-                                    module_uri: artifact
-                                        .as_ref()
-                                        .and_then(|a| a.oci_url.clone())
-                                        .unwrap_or_else(|| {
-                                            format!("redis:wasm:{}", step_module_id)
-                                        }),
-                                    wasm_bytes: None,
-                                    expected_wasm_hash: artifact
-                                        .as_ref()
-                                        .map(|a| a.content_hash.clone()),
-                                    // Pipeline dispatch doesn't carry capability_world
-                                    // per-step — the worker's pipeline executor uses the
-                                    // chain-level world. DispatchJob carries it for the
-                                    // single-node path; the NATS adapter drops it here.
-                                    capability_world: None,
-                                    integration_name: artifact
-                                        .as_ref()
-                                        .and_then(|a| a.integration_name.clone()),
-                                    // PipelineStep calls this `config`; the
-                                    // adapter will map `input_payload` to it.
-                                    input_payload: module_config,
-                                    timeout: std::time::Duration::from_secs(
-                                        node_timeouts_clone
-                                            .get(&step_node_id)
-                                            .copied()
-                                            .unwrap_or(30),
-                                    ),
-                                    max_fuel: node_max_fuel,
-                                    allowed_hosts: artifact
-                                        .as_ref()
-                                        .map(|a| a.allowed_hosts.clone())
-                                        .unwrap_or_default(),
-                                    allowed_methods: artifact
-                                        .as_ref()
-                                        .map(|a| a.allowed_methods.clone())
-                                        .unwrap_or_default(),
-                                    allowed_secrets: artifact
-                                        .as_ref()
-                                        .map(|a| a.allowed_secrets.clone())
-                                        .unwrap_or_default(),
-                                    allowed_sql_operations: vec![],
-                                    allow_tier2_exposure: false,
-                                    encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                                    encrypted_secrets_nonce: encrypted_secrets.nonce,
-                                    priority: 100,
-                                    dry_run: self.dry_run,
-                                    max_retries: 0,
-                                    backoff_ms: 0,
-                                    retry_condition: None,
-                                    retry_delay_expr: None,
-                                    // Chain-level retry emits under the chain's
-                                    // aggregate policy, not per-step.
-                                    emit_retry_events: false,
-                                });
-                            }
-
-                            // For the first step, inject the gathered inputs as
-                            // initial input (wrap it the same way as single-node does).
-                            // DispatchJob's `input_payload` maps to PipelineStep's `config`
-                            // in the adapter.
-                            if let Some(first) = step_jobs.first_mut() {
-                                let mut wrapped = serde_json::json!({
-                                    "pipeline_input": chain_input,
-                                    "config": first.input_payload,
-                                });
-                                // Inject accumulated context into pipeline first step
-                                if let Some(ref acc) = accumulated_snapshot {
-                                    if let Some(obj) = wrapped.as_object_mut() {
-                                        obj.insert("__accumulated__".to_string(), acc.clone());
-                                    }
-                                }
-                                // Inject actor memory context so LLM nodes can
-                                // reference learned_preferences, persona, etc.
-                                if let Some(ref ctx) = self.actor_context {
-                                    if let Some(obj) = wrapped.as_object_mut() {
-                                        obj.insert("__actor_context__".to_string(), ctx.clone());
-                                    }
-                                }
-                                first.input_payload = wrapped;
-                            }
-
-                            // Pre-INSERT `module_executions` rows for each step
-                            // so observers can see the chain's in-flight state.
-                            // Row ids (`step_exec_ids`) are engine-level
-                            // bookkeeping — they're NOT threaded through to the
-                            // wire format; the post-dispatch UPDATE below uses
-                            // them to target the right row.
-                            let mut step_exec_ids = Vec::new();
-                            if let Some(ref store) = self.module_execution_store {
-                                for (i, &step_node_id) in chain_node_ids.iter().enumerate() {
-                                    let step_exec_id = Uuid::new_v4();
-                                    step_exec_ids.push(step_exec_id);
-                                    let input_for_db = if i == 0 {
-                                        serde_json::json!({ "input": chain_input })
-                                    } else {
-                                        serde_json::json!(null)
-                                    };
-                                    let actual_mid = store.resolve_module_id(step_node_id).await;
-                                    if let Err(db_err) = store
-                                        .record_started(ExecutionStartedContext {
-                                            id: step_exec_id,
-                                            module_id: actual_mid,
-                                            user_id: uid_for_chain.unwrap_or_else(Uuid::new_v4),
-                                            workflow_execution_id: execution_id,
-                                            input: &input_for_db,
-                                            trigger_type: "webhook",
-                                            // Pipeline steps dispatch as a unit — no
-                                            // concurrent sibling to race against.
-                                            race_safe_status: false,
-                                        })
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            "module_execution_store.record_started failed: {}",
-                                            db_err
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Aggregate timeout = sum of per-step budgets + 5s
-                            // NATS overhead, clamped to the operator-configurable
-                            // TALOS_NATS_TIMEOUT_SECS floor.
-                            static NATS_TIMEOUT_FLOOR_SECS: OnceLock<u64> = OnceLock::new();
-                            let nats_floor = *NATS_TIMEOUT_FLOOR_SECS.get_or_init(|| {
-                                std::env::var("TALOS_NATS_TIMEOUT_SECS")
-                                    .ok()
-                                    .and_then(|v| v.parse::<u64>().ok())
-                                    .unwrap_or(0)
-                            });
-                            let chain_computed_secs: u64 = chain_node_ids
-                                .iter()
-                                .map(|id| node_timeouts_clone.get(id).copied().unwrap_or(30))
-                                .sum::<u64>()
-                                + 5;
-                            let timeout_secs = chain_computed_secs.max(nats_floor);
-
-                            let chain_request = talos_workflow_engine_core::ChainDispatchRequest {
-                                workflow_execution_id: execution_id,
-                                user_id: uid_for_chain,
-                                job_id: None,
-                                steps: step_jobs,
-                                share_sandbox: true,
-                                total_timeout: std::time::Duration::from_secs(timeout_secs),
-                                max_retries: chain_retry.max_retries,
-                                backoff_ms: chain_retry.backoff_ms,
-                                retry_condition: chain_retry.retry_condition.clone(),
-                                retry_delay_expr: chain_retry.retry_delay_expression.clone(),
-                            };
-
-                            let chain_result =
-                                match dispatcher_clone.dispatch_chain(chain_request).await {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        return (
-                                            chain_clone[chain_clone.len() - 1],
-                                            Err(e.to_string()),
-                                        );
-                                    }
-                                };
-
-                            // Per-step post-processing: update module_executions
-                            // rows with status/output/error, persist
-                            // __memory_write__ payloads for successful steps.
-                            if let Some(ref store) = self.module_execution_store {
-                                for (i, step_result) in chain_result.steps.iter().enumerate() {
-                                    if let Some(&step_exec_id) = step_exec_ids.get(i) {
-                                        let status_str = match step_result.status {
-                                            talos_workflow_engine_core::StepStatus::Success => {
-                                                "completed"
-                                            }
-                                            talos_workflow_engine_core::StepStatus::TimedOut => {
-                                                "timeout"
-                                            }
-                                            talos_workflow_engine_core::StepStatus::Failed => {
-                                                "failed"
-                                            }
-                                        };
-                                        let error_msg = step_result
-                                            .error
-                                            .as_deref()
-                                            .map(|s| self.redact_str(s));
-                                        let duration = i32::try_from(step_result.execution_time_ms)
-                                            .unwrap_or(i32::MAX);
-                                        if let Err(db_err) = store
-                                            .record_completed(
-                                                step_exec_id,
-                                                status_str,
-                                                &self.redact_json(&step_result.output),
-                                                duration,
-                                                error_msg.as_deref(),
-                                            )
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "module_execution_store.record_completed failed: {}",
-                                                db_err
-                                            );
-                                        }
-
-                                        // __memory_write__ protocol for pipeline steps.
-                                        // Only fire the hook for successful steps — failed
-                                        // steps may have partial/corrupt output. The hook
-                                        // owns extraction + spawn semantics; the engine
-                                        // just forwards per-step outputs.
-                                        if matches!(
-                                            step_result.status,
-                                            talos_workflow_engine_core::StepStatus::Success
-                                        ) {
-                                            if let Some(hook) = self.node_hook.as_ref() {
-                                                hook.on_pipeline_step_completed(
-                                                    self.actor_id,
-                                                    &step_result.output,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                // Mark any unexecuted trailing steps as aborted.
-                                for i in chain_result.steps.len()..step_exec_ids.len() {
-                                    if let Some(&step_exec_id) = step_exec_ids.get(i) {
-                                        if let Err(db_err) = store
-                                            .record_completed(
-                                                step_exec_id,
-                                                "failed",
-                                                &serde_json::Value::Null,
-                                                0,
-                                                Some("Pipeline aborted before this step"),
-                                            )
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "Database operation failed in engine: {}",
-                                                db_err
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            match chain_result.overall_status {
-                                talos_workflow_engine_core::StepStatus::Success => (
-                                    chain_clone[chain_clone.len() - 1],
-                                    Ok(chain_result.final_output),
-                                ),
-                                _ => (
-                                    chain_clone[chain_clone.len() - 1],
-                                    Err(format!(
-                                        "Pipeline execution failed: {:?}",
-                                        chain_result.final_output
-                                    )),
-                                ),
-                            }
-                        };
-                        executing.push(Box::pin(fut)
-                            as Pin<
-                                Box<
-                                    dyn Future<Output = (NodeIndex, Result<JsonValue, String>)>
-                                        + Send,
-                                >,
-                            >);
+                    // Only dispatch when we're at the chain head; non-
+                    // head chain nodes roll up under the head's
+                    // completion, so skip them here.
+                    if !chain_heads.contains(&node_idx) {
                         continue;
                     }
-                    // Non-head chain nodes are handled when the chain completes — skip them.
+                    let chain = chains[chain_idx].clone();
+                    let chain_input = self.gather_inputs(node_idx, &results);
+                    let accumulated_snapshot =
+                        Self::build_accumulated_context(&self.node_labels, &results);
+                    let fut = self.run_pipeline_chain_dispatch(
+                        chain,
+                        chain_input,
+                        accumulated_snapshot,
+                        execution_id,
+                        dispatcher.clone(),
+                        worker_shared_key.clone(),
+                    );
+                    executing.push(Box::pin(fut)
+                        as Pin<
+                            Box<
+                                dyn Future<Output = (NodeIndex, Result<JsonValue, String>)>
+                                    + Send,
+                            >,
+                        >);
                     continue;
                 }
 
-                // ── FanIn aggregation (local computation, no NATS dispatch) ──
                 let node_id = self.graph[node_idx];
 
-                // ── Skip condition check (FIRST — applies to ALL node types including system nodes) ──
-                if let Some(skip_cond) = self
-                    .node_configs
-                    .get(&node_id)
-                    .and_then(|cfg| cfg.get("__skip_condition"))
-                    .and_then(|v| v.as_str())
+                // ── Skip condition check (applies to ALL node kinds) ─────────
+                if let Some(output) =
+                    self.check_skip_condition(node_idx, node_id, execution_id, &results)
                 {
-                    let mut skip_context = self.gather_inputs(node_idx, &results);
-                    if let Some(trigger_id) = self
-                        .node_labels
-                        .iter()
-                        .find(|(_, label)| label.as_str() == "__trigger__")
-                        .map(|(uuid, _)| *uuid)
-                    {
-                        if let Some(trigger_val) = results.get(&trigger_id) {
-                            if let Some(obj) = trigger_val.as_object() {
-                                if let Some(ctx_obj) = skip_context.as_object_mut() {
-                                    for (k, v) in obj {
-                                        ctx_obj.entry(k.clone()).or_insert(v.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if self.eval_bool(skip_cond, &skip_context) {
-                        tracing::info!(node_id = %node_id, skip_condition = %skip_cond, "Node skipped by skip_condition");
-                        results.insert(
-                            node_id,
-                            serde_json::json!({"__skipped": true, "reason": "skip_condition"}),
-                        );
-                        emit_event_spawn(
-                            &self.event_sink,
-                            NodeEventWrite {
-                                execution_id,
-                                event_type: "node_skipped".to_string(),
-                                node_id: Some(node_id),
-                                status: "Skipped".to_string(),
-                                log_message: None,
-                                iteration_index: None,
-                            },
-                        );
-                        for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                            if let Some(cnt) = pending.get_mut(&child) {
-                                if *cnt > 0 {
-                                    *cnt -= 1;
-                                }
-                                if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                    ready.push_back(child);
-                                }
-                            }
-                        }
-                        continue;
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
                 }
 
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::FanIn {
-                        ref join_mode,
-                        ref aggregation_expr,
-                    }),
-                )) = self.node_meta.get(&node_id)
-                {
-                    let final_result =
-                        self.aggregate_fan_in(node_idx, &results, join_mode, aggregation_expr);
-
-                    results.insert(node_id, final_result);
-
-                    // Unblock successors of the FanIn node
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if *cnt == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                // ── FanIn aggregation (local computation, no dispatch) ───────
+                if let Some(output) = self.try_dispatch_fan_in(node_idx, node_id, &results) {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
@@ -3691,253 +4026,18 @@ impl ParallelWorkflowEngine {
 
                 // ── AgentLoop dispatch (ReAct-style iterative sub-workflow execution) ──
                 #[cfg(feature = "llm-primitives")]
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::AgentLoop {
-                        body_workflow_id,
-                        max_iterations,
-                        inject_history,
-                        timeout_secs,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_agent_loop(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let body_wf_id = *body_workflow_id;
-                    let max_iters = *max_iterations;
-                    let do_inject_history = *inject_history;
-                    let timeout_secs = *timeout_secs;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        body_workflow_id = %body_wf_id,
-                        max_iterations = max_iters,
-                        "AgentLoop — starting ReAct iteration loop"
-                    );
-
-                    let agent_result = if self.module_fetcher.is_some() {
-                        let user_id = match self.user_id {
-                            Some(uid) => uid,
-                            None => {
-                                results.insert(node_id, serde_json::json!({
-                                    "__error": true,
-                                    "error_message": "user_id required for sub-workflow execution"
-                                }));
-                                for child in
-                                    self.graph.neighbors_directed(node_idx, Direction::Outgoing)
-                                {
-                                    if let Some(cnt) = pending.get_mut(&child) {
-                                        if *cnt > 0 {
-                                            *cnt -= 1;
-                                        }
-                                        if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                            ready.push_back(child);
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                        };
-                        let graph_row = self.get_sub_workflow_graph(body_wf_id, user_id).await;
-
-                        if let Some(graph_json) = graph_row {
-                            let dispatcher_al = dispatcher.clone();
-                            let worker_shared_key_al = worker_shared_key.clone();
-                            let adapter_set_al = self.adapter_set();
-                            let inputs_al = inputs.clone();
-                            let agent_result_inner = match tokio::time::timeout(
-                                std::time::Duration::from_secs(timeout_secs),
-                                async move {
-                                    let mut history: Vec<JsonValue> = Vec::new();
-                                    let mut last_output = serde_json::json!({});
-                                    let mut finished = false;
-                                    // Track total iterations separately from history.len() —
-                                    // history is capped at AGENT_LOOP_MAX_HISTORY entries (sliding window) so
-                                    // history.len() would under-report when max_iters > AGENT_LOOP_MAX_HISTORY.
-                                    let mut iterations_run: u32 = 0;
-
-                                    for iteration in 1..=max_iters {
-                                        // Build iteration input: start with clean parent inputs
-                                        let mut iter_input = if let Some(obj) = inputs_al.as_object() {
-                                            let mut cleaned = obj.clone();
-                                            cleaned.retain(|k, _| !k.starts_with("__"));
-                                            cleaned
-                                        } else {
-                                            serde_json::Map::new()
-                                        };
-
-                                        iter_input.insert(
-                                            "__agent_iteration__".to_string(),
-                                            serde_json::json!(iteration),
-                                        );
-
-                                        if do_inject_history && !history.is_empty() {
-                                            iter_input.insert(
-                                                "__agent_history__".to_string(),
-                                                serde_json::Value::Array(history.clone()),
-                                            );
-                                        }
-
-                                        let iter_input_value = serde_json::Value::Object(iter_input);
-
-                                        let iter_result = match adapter_set_al
-                                            .clone()
-                                            .into_engine_with_graph(&graph_json)
-                                        {
-                                            Ok(mut sub_engine) => {
-                                                let sub_execution_id = Uuid::new_v4();
-                                                let trigger_node_id = Uuid::new_v4();
-                                                sub_engine.add_node(trigger_node_id, None, None, None);
-                                                sub_engine.node_labels.insert(trigger_node_id, "__trigger__".to_string());
-
-                                                let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
-                                                    .graph
-                                                    .node_indices()
-                                                    .filter(|&idx| {
-                                                        sub_engine.graph[idx] != trigger_node_id
-                                                            && sub_engine
-                                                                .graph
-                                                                .neighbors_directed(idx, Direction::Incoming)
-                                                                .count()
-                                                                == 0
-                                                    })
-                                                    .collect();
-                                                for root_idx in &root_indices {
-                                                    let root_id = sub_engine.graph[*root_idx];
-                                                    let _ = sub_engine.add_edge(
-                                                        trigger_node_id,
-                                                        root_id,
-                                                        talos_workflow_engine_core::EdgeLogic {
-                                                            source_handle: "output".to_string(),
-                                                            target_handle: "input".to_string(),
-                                                            mapping: None,
-                                                            condition: None,
-                                                            edge_type: "default".to_string(),
-                                                        },
-                                                    );
-                                                }
-
-                                                let mut initial_results = HashMap::new();
-                                                initial_results.insert(trigger_node_id, iter_input_value);
-
-                                                let sub_labels = sub_engine.node_labels.clone();
-                                                match sub_engine
-                                                    .run_with_seed_with_transport(
-                                                        dispatcher_al.clone(),
-                                                        worker_shared_key_al.clone(),
-                                                        initial_results,
-                                                        sub_execution_id,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(ctx) => {
-                                                        let mut sub_outputs = serde_json::Map::new();
-                                                        for (nid, output) in &ctx.results {
-                                                            if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                                                continue;
-                                                            }
-                                                            let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
-                                                            if key == "__trigger__" { continue; }
-                                                            sub_outputs.insert(key, ParallelWorkflowEngine::unwrap_output(output).clone());
-                                                        }
-                                                        serde_json::Value::Object(sub_outputs)
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            iteration,
-                                                            error = %e,
-                                                            "AgentLoop body workflow failed on iteration"
-                                                        );
-                                                        serde_json::json!({"__error": true, "error_message": e.to_string()})
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                serde_json::json!({"__error": true, "error_message": format!("Failed to build agent body: {}", e)})
-                                            }
-                                        };
-
-                                        // Check for finish signals in the iteration output.
-                                        let iter_finished = iter_result
-                                            .get("finished")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false)
-                                            || iter_result
-                                                .get("action")
-                                                .and_then(|v| v.as_str())
-                                                .map(|s| s.eq_ignore_ascii_case("FINISH"))
-                                                .unwrap_or(false);
-
-                                        // Cap history entries to prevent unbounded memory growth
-                                        // when inject_history is true and iterations produce large outputs.
-                                        // Keep the last AGENT_LOOP_MAX_HISTORY entries (sufficient for ReAct reasoning chains).
-                                        iterations_run += 1;
-                                        if history.len() >= AGENT_LOOP_MAX_HISTORY {
-                                            history.remove(0);
-                                        }
-                                        history.push(iter_result.clone());
-                                        last_output = iter_result;
-
-                                        if iter_finished {
-                                            finished = true;
-                                            break;
-                                        }
-                                    }
-
-                                    if !finished {
-                                        tracing::warn!(
-                                            max_iterations = max_iters,
-                                            "AgentLoop reached max_iterations without finish signal"
-                                        );
-                                    }
-
-                                    serde_json::json!({
-                                        "iterations": iterations_run,
-                                        "finished": finished,
-                                        "history": history,
-                                        "final_output": last_output,
-                                    })
-                                },
-                            ).await {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        node_id = %node_id,
-                                        timeout_secs = timeout_secs,
-                                        "AgentLoop timed out"
-                                    );
-                                    serde_json::json!({
-                                        "__error": true,
-                                        "error_message": format!("AgentLoop timed out after {}s", timeout_secs),
-                                    })
-                                }
-                            };
-                            agent_result_inner
-                        } else {
-                            serde_json::json!({
-                                "__error": true,
-                                "error_message": format!("AgentLoop body workflow {} not found", body_wf_id),
-                            })
-                        }
-                    } else {
-                        serde_json::json!({
-                            "__error": true,
-                            "error_message": "Registry not available for AgentLoop execution",
-                        })
-                    };
-
-                    results.insert(node_id, agent_result);
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
@@ -3971,417 +4071,39 @@ impl ParallelWorkflowEngine {
                     continue;
                 }
 
-                // ── DynamicDispatch (evaluate Rhai expression to select sub-workflow) ──
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::DynamicDispatch {
-                        ref dispatch_expression,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                // ── DynamicDispatch (Rhai expression → target sub-workflow) ──
+                if let Some(output) = self
+                    .try_dispatch_dynamic_dispatch(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let expression = dispatch_expression.clone();
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        expression = %expression,
-                        "DynamicDispatch node — evaluating dispatch expression"
-                    );
-
-                    // Evaluate the Rhai expression to get the target workflow ID
-                    let dispatch_target: Result<String, String> = {
-                        let mut rhai_engine = rhai::Engine::new();
-                        rhai_engine.set_max_operations(10_000);
-                        rhai_engine.disable_symbol("eval");
-                        rhai_engine
-                            .set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
-                        let mut scope = rhai::Scope::new();
-                        if let Some(obj) = inputs.as_object() {
-                            for (k, v) in obj {
-                                let dyn_val: rhai::Dynamic = match v {
-                                    serde_json::Value::String(s) => rhai::Dynamic::from(s.clone()),
-                                    serde_json::Value::Number(n) => {
-                                        if let Some(i) = n.as_i64() {
-                                            rhai::Dynamic::from(i)
-                                        } else if let Some(f) = n.as_f64() {
-                                            rhai::Dynamic::from(f)
-                                        } else {
-                                            rhai::Dynamic::from(n.to_string())
-                                        }
-                                    }
-                                    serde_json::Value::Bool(b) => rhai::Dynamic::from(*b),
-                                    _ => rhai::Dynamic::from(v.to_string()),
-                                };
-                                scope.push(k.clone(), dyn_val);
-                            }
-                        }
-                        match rhai_engine.eval_with_scope::<rhai::Dynamic>(&mut scope, &expression)
-                        {
-                            Ok(result) => {
-                                let s = result.to_string();
-                                if s.is_empty() {
-                                    Err("Dispatch expression returned empty string".to_string())
-                                } else {
-                                    Ok(s)
-                                }
-                            }
-                            Err(e) => Err(format!("Dispatch expression evaluation failed: {}", e)),
-                        }
-                    };
-
-                    let dispatch_result = match dispatch_target {
-                        Ok(target_id_or_name) => {
-                            let target_wf_id: Option<uuid::Uuid> =
-                                if let Ok(id) = uuid::Uuid::parse_str(&target_id_or_name) {
-                                    Some(id)
-                                } else if let Some(ref store) = self.graph_store {
-                                    store
-                                        .resolve_by_name(
-                                            &target_id_or_name,
-                                            self.user_id.unwrap_or_else(Uuid::nil),
-                                        )
-                                        .await
-                                        .map_err(|e| {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "DB query failed during execution",
-                                            );
-                                            e
-                                        })
-                                        .ok()
-                                        .flatten()
-                                } else {
-                                    None
-                                };
-
-                            match target_wf_id {
-                                Some(sub_wf_id) => {
-                                    tracing::info!(node_id = %node_id, dispatched_workflow_id = %sub_wf_id, "DynamicDispatch resolved to workflow");
-                                    if self.module_fetcher.is_some() {
-                                        let graph_row = self
-                                            .get_sub_workflow_graph(
-                                                sub_wf_id,
-                                                self.user_id.unwrap_or_else(Uuid::nil),
-                                            )
-                                            .await;
-
-                                        if let Some(graph_json) = graph_row {
-                                            match self
-                                                .adapter_set()
-                                                .into_engine_with_graph(&graph_json)
-                                            {
-                                                Ok(mut sub_engine) => {
-                                                    let sub_execution_id = Uuid::new_v4();
-                                                    let clean_input = if let Some(obj) =
-                                                        inputs.as_object()
-                                                    {
-                                                        let mut cleaned = obj.clone();
-                                                        cleaned.retain(|k, _| !k.starts_with("__"));
-                                                        serde_json::Value::Object(cleaned)
-                                                    } else {
-                                                        inputs.clone()
-                                                    };
-
-                                                    let trigger_node_id = Uuid::new_v4();
-                                                    sub_engine.add_node(
-                                                        trigger_node_id,
-                                                        None,
-                                                        None,
-                                                        None,
-                                                    );
-                                                    sub_engine.node_labels.insert(
-                                                        trigger_node_id,
-                                                        "__trigger__".to_string(),
-                                                    );
-                                                    let root_indices: Vec<
-                                                        petgraph::graph::NodeIndex,
-                                                    > = sub_engine
-                                                        .graph
-                                                        .node_indices()
-                                                        .filter(|&idx| {
-                                                            sub_engine.graph[idx] != trigger_node_id
-                                                                && sub_engine
-                                                                    .graph
-                                                                    .neighbors_directed(
-                                                                        idx,
-                                                                        Direction::Incoming,
-                                                                    )
-                                                                    .count()
-                                                                    == 0
-                                                        })
-                                                        .collect();
-                                                    for root_idx in &root_indices {
-                                                        let root_id = sub_engine.graph[*root_idx];
-                                                        let _ = sub_engine.add_edge(
-                                                            trigger_node_id,
-                                                            root_id,
-                                                            talos_workflow_engine_core::EdgeLogic {
-                                                                source_handle: "output".to_string(),
-                                                                target_handle: "input".to_string(),
-                                                                mapping: None,
-                                                                condition: None,
-                                                                edge_type: "default".to_string(),
-                                                            },
-                                                        );
-                                                    }
-
-                                                    let mut initial_results = HashMap::new();
-                                                    initial_results
-                                                        .insert(trigger_node_id, clean_input);
-                                                    let sub_labels = sub_engine.node_labels.clone();
-                                                    match sub_engine
-                                                        .run_with_seed_with_transport(
-                                                            dispatcher.clone(),
-                                                            worker_shared_key.clone(),
-                                                            initial_results,
-                                                            sub_execution_id,
-                                                        )
-                                                        .await
-                                                    {
-                                                        Ok(ctx) => {
-                                                            let mut sub_outputs =
-                                                                serde_json::Map::new();
-                                                            sub_outputs.insert(
-                                                                "__dispatched_workflow_id__"
-                                                                    .to_string(),
-                                                                serde_json::json!(
-                                                                    sub_wf_id.to_string()
-                                                                ),
-                                                            );
-                                                            for (nid, output) in &ctx.results {
-                                                                if output
-                                                                    .get("__skipped")
-                                                                    .and_then(|v| v.as_bool())
-                                                                    .unwrap_or(false)
-                                                                {
-                                                                    continue;
-                                                                }
-                                                                let key = sub_labels
-                                                                    .get(nid)
-                                                                    .cloned()
-                                                                    .unwrap_or_else(|| {
-                                                                        nid.to_string()
-                                                                    });
-                                                                if key == "__trigger__" {
-                                                                    continue;
-                                                                }
-                                                                sub_outputs.insert(
-                                                                    key,
-                                                                    Self::unwrap_output(output)
-                                                                        .clone(),
-                                                                );
-                                                            }
-                                                            serde_json::Value::Object(sub_outputs)
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Dispatched workflow failed");
-                                                            serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow failed: {}", e)})
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    serde_json::json!({"__error": true, "error_message": format!("Failed to build dispatched workflow engine: {}", e)})
-                                                }
-                                            }
-                                        } else {
-                                            serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow {} not found", sub_wf_id)})
-                                        }
-                                    } else {
-                                        serde_json::json!({"__error": true, "error_message": "Registry not available for dispatch execution"})
-                                    }
-                                }
-                                None => {
-                                    serde_json::json!({"__error": true, "error_message": format!("Could not resolve dispatch target: {}", target_id_or_name)})
-                                }
-                            }
-                        }
-                        Err(e) => serde_json::json!({"__error": true, "error_message": e}),
-                    };
-
-                    results.insert(node_id, dispatch_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── CapabilityDispatch (find best workflow by capability tags) ──
-                if let Some((
-                    _,
-                    _,
-                    Some(SystemNodeKind::CapabilityDispatch {
-                        ref required_capabilities,
-                        timeout_secs: _,
-                    }),
-                )) = self.node_meta.get(&node_id)
+                // ── CapabilityDispatch (match workflow by capability tags) ──
+                if let Some(output) = self
+                    .try_dispatch_capability_dispatch(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let caps = required_capabilities.clone();
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        capabilities = ?caps,
-                        "CapabilityDispatch node — finding best matching workflow"
-                    );
-
-                    let capability_result = if let Some(ref store) = self.graph_store {
-                        let matching_row = store
-                            .resolve_by_capabilities(&caps, self.user_id.unwrap_or_else(Uuid::nil))
-                            .await
-                            .map_err(|e| {
-                                tracing::warn!(
-                                    error = %e,
-                                    "DB query failed during execution",
-                                );
-                                e
-                            })
-                            .ok()
-                            .flatten();
-
-                        match matching_row {
-                            Some((sub_wf_id, sub_wf_name)) => {
-                                tracing::info!(node_id = %node_id, dispatched_workflow_id = %sub_wf_id, dispatched_workflow_name = %sub_wf_name, "CapabilityDispatch resolved to workflow");
-                                let graph_row = self
-                                    .get_sub_workflow_graph(
-                                        sub_wf_id,
-                                        self.user_id.unwrap_or_else(Uuid::nil),
-                                    )
-                                    .await;
-
-                                if let Some(graph_json) = graph_row {
-                                    match self.adapter_set().into_engine_with_graph(&graph_json) {
-                                        Ok(mut sub_engine) => {
-                                            let sub_execution_id = Uuid::new_v4();
-                                            let clean_input = if let Some(obj) = inputs.as_object()
-                                            {
-                                                let mut cleaned = obj.clone();
-                                                cleaned.retain(|k, _| !k.starts_with("__"));
-                                                serde_json::Value::Object(cleaned)
-                                            } else {
-                                                inputs.clone()
-                                            };
-
-                                            let trigger_node_id = Uuid::new_v4();
-                                            sub_engine.add_node(trigger_node_id, None, None, None);
-                                            sub_engine
-                                                .node_labels
-                                                .insert(trigger_node_id, "__trigger__".to_string());
-                                            let root_indices: Vec<petgraph::graph::NodeIndex> =
-                                                sub_engine
-                                                    .graph
-                                                    .node_indices()
-                                                    .filter(|&idx| {
-                                                        sub_engine.graph[idx] != trigger_node_id
-                                                            && sub_engine
-                                                                .graph
-                                                                .neighbors_directed(
-                                                                    idx,
-                                                                    Direction::Incoming,
-                                                                )
-                                                                .count()
-                                                                == 0
-                                                    })
-                                                    .collect();
-                                            for root_idx in &root_indices {
-                                                let root_id = sub_engine.graph[*root_idx];
-                                                let _ = sub_engine.add_edge(
-                                                    trigger_node_id,
-                                                    root_id,
-                                                    talos_workflow_engine_core::EdgeLogic {
-                                                        source_handle: "output".to_string(),
-                                                        target_handle: "input".to_string(),
-                                                        mapping: None,
-                                                        condition: None,
-                                                        edge_type: "default".to_string(),
-                                                    },
-                                                );
-                                            }
-
-                                            let mut initial_results = HashMap::new();
-                                            initial_results.insert(trigger_node_id, clean_input);
-                                            let sub_labels = sub_engine.node_labels.clone();
-                                            match sub_engine
-                                                .run_with_seed_with_transport(
-                                                    dispatcher.clone(),
-                                                    worker_shared_key.clone(),
-                                                    initial_results,
-                                                    sub_execution_id,
-                                                )
-                                                .await
-                                            {
-                                                Ok(ctx) => {
-                                                    let mut sub_outputs = serde_json::Map::new();
-                                                    sub_outputs.insert(
-                                                        "__dispatched_workflow_id__".to_string(),
-                                                        serde_json::json!(sub_wf_id.to_string()),
-                                                    );
-                                                    sub_outputs.insert(
-                                                        "__dispatched_by".to_string(),
-                                                        serde_json::json!("capability_dispatch"),
-                                                    );
-                                                    sub_outputs.insert(
-                                                        "__dispatched_workflow_name".to_string(),
-                                                        serde_json::json!(sub_wf_name),
-                                                    );
-                                                    sub_outputs.insert(
-                                                        "__matched_capabilities".to_string(),
-                                                        serde_json::json!(caps),
-                                                    );
-                                                    for (nid, output) in &ctx.results {
-                                                        if output
-                                                            .get("__skipped")
-                                                            .and_then(|v| v.as_bool())
-                                                            .unwrap_or(false)
-                                                        {
-                                                            continue;
-                                                        }
-                                                        let key = sub_labels
-                                                            .get(nid)
-                                                            .cloned()
-                                                            .unwrap_or_else(|| nid.to_string());
-                                                        if key == "__trigger__" {
-                                                            continue;
-                                                        }
-                                                        sub_outputs.insert(
-                                                            key,
-                                                            Self::unwrap_output(output).clone(),
-                                                        );
-                                                    }
-                                                    serde_json::Value::Object(sub_outputs)
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Capability-dispatched workflow failed");
-                                                    serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow failed: {}", e)})
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            serde_json::json!({"__error": true, "error_message": format!("Failed to build capability-dispatched engine: {}", e)})
-                                        }
-                                    }
-                                } else {
-                                    serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow {} graph not found", sub_wf_id)})
-                                }
-                            }
-                            None => {
-                                serde_json::json!({"__error": true, "error_message": format!("No workflow found matching capabilities: {:?}", caps)})
-                            }
-                        }
-                    } else {
-                        serde_json::json!({"__error": true, "error_message": "Registry not available for capability dispatch"})
-                    };
-
-                    // If capability dispatch failed, check continue_on_error before propagating
-                    if capability_result
+                    // Capability-dispatch failures are scheduler-fatal unless
+                    // the node opts in to `continue_on_error`. The check
+                    // lives at the caller because the handler itself stays
+                    // policy-neutral: it returns the `__error` envelope and
+                    // lets the scheduler decide whether to propagate.
+                    if output
                         .get("__error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
@@ -4393,31 +4115,27 @@ impl ParallelWorkflowEngine {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         if !continue_on_error {
-                            let err_msg = capability_result
+                            let err_msg = output
                                 .get("error_message")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("capability dispatch failed")
                                 .to_string();
-                            tracing::error!(node_id = %node_id, error = %err_msg, "Capability dispatch failed — failing workflow");
+                            tracing::error!(
+                                %node_id,
+                                error = %err_msg,
+                                "Capability dispatch failed — failing workflow"
+                            );
                             return Err(format!(
-                                "Capability dispatch node {}: {}",
-                                node_id, err_msg
+                                "Capability dispatch node {node_id}: {err_msg}"
                             ));
                         }
-                        tracing::info!(node_id = %node_id, "Capability dispatch failed but continue_on_error is set — continuing");
+                        tracing::info!(
+                            %node_id,
+                            "Capability dispatch failed but continue_on_error is set — continuing"
+                        );
                     }
-
-                    results.insert(node_id, capability_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
@@ -4439,504 +4157,44 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── ErrorHandler dispatch (pattern filtering) ───────────────
-                if let Some((_, _, Some(SystemNodeKind::ErrorHandler { ref error_pattern }))) =
-                    self.node_meta.get(&node_id)
+                // `None` return means "pattern matched (or unset) — fall
+                // through to regular single-node dispatch below." `Some`
+                // means the pattern didn't match and the handler is
+                // short-circuited with a `__skipped` envelope.
+                if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results)
                 {
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    // Check if error matches the pattern filter (if specified)
-                    if let Some(pattern) = error_pattern {
-                        let error_msg = inputs
-                            .get("error_message")
-                            .or_else(|| {
-                                // Check parent outputs for __error payloads
-                                inputs.as_object().and_then(|obj| {
-                                    obj.values().find_map(|v| v.get("error_message"))
-                                })
-                            })
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        if !error_msg.contains(pattern.as_str()) {
-                            // Error doesn't match pattern — skip this handler, propagate error
-                            results.insert(
-                                node_id,
-                                serde_json::json!({
-                                    "__skipped": true,
-                                    "reason": "error_pattern_mismatch",
-                                }),
-                            );
-
-                            for child in
-                                self.graph.neighbors_directed(node_idx, Direction::Outgoing)
-                            {
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 {
-                                        *cnt -= 1;
-                                    }
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    // If pattern matches (or no pattern), fall through to normal dispatch below
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
                 }
 
                 // ── Single-node dispatch ─────────────────────────────────────
-
-                // ── Rate limit check ──────────────────────────────────────
-                evict_stale_rate_limits();
-                let module_id_resolved = self.resolve_module_id(node_id);
-                if let Some(&limit) = self.rate_limits.get(&module_id_resolved) {
-                    if limit > 0 {
-                        let now = std::time::Instant::now();
-                        let mut entry = MODULE_RATE_LIMITS
-                            .entry(module_id_resolved)
-                            .or_insert((now, 0));
-                        if now.duration_since(entry.0) > std::time::Duration::from_secs(60) {
-                            entry.0 = now;
-                            entry.1 = 0;
-                        }
-                        entry.1 += 1;
-                        if entry.1 > limit as u32 {
-                            tracing::warn!(
-                                node_id = %node_id,
-                                module_id = %module_id_resolved,
-                                rate_limit = limit,
-                                "Module rate limit exceeded"
-                            );
-                            results.insert(node_id, serde_json::json!({
-                                "__error": true,
-                                "error_message": format!("Module rate limit exceeded ({}/min)", limit)
-                            }));
-                            for child in
-                                self.graph.neighbors_directed(node_idx, Direction::Outgoing)
-                            {
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 {
-                                        *cnt -= 1;
-                                    }
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
+                if let Some(error_envelope) = self.check_rate_limit(node_id) {
+                    results.insert(node_id, error_envelope);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
                 }
 
-                let retry = self
-                    .node_meta
-                    .get(&node_id)
-                    .and_then(|(_, rp, _)| rp.clone())
-                    .unwrap_or_default();
                 let inputs = self.gather_inputs(node_idx, &results);
-                let dispatcher_clone = dispatcher.clone();
-                let user_id_clone = self.user_id;
-                let fetch_fut = self.fetch_module(node_id);
-                let secrets_resolver = self.secrets_resolver.clone();
-                let secret_envelope = self.secret_envelope.clone();
-                let approval_gate = self.approval_gate.clone();
-                let _exec_sandbox = execution_sandbox.clone();
-                let single_user_id = self.user_id;
-                let worker_shared_key_clone = worker_shared_key.clone();
-                let node_configs_clone = self.node_configs.clone();
-                let node_timeouts_clone = self.node_timeouts.clone();
-                let event_sink_clone = self.event_sink.clone();
-                let dry_run = self.dry_run;
-                // Build accumulated context snapshot from all completed node
-                // results so far, keyed by node label with __-prefixed metadata
-                // stripped. Captured into the async block as a plain Option<Value>.
                 let accumulated_snapshot =
                     Self::build_accumulated_context(&self.node_labels, &results);
-
-                let fut = async move {
-                    let wasm_module = match fetch_fut.await {
-                        Ok(m) => m,
-                        Err(e) => return (node_idx, Err(e)),
-                    };
-
-                    // ── Approval gate ───────────────────────────────────────
-                    // If the module declares `requires_approval_for`, verify
-                    // that an approved record exists before dispatching.
-                    if !wasm_module.requires_approval_for.is_empty() {
-                        if let Some(ref gate) = approval_gate {
-                            let approval_webhook = node_configs_clone
-                                .get(&node_id)
-                                .and_then(|cfg| cfg.get("NOTIFICATION_WEBHOOK"))
-                                .and_then(|v| v.as_str());
-                            match gate
-                                .check_or_request(
-                                    execution_id, // workflow-level execution ID
-                                    node_id,
-                                    &wasm_module.requires_approval_for,
-                                    approval_webhook,
-                                )
-                                .await
-                            {
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {
-                                    /* proceed */
-                                }
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
-                                    return (
-                                        node_idx,
-                                        Err(format!(
-                                            "Execution paused: module {} requires approval for {:?}. \
-                                             An approval request has been created.",
-                                            node_id, wasm_module.requires_approval_for
-                                        )),
-                                    );
-                                }
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Denied {
-                                    reason,
-                                }) => {
-                                    return (node_idx, Err(reason));
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        node_id = %node_id,
-                                        "Approval gate check failed: {}",
-                                        e
-                                    );
-                                    return (
-                                        node_idx,
-                                        Err(format!("Approval gate check failed: {}", e)),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Read the module's compile-time config from the
-                    // artifact we already fetched. `wasm_module` came from
-                    // `fetch_fut` above (which hit `ModuleFetcher::fetch`);
-                    // `WasmModuleArtifact::config` mirrors `wasm_modules.config`,
-                    // so this avoids a separate `reg.get_module_config`
-                    // round-trip the engine previously made.
-                    //
-                    // The previously-inlined `reg.ensure_module_in_cache`
-                    // best-effort Redis warm is dropped — it was advisory
-                    // only (its own comment flagged it as non-fatal and
-                    // sometimes mis-keyed). Dispatch embeds `wasm_bytes`
-                    // directly in the JobRequest, so the worker never
-                    // depends on the pre-warm.
-                    if single_user_id.is_none() {
-                        return (
-                            node_idx,
-                            Err("Module execution requires user context (user_id not set)"
-                                .to_string()),
-                        );
-                    }
-                    let module_config = wasm_module
-                        .config
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({}));
-
-                    // Merge node-level config from graph_json (takes precedence)
-                    // Filter out internal keys (__skip_condition, skip_condition) that shouldn't be passed to modules
-                    let module_config = if let Some(node_cfg) = node_configs_clone.get(&node_id) {
-                        if module_config.is_object() && node_cfg.is_object() {
-                            let mut merged = module_config.as_object().cloned().unwrap_or_default();
-                            if let Some(node_cfg_obj) = node_cfg.as_object() {
-                                for (k, v) in node_cfg_obj {
-                                    if k == "__skip_condition"
-                                        || k == "skip_condition"
-                                        || k == "__continue_on_error"
-                                        || k == "continue_on_error"
-                                    {
-                                        continue;
-                                    }
-                                    merged.insert(k.clone(), v.clone());
-                                }
-                            }
-                            serde_json::Value::Object(merged)
-                        } else if module_config == serde_json::json!({}) {
-                            node_cfg.clone()
-                        } else {
-                            module_config
-                        }
-                    } else {
-                        module_config
-                    };
-
-                    // Merge config and input into a flat object so templates can
-                    // find their fields at the top level (e.g., "text", "URL").
-                    // Also include "config" and "input" for backwards compatibility.
-                    let wrapped_input = {
-                        let mut merged = serde_json::Map::new();
-                        // Start with config fields at top level
-                        if let Some(obj) = module_config.as_object() {
-                            for (k, v) in obj {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        // Overlay input fields at top level (input takes precedence)
-                        if let Some(obj) = inputs.as_object() {
-                            for (k, v) in obj {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        } else if !inputs.is_null() {
-                            merged.insert("input".to_string(), inputs.clone());
-                        }
-                        // Always include config and input sub-objects for templates
-                        // that explicitly read from these keys
-                        // Only include "config" if it has actual content (skip empty {})
-                        if module_config != serde_json::json!({}) {
-                            merged.insert("config".to_string(), module_config.clone());
-                        }
-                        // Always include "input" sub-key for non-null, non-empty upstream
-                        // outputs so downstream modules can access data["input"] regardless
-                        // of whether the upstream returned an object or a scalar.
-                        let is_empty_object =
-                            inputs.as_object().map(|m| m.is_empty()).unwrap_or(false);
-                        if !inputs.is_null() && !is_empty_object {
-                            merged.insert("input".to_string(), inputs.clone());
-                        }
-                        // Inject accumulated context: all prior nodes' outputs
-                        // keyed by label, with __-prefixed metadata stripped.
-                        if let Some(acc) = &accumulated_snapshot {
-                            merged.insert("__accumulated__".to_string(), acc.clone());
-                        }
-                        // Inject actor memory context into every node.
-                        if let Some(ref ctx) = self.actor_context {
-                            merged.insert("__actor_context__".to_string(), ctx.clone());
-                        }
-                        serde_json::Value::Object(merged)
-                    };
-
-                    // Store truncated node input for debugging (node I/O inspector)
-                    {
-                        let input_preview = {
-                            let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
-                            if s.len() > 4096 {
-                                format!("{}...(truncated)", &s[..4096])
-                            } else {
-                                s
-                            }
-                        };
-                        emit_event_spawn(
-                            &event_sink_clone,
-                            NodeEventWrite {
-                                execution_id,
-                                event_type: "node_input".to_string(),
-                                node_id: Some(node_id),
-                                status: "Input".to_string(),
-                                log_message: Some(input_preview),
-                                iteration_index: None,
-                            },
-                        );
-                    }
-
-                    let job_id = Uuid::new_v4();
-
-                    if let Some(ref store) = self.module_execution_store {
-                        // Resolve the actual wasm_modules.id for the FK.
-                        // `module_id_resolved` may be a node_template UUID
-                        // (Fallback 2 path) not present in wasm_modules;
-                        // the store's resolver maps template → wasm_modules
-                        // by most-recent compile.
-                        let actual_module_id = store.resolve_module_id(module_id_resolved).await;
-                        if let Err(db_err) = store
-                            .record_started(ExecutionStartedContext {
-                                id: job_id,
-                                module_id: actual_module_id,
-                                user_id: single_user_id.unwrap_or_else(Uuid::new_v4),
-                                workflow_execution_id: execution_id,
-                                input: &inputs,
-                                trigger_type: "webhook",
-                                // Race-safe: if a sibling has already failed
-                                // the workflow, this row enters as
-                                // 'cancelled' rather than 'running', closing
-                                // the race with the failure-path UPDATE.
-                                race_safe_status: true,
-                            })
-                            .await
-                        {
-                            tracing::error!(
-                                "module_execution_store.record_started failed: {}",
-                                db_err
-                            );
-                        }
-                    }
-
-                    // Per-node fuel limit: config override > module default, capped at 50M.
-                    let node_max_fuel = module_config
-                        .get("max_fuel")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(wasm_module.max_fuel)
-                        .min(50_000_000);
-
-                    // Resolve encrypted secrets payload (opaque bytes at this layer).
-                    let encrypted_secrets =
-                        match (secrets_resolver.as_ref(), &worker_shared_key_clone) {
-                            (Some(resolver), Some(key)) => {
-                                let vault_paths = extract_vault_paths(&module_config);
-                                build_encrypted_secrets_for(
-                                    resolver.as_ref(),
-                                    secret_envelope.as_ref(),
-                                    module_id_resolved,
-                                    single_user_id,
-                                    &vault_paths,
-                                    &wasm_module.allowed_secrets,
-                                    key.as_bytes(),
-                                )
-                                .await
-                            }
-                            _ => Default::default(),
-                        };
-
-                    // Wire-format WASM budget. The dispatcher internally adds its
-                    // own Tokio-outer grace on top (see TOKIO_WRAP_GRACE_SECS).
-                    let node_timeout_secs = node_timeouts_clone
-                        .get(&node_id)
-                        .copied()
-                        .unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
-
-                    let job = DispatchJob {
-                        execution_id,
-                        node_id,
-                        module_id: module_id_resolved,
-                        // Pre-INSERTed module_executions row is keyed by this id;
-                        // thread it through so the worker's UPDATE lands on the
-                        // same row and worker logs stay correlated.
-                        job_id: Some(job_id),
-                        user_id: user_id_clone,
-                        actor_id: self.actor_id,
-                        module_uri: wasm_module
-                            .oci_url
-                            .clone()
-                            .unwrap_or_else(|| format!("redis:wasm:{}", module_id_resolved)),
-                        // Embed bytes directly: worker uses these without a Redis lookup,
-                        // bypassing the "wasm:{uid}:{id}" vs "wasm:{id}" key mismatch and
-                        // the template-UUID failure in ensure_module_in_cache. OCI modules
-                        // have empty wasm_bytes (fetched by the worker from the registry).
-                        wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
-                            None
-                        } else {
-                            Some(wasm_module.wasm_bytes.clone())
-                        },
-                        // For OCI modules (wasm_bytes empty), commit the expected hash so the
-                        // worker can verify the fetched content matches what we compiled.
-                        expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
-                            Some(wasm_module.content_hash.clone())
-                        } else {
-                            None // HMAC already covers sha256(inline_bytes)
-                        },
-                        capability_world: Some(wasm_module.capability_world.clone()),
-                        integration_name: wasm_module.integration_name.clone(),
-                        input_payload: wrapped_input,
-                        timeout: std::time::Duration::from_secs(node_timeout_secs),
-                        max_fuel: node_max_fuel,
-                        allowed_hosts: wasm_module.allowed_hosts.clone(),
-                        allowed_methods: wasm_module.allowed_methods.clone(),
-                        allowed_secrets: wasm_module.allowed_secrets.clone(),
-                        allowed_sql_operations: vec![],
-                        allow_tier2_exposure: false,
-                        encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                        encrypted_secrets_nonce: encrypted_secrets.nonce,
-                        priority: 100,
-                        dry_run,
-                        max_retries: retry.max_retries,
-                        backoff_ms: retry.backoff_ms,
-                        retry_condition: retry.retry_condition.clone(),
-                        retry_delay_expr: retry.retry_delay_expression.clone(),
-                        emit_retry_events: true,
-                    };
-
-                    match dispatcher_clone.dispatch(job).await {
-                        Ok(result) => {
-                            tracing::info!(node_id = %node_id, "Node execution succeeded");
-                            (node_idx, Ok(result.output))
-                        }
-                        Err(e) => (node_idx, Err(e.to_string())),
-                    }
-                };
+                let fut = self.run_single_node_dispatch(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    dispatcher.clone(),
+                    worker_shared_key.clone(),
+                    inputs,
+                    accumulated_snapshot,
+                    execution_sandbox.clone(),
+                );
                 executing.push(Box::pin(fut));
 
-                // ── Speculative module prefetch (P10) ────────────────────────
-                // When a node has `speculative_prefetch: true`, kick off background
-                // fetch tasks for all direct successors while this node executes.
-                // The successor's fetch_module call will hit the cache (sub-ms) instead
-                // of paying the DB round-trip latency after this node completes.
-                //
-                // Safety limits:
-                //   - Max 8 successors prefetched per node (prevents fan-out DoS)
-                //   - 5-second fetch timeout (prevents hung tasks from leaking memory)
-                //   - DashMap insert is atomic; duplicate spawns are suppressed by
-                //     entry().or_insert_with() semantics in the cache layer
-                if self
-                    .node_configs
-                    .get(&node_id)
-                    .and_then(|c| c.get("speculative_prefetch"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    for succ_idx in self
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Outgoing)
-                        .take(MAX_PREFETCH_SUCCESSORS)
-                    {
-                        let succ_id = self.graph[succ_idx];
-                        // Skip system nodes — they have no module in the registry (resolve_module_id
-                        // returns the node UUID as a fallback). Fetching would waste a 5-second
-                        // timeout and generate noisy debug log entries for every system successor.
-                        let succ_module_id =
-                            match self.node_meta.get(&succ_id).and_then(|(mid, _, _)| *mid) {
-                                Some(mid) => mid,
-                                None => continue,
-                            };
-                        let prefetch_cache = Arc::clone(&self.module_prefetch_cache);
-                        if let Some(ref fetcher) = self.module_fetcher {
-                            let fetcher = Arc::clone(fetcher);
-                            let uid = self.user_id;
-                            tokio::spawn(async move {
-                                // Atomic duplicate suppression via vacant-entry check:
-                                // only one spawn proceeds to fetch; others see the key
-                                // already present and return immediately.
-                                if prefetch_cache.contains_key(&succ_id) {
-                                    return;
-                                }
-                                if let Some(uid) = uid {
-                                    // 5-second timeout: prevents hung prefetch tasks from
-                                    // leaking tokio task slots if the registry is unresponsive.
-                                    let fetch_result = tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        fetcher.fetch(succ_module_id, uid),
-                                    )
-                                    .await;
-                                    match fetch_result {
-                                        Ok(Ok(artifact)) => {
-                                            // Use entry().or_insert to avoid overwriting a
-                                            // result that another concurrent spawn already stored.
-                                            prefetch_cache.entry(succ_id).or_insert(artifact);
-                                            tracing::debug!(
-                                                succ_id = %succ_id,
-                                                "speculative prefetch: module cached"
-                                            );
-                                        }
-                                        Ok(Err(e)) => {
-                                            tracing::debug!(
-                                                succ_id = %succ_id,
-                                                error = %e,
-                                                "speculative prefetch: fetch failed (normal dispatch will retry)"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            tracing::debug!(
-                                                succ_id = %succ_id,
-                                                "speculative prefetch: timed out (normal dispatch will fetch)"
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
+                // Speculative module prefetch (P10) — kick off background
+                // fetch tasks for direct successors. See the handler's
+                // module docs for the safety caps.
+                self.maybe_speculative_prefetch(node_id, node_idx);
+                continue;
             }
 
             // Await next finished task.
@@ -5460,7 +4718,12 @@ impl ParallelWorkflowEngine {
         // Store original trigger input for passthrough to all downstream nodes.
         // This allows any node to access the original trigger data via the
         // `__trigger_input__` key in its input payload.
-        let trigger_input: JsonValue = results.values().next().cloned().unwrap_or(serde_json::json!({}));
+        // Seeded trigger input is preserved in `results` — the inline
+        // dispatch switch previously read it via `_trigger_input__` on
+        // gathered inputs; the extracted handlers access `results`
+        // directly so no prelude needed here.
+        let _trigger_input: JsonValue =
+            results.values().next().cloned().unwrap_or(serde_json::json!({}));
 
         let seeded: HashSet<Uuid> = results.keys().cloned().collect();
         for &node_id in &seeded {
@@ -5494,825 +4757,232 @@ impl ParallelWorkflowEngine {
 
         // DB pool for execution event logging (fire-and-forget)
 
-        // Main reactor loop — single-node dispatch (no pipeline chain optimisation).
+        // Main reactor loop — single-node dispatch (no pipeline chain
+        // optimisation; the seeded-resume path dispatches each node
+        // individually because chain detection was performed on the
+        // original workflow, not the residual ready set).
         while !ready.is_empty() || !executing.is_empty() {
             while let Some(node_idx) = ready.pop_front() {
                 let node_id = self.graph[node_idx];
 
-                // ── Skip condition check (FIRST — applies to ALL node types including system nodes) ──
-                if let Some(skip_cond) = self.node_configs.get(&node_id)
-                    .and_then(|cfg| cfg.get("__skip_condition"))
-                    .and_then(|v| v.as_str())
+                // ── Skip condition check (applies to ALL node kinds) ─────────
+                if let Some(output) =
+                    self.check_skip_condition(node_idx, node_id, execution_id, &results)
                 {
-                    let mut skip_context = self.gather_inputs(node_idx, &results);
-                    if let Some(trigger_id) = self.node_labels.iter()
-                        .find(|(_, label)| label.as_str() == "__trigger__")
-                        .map(|(uuid, _)| *uuid)
-                    {
-                        if let Some(trigger_val) = results.get(&trigger_id) {
-                            if let Some(obj) = trigger_val.as_object() {
-                                if let Some(ctx_obj) = skip_context.as_object_mut() {
-                                    for (k, v) in obj {
-                                        ctx_obj.entry(k.clone()).or_insert(v.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if self.eval_bool(skip_cond, &skip_context) {
-                        tracing::info!(node_id = %node_id, skip_condition = %skip_cond, "Node skipped by skip_condition");
-                        results.insert(node_id, serde_json::json!({"__skipped": true, "reason": "skip_condition"}));
-                        emit_event_spawn(
-                            &self.event_sink,
-                            NodeEventWrite {
-                                execution_id,
-                                event_type: "node_skipped".to_string(),
-                                node_id: Some(node_id),
-                                status: "Skipped".to_string(),
-                                log_message: None,
-                                iteration_index: None,
-                            },
-                        );
-                        for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                            if let Some(cnt) = pending.get_mut(&child) {
-                                if *cnt > 0 { *cnt -= 1; }
-                                if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                    ready.push_back(child);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                // ── FanIn aggregation (local computation, no NATS dispatch) ──
-                if let Some((_, _, Some(SystemNodeKind::FanIn { ref join_mode, ref aggregation_expr }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let final_result = self.aggregate_fan_in(node_idx, &results, join_mode, aggregation_expr);
-
-                    results.insert(node_id, final_result);
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if *cnt == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── Collect dispatch (local computation — single-node reactor) ─
-                if let Some((_, _, Some(SystemNodeKind::Collect))) =
-                    self.node_meta.get(&node_id)
+                // ── FanIn aggregation (local computation, no dispatch) ───────
+                if let Some(output) = self.try_dispatch_fan_in(node_idx, node_id, &results) {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
+                }
+
+                // ── Collect dispatch (local computation) ─────────────────────
+                if let Some(output) =
+                    self.try_dispatch_collect(node_idx, node_id, execution_id, &results)
                 {
-                    let collected = self.collect_parent_outputs_for_node(node_idx, &results);
-                    let parent_count = collected.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
+                }
 
-                    results.insert(node_id, collected);
+                // ── Synthesize dispatch (collect + optional Rhai synthesis) ──
+                if let Some(output) =
+                    self.try_dispatch_synthesize(node_idx, node_id, execution_id, &results)
+                {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
+                }
 
-                    self.emit_node_lifecycle_events(
-                        execution_id,
+                // ── Verify dispatch (step-level output verification) ─────────
+                if let Some(output) =
+                    self.try_dispatch_verify(node_idx, node_id, execution_id, &results)
+                {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
+                }
+
+                // ── Judge dispatch (LLM-as-Judge evaluation) ─────────────────
+                #[cfg(feature = "llm-primitives")]
+                if let Some(output) = self
+                    .try_dispatch_judge(
+                        node_idx,
                         node_id,
-                        "Completed",
-                        format!("collected {} branch outputs into items array", parent_count),
-                    );
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if *cnt == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
+                {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── Synthesize dispatch (collect + optional Rhai expression) ─
-                if let Some((_, _, Some(SystemNodeKind::Synthesize { ref synthesis_expr }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let synthesis_expr = synthesis_expr.clone();
-                    let synthesized = self.synthesize_parent_outputs(node_idx, &results, &synthesis_expr);
-
-                    let parent_count = synthesized
-                        .get("count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-
-                    results.insert(node_id, synthesized);
-
-                    self.emit_node_lifecycle_events(
-                        execution_id,
+                // ── Ensemble dispatch (self-consistency / ensemble voting) ────
+                #[cfg(feature = "llm-primitives")]
+                if let Some(output) = self
+                    .try_dispatch_ensemble(
+                        node_idx,
                         node_id,
-                        "Completed",
-                        format!("synthesized {} branch outputs", parent_count),
-                    );
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if *cnt == 0 { ready.push_back(child); }
-                        }
-                    }
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
+                {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── Verify dispatch (step-level verification) ────────────────
-                if let Some((_, _, Some(SystemNodeKind::Verify { ref condition, ref check_label, ref on_failure }))) =
-                    self.node_meta.get(&node_id)
+                // ── ConfidenceGate dispatch ───────────────────────────────────
+                #[cfg(feature = "llm-primitives")]
+                if let Some(outcome) = self
+                    .try_dispatch_confidence_gate(node_idx, node_id, execution_id, &results)
+                    .await
                 {
-                    let check_label = check_label.clone().unwrap_or_else(|| "output quality".to_string());
-                    let (verify_result, passed) = self.evaluate_verify_node(
-                        node_idx, &results, condition, &check_label, on_failure,
-                    );
+                    use crate::scheduler_handlers::ConfidenceGateOutcome;
+                    match outcome {
+                        ConfidenceGateOutcome::Proceed(output) => {
+                            results.insert(node_id, output);
+                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                            continue;
+                        }
+                        ConfidenceGateOutcome::Pause { waiting_output } => {
+                            results.insert(node_id, waiting_output);
+                            return Ok(WorkflowContext {
+                                results,
+                                waiting: true,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
 
-                    results.insert(node_id, verify_result);
-
-                    self.emit_node_lifecycle_events(
-                        execution_id,
+                // ── ReflectiveRetry dispatch ──────────────────────────────────
+                #[cfg(feature = "llm-primitives")]
+                if let Some(output) = self
+                    .try_dispatch_reflective_retry(
+                        node_idx,
                         node_id,
-                        if passed { "Completed" } else { "Failed" },
-                        format!(
-                            "Verify '{}': {}",
-                            check_label,
-                            if passed { "PASSED" } else { "FAILED" }
-                        ),
-                    );
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
+                {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── Judge dispatch (LLM-as-Judge evaluation) [run_with_seed] ──
+                // ── LlmDispatch dispatch (LLM-based routing) ──────────────────
                 #[cfg(feature = "llm-primitives")]
-                if let Some((_, _, Some(SystemNodeKind::Judge { judge_workflow_id, ref rubric, pass_threshold, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_llm_dispatch(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let judge_wf_id = *judge_workflow_id;
-                    let rubric = rubric.clone();
-                    let pass_threshold = *pass_threshold;
-                    let parent_inputs = self.gather_inputs(node_idx, &results);
-
-                    let judge_result = self
-                        .dispatch_judge(
-                            parent_inputs,
-                            judge_wf_id,
-                            rubric,
-                            pass_threshold,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, judge_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── Ensemble dispatch (self-consistency) [run_with_seed] ──────
+                // ── AgentLoop dispatch (ReAct-style iterative sub-workflow) ──
                 #[cfg(feature = "llm-primitives")]
-                if let Some((_, _, Some(SystemNodeKind::Ensemble { child_workflow_id, count, ref consensus, judge_workflow_id, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                if let Some(output) = self
+                    .try_dispatch_agent_loop(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let child_wf_id = *child_workflow_id;
-                    let run_count = *count;
-                    let consensus_strategy = consensus.clone();
-                    let judge_wf_id_opt = *judge_workflow_id;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    let ensemble_result = self
-                        .dispatch_ensemble(
-                            inputs,
-                            child_wf_id,
-                            run_count,
-                            consensus_strategy,
-                            judge_wf_id_opt,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, ensemble_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
-                    continue;
-                }
-
-                // ── ConfidenceGate dispatch [run_with_seed] ───────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some((_, _, Some(SystemNodeKind::ConfidenceGate { threshold, ref confidence_path, ref on_low_confidence }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    match self.evaluate_confidence_gate(
-                        node_idx, &results, execution_id, *threshold, confidence_path, on_low_confidence,
-                    ).await {
-                        Ok(gate_result) => {
-                            results.insert(node_id, gate_result);
-                        }
-                        Err(waiting_json) => {
-                            results.insert(node_id, waiting_json);
-                            self.module_prefetch_cache.clear();
-                            return Ok(WorkflowContext { results, waiting: true, ..Default::default() });
-                        }
-                    }
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
-                    continue;
-                }
-
-                // ── ReflectiveRetry dispatch [run_with_seed] ──────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some((_, _, Some(SystemNodeKind::ReflectiveRetry { child_workflow_id, reflection_workflow_id, max_retries, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let child_wf_id = *child_workflow_id;
-                    let reflection_wf_id = *reflection_workflow_id;
-                    let max_retries = *max_retries;
-                    let initial_input = self.gather_inputs(node_idx, &results);
-
-                    let reflective_result = self
-                        .dispatch_reflective_retry(
-                            initial_input,
-                            child_wf_id,
-                            reflection_wf_id,
-                            max_retries,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, reflective_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
-                    continue;
-                }
-
-                // ── LlmDispatch dispatch [run_with_seed] ──────────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some((_, _, Some(SystemNodeKind::LlmDispatch { classifier_workflow_id, ref routes, fallback_workflow_id, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let classifier_wf_id = *classifier_workflow_id;
-                    let routes = routes.clone();
-                    let fallback_wf_id = *fallback_workflow_id;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    let llm_dispatch_result = self
-                        .dispatch_llm_dispatch(
-                            inputs,
-                            classifier_wf_id,
-                            routes,
-                            fallback_wf_id,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, llm_dispatch_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
-                    continue;
-                }
-
-                // ── AgentLoop dispatch (ReAct-style iterative sub-workflow) ─
-                #[cfg(feature = "llm-primitives")]
-                if let Some((_, _, Some(SystemNodeKind::AgentLoop { body_workflow_id, max_iterations, inject_history, timeout_secs }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let body_wf_id = *body_workflow_id;
-                    let max_iters = *max_iterations;
-                    let do_inject_history = *inject_history;
-                    let timeout_secs = *timeout_secs;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    let agent_result = if self.module_fetcher.is_some() {
-                        let user_id = match self.user_id {
-                            Some(uid) => uid,
-                            None => {
-                                results.insert(node_id, serde_json::json!({
-                                    "__error": true,
-                                    "error_message": "user_id required for sub-workflow execution"
-                                }));
-                                for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                                    if let Some(cnt) = pending.get_mut(&child) {
-                                        if *cnt > 0 { *cnt -= 1; }
-                                        if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                                    }
-                                }
-                                continue;
-                            }
-                        };
-                        let graph_row = self.get_sub_workflow_graph(body_wf_id, user_id).await;
-
-                        if let Some(graph_json) = graph_row {
-                            let dispatcher_al = dispatcher.clone();
-                            let worker_shared_key_al = worker_shared_key.clone();
-                            let adapter_set_al = self.adapter_set();
-                            let inputs_al = inputs.clone();
-                            let agent_result_inner = match tokio::time::timeout(
-                                std::time::Duration::from_secs(timeout_secs),
-                                async move {
-                                    let mut history: Vec<JsonValue> = Vec::new();
-                                    let mut last_output = serde_json::json!({});
-                                    let mut finished = false;
-                                    // Track total iterations separately from history.len() —
-                                    // history is capped at AGENT_LOOP_MAX_HISTORY entries (sliding window) so
-                                    // history.len() would under-report when max_iters > AGENT_LOOP_MAX_HISTORY.
-                                    let mut iterations_run: u32 = 0;
-
-                                    for iteration in 1..=max_iters {
-                                        let mut iter_input = if let Some(obj) = inputs_al.as_object() {
-                                            let mut cleaned = obj.clone();
-                                            cleaned.retain(|k, _| !k.starts_with("__"));
-                                            cleaned
-                                        } else {
-                                            serde_json::Map::new()
-                                        };
-                                        iter_input.insert("__agent_iteration__".to_string(), serde_json::json!(iteration));
-                                        if do_inject_history && !history.is_empty() {
-                                            iter_input.insert("__agent_history__".to_string(), serde_json::Value::Array(history.clone()));
-                                        }
-
-                                        let iter_result = match adapter_set_al
-                                            .clone()
-                                            .into_engine_with_graph(&graph_json)
-                                        {
-                                            Ok(mut sub_engine) => {
-                                                let sub_execution_id = Uuid::new_v4();
-                                                let trigger_node_id = Uuid::new_v4();
-                                                sub_engine.add_node(trigger_node_id, None, None, None);
-                                                sub_engine.node_labels.insert(trigger_node_id, "__trigger__".to_string());
-                                                let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine.graph.node_indices()
-                                                    .filter(|&idx| sub_engine.graph[idx] != trigger_node_id && sub_engine.graph.neighbors_directed(idx, Direction::Incoming).count() == 0)
-                                                    .collect();
-                                                for root_idx in &root_indices {
-                                                    let root_id = sub_engine.graph[*root_idx];
-                                                    let _ = sub_engine.add_edge(trigger_node_id, root_id, talos_workflow_engine_core::EdgeLogic {
-                                                        source_handle: "output".to_string(),
-                                                        target_handle: "input".to_string(),
-                                                        mapping: None, condition: None,
-                                                        edge_type: "default".to_string(),
-                                                    });
-                                                }
-                                                let mut initial_results = HashMap::new();
-                                                initial_results.insert(trigger_node_id, serde_json::Value::Object(iter_input));
-                                                let sub_labels = sub_engine.node_labels.clone();
-                                                match sub_engine.run_with_seed_with_transport(dispatcher_al.clone(), worker_shared_key_al.clone(), initial_results, sub_execution_id).await {
-                                                    Ok(ctx) => {
-                                                        let mut sub_outputs = serde_json::Map::new();
-                                                        for (nid, output) in &ctx.results {
-                                                            if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                                                            let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
-                                                            if key == "__trigger__" { continue; }
-                                                            sub_outputs.insert(key, ParallelWorkflowEngine::unwrap_output(output).clone());
-                                                        }
-                                                        serde_json::Value::Object(sub_outputs)
-                                                    }
-                                                    Err(e) => serde_json::json!({"__error": true, "error_message": e.to_string()}),
-                                                }
-                                            }
-                                            Err(e) => serde_json::json!({"__error": true, "error_message": format!("AgentLoop body build failed: {}", e)}),
-                                        };
-
-                                        let iter_finished = iter_result.get("finished").and_then(|v| v.as_bool()).unwrap_or(false)
-                                            || iter_result.get("action").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case("FINISH")).unwrap_or(false);
-
-                                        // Cap history entries to prevent unbounded memory growth
-                                        // when inject_history is true and iterations produce large outputs.
-                                        iterations_run += 1;
-                                        if history.len() >= AGENT_LOOP_MAX_HISTORY {
-                                            history.remove(0);
-                                        }
-                                        history.push(iter_result.clone());
-                                        last_output = iter_result;
-
-                                        if iter_finished {
-                                            finished = true;
-                                            break;
-                                        }
-                                    }
-
-                                    if !finished {
-                                        tracing::warn!(
-                                            max_iterations = max_iters,
-                                            "AgentLoop reached max_iterations without finish signal"
-                                        );
-                                    }
-
-                                    serde_json::json!({
-                                        "iterations": iterations_run,
-                                        "finished": finished,
-                                        "history": history,
-                                        "final_output": last_output,
-                                    })
-                                },
-                            ).await {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        node_id = %node_id,
-                                        timeout_secs = timeout_secs,
-                                        "AgentLoop timed out"
-                                    );
-                                    serde_json::json!({
-                                        "__error": true,
-                                        "error_message": format!("AgentLoop timed out after {}s", timeout_secs),
-                                    })
-                                }
-                            };
-                            agent_result_inner
-                        } else {
-                            serde_json::json!({"__error": true, "error_message": format!("AgentLoop body workflow {} not found", body_wf_id)})
-                        }
-                    } else {
-                        serde_json::json!({"__error": true, "error_message": "Registry not available for AgentLoop"})
-                    };
-
-                    results.insert(node_id, agent_result);
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── WhileLoop dispatch (local computation) ──────────────────
-                if let Some((_, _, Some(SystemNodeKind::WhileLoop { ref condition, max_iterations }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let condition = condition.clone();
-                    let max_iters = *max_iterations;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    // WhileLoop runs the body inline, checking the condition after each iteration.
-                    let mut current_output = inputs;
-                    let mut iteration = 0u32;
-
-                    while iteration < max_iters {
-                        // Evaluate condition against current output
-                        if !self.eval_bool(&condition, &current_output) {
-                            break;
-                        }
-                        iteration += 1;
-                        // Store iteration result (each iteration overwrites)
-                        current_output = serde_json::json!({
-                            "__loop_iteration": iteration,
-                            "__loop_input": current_output,
-                        });
-                    }
-
-                    if iteration >= max_iters {
-                        tracing::warn!(
-                            node_id = %node_id,
-                            max_iterations = max_iters,
-                            "WhileLoop reached maximum iterations"
-                        );
-                    }
-
-                    results.insert(node_id, serde_json::json!({
-                        "iterations": iteration,
-                        "output": current_output,
-                    }));
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                if let Some(output) = self.try_dispatch_while_loop(node_idx, node_id, &results) {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── RepeatLoop dispatch (local computation) ─────────────────
-                if let Some((_, _, Some(SystemNodeKind::RepeatLoop { count }))) =
-                    self.node_meta.get(&node_id)
-                {
-                    let count = *count;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    results.insert(node_id, serde_json::json!({
-                        "iterations": count,
-                        "input": inputs,
-                    }));
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                if let Some(output) = self.try_dispatch_repeat_loop(node_idx, node_id, &results) {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── SubWorkflow dispatch (real execution) ─────────────────
-                if let Some((_, _, Some(SystemNodeKind::SubWorkflow { workflow_id: sub_wf_id, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                // ── SubWorkflow dispatch ─────────────────────────────────────
+                if let Some(output) = self
+                    .try_dispatch_sub_workflow(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let sub_wf_id = *sub_wf_id;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        sub_workflow_id = %sub_wf_id,
-                        "SubWorkflow node — executing sub-workflow"
-                    );
-
-                    let sub_result = self
-                        .dispatch_subworkflow(
-                            inputs,
-                            sub_wf_id,
-                            dispatcher.clone(),
-                            worker_shared_key.clone(),
-                        )
-                        .await;
-
-                    results.insert(node_id, sub_result);
-
-                    // Unblock successors
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 { ready.push_back(child); }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── DynamicDispatch (evaluate Rhai expression to select sub-workflow) ──
-                if let Some((_, _, Some(SystemNodeKind::DynamicDispatch { ref dispatch_expression, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                // ── DynamicDispatch (Rhai expression → target sub-workflow) ──
+                if let Some(output) = self
+                    .try_dispatch_dynamic_dispatch(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let expression = dispatch_expression.clone();
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        expression = %expression,
-                        "DynamicDispatch node — evaluating dispatch expression"
-                    );
-
-                    // Evaluate the Rhai expression to get the target workflow ID
-                    let dispatch_target: Result<String, String> = {
-                        let mut rhai_engine = rhai::Engine::new();
-                        rhai_engine.set_max_operations(10_000);
-                        rhai_engine.disable_symbol("eval");
-                        rhai_engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
-                        let mut scope = rhai::Scope::new();
-                        if let Some(obj) = inputs.as_object() {
-                            for (k, v) in obj {
-                                let dyn_val: rhai::Dynamic = match v {
-                                    serde_json::Value::String(s) => rhai::Dynamic::from(s.clone()),
-                                    serde_json::Value::Number(n) => {
-                                        if let Some(i) = n.as_i64() { rhai::Dynamic::from(i) }
-                                        else if let Some(f) = n.as_f64() { rhai::Dynamic::from(f) }
-                                        else { rhai::Dynamic::from(n.to_string()) }
-                                    }
-                                    serde_json::Value::Bool(b) => rhai::Dynamic::from(*b),
-                                    _ => rhai::Dynamic::from(v.to_string()),
-                                };
-                                scope.push(k.clone(), dyn_val);
-                            }
-                        }
-                        match rhai_engine.eval_with_scope::<rhai::Dynamic>(&mut scope, &expression) {
-                            Ok(result) => {
-                                let s = result.to_string();
-                                if s.is_empty() { Err("Dispatch expression returned empty string".to_string()) }
-                                else { Ok(s) }
-                            }
-                            Err(e) => Err(format!("Dispatch expression evaluation failed: {}", e)),
-                        }
-                    };
-
-                    let dispatch_result = match dispatch_target {
-                        Ok(target_id_or_name) => {
-                            let target_wf_id: Option<uuid::Uuid> = if let Ok(id) = uuid::Uuid::parse_str(&target_id_or_name) {
-                                Some(id)
-                            } else if let Some(ref store) = self.graph_store {
-                                store
-                                    .resolve_by_name(
-                                        &target_id_or_name,
-                                        self.user_id.unwrap_or_else(Uuid::nil),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "DB query failed during execution",
-                                        );
-                                        e
-                                    })
-                                    .ok()
-                                    .flatten()
-                            } else { None };
-
-                            match target_wf_id {
-                                Some(sub_wf_id) => {
-                                    tracing::info!(node_id = %node_id, dispatched_workflow_id = %sub_wf_id, "DynamicDispatch resolved to workflow");
-                                    if self.module_fetcher.is_some() {
-                                        let graph_row = self.get_sub_workflow_graph(sub_wf_id, self.user_id.unwrap_or_else(Uuid::nil)).await;
-
-                                        if let Some(graph_json) = graph_row {
-                                            match self
-                                                .adapter_set()
-                                                .into_engine_with_graph(&graph_json)
-                                            {
-                                                Ok(mut sub_engine) => {
-                                                    let sub_execution_id = Uuid::new_v4();
-                                                    let clean_input = if let Some(obj) = inputs.as_object() {
-                                                        let mut cleaned = obj.clone(); cleaned.retain(|k, _| !k.starts_with("__")); serde_json::Value::Object(cleaned)
-                                                    } else { inputs.clone() };
-
-                                                    let trigger_node_id = Uuid::new_v4();
-                                                    sub_engine.add_node(trigger_node_id, None, None, None);
-                                                    sub_engine.node_labels.insert(trigger_node_id, "__trigger__".to_string());
-                                                    let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine.graph.node_indices()
-                                                        .filter(|&idx| sub_engine.graph[idx] != trigger_node_id && sub_engine.graph.neighbors_directed(idx, Direction::Incoming).count() == 0)
-                                                        .collect();
-                                                    for root_idx in &root_indices {
-                                                        let root_id = sub_engine.graph[*root_idx];
-                                                        let _ = sub_engine.add_edge(trigger_node_id, root_id, talos_workflow_engine_core::EdgeLogic {
-                                                            source_handle: "output".to_string(), target_handle: "input".to_string(), mapping: None, condition: None, edge_type: "default".to_string(),
-                                                        });
-                                                    }
-
-                                                    let mut initial_results = HashMap::new();
-                                                    initial_results.insert(trigger_node_id, clean_input);
-                                                    let sub_labels = sub_engine.node_labels.clone();
-                                                    match sub_engine.run_with_seed_with_transport(dispatcher.clone(), worker_shared_key.clone(), initial_results, sub_execution_id).await {
-                                                        Ok(ctx) => {
-                                                            let mut sub_outputs = serde_json::Map::new();
-                                                            sub_outputs.insert("__dispatched_workflow_id__".to_string(), serde_json::json!(sub_wf_id.to_string()));
-                                                            for (nid, output) in &ctx.results {
-                                                                if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                                                                let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
-                                                                if key == "__trigger__" { continue; }
-                                                                sub_outputs.insert(key, Self::unwrap_output(output).clone());
-                                                            }
-                                                            serde_json::Value::Object(sub_outputs)
-                                                        }
-                                                        Err(e) => { tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Dispatched workflow failed"); serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow failed: {}", e)}) }
-                                                    }
-                                                }
-                                                Err(e) => serde_json::json!({"__error": true, "error_message": format!("Failed to build dispatched workflow engine: {}", e)}),
-                                            }
-                                        } else { serde_json::json!({"__error": true, "error_message": format!("Dispatched workflow {} not found", sub_wf_id)}) }
-                                    } else { serde_json::json!({"__error": true, "error_message": "Registry not available for dispatch execution"}) }
-                                }
-                                None => serde_json::json!({"__error": true, "error_message": format!("Could not resolve dispatch target: {}", target_id_or_name)}),
-                            }
-                        }
-                        Err(e) => serde_json::json!({"__error": true, "error_message": e}),
-                    };
-
-                    results.insert(node_id, dispatch_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── CapabilityDispatch (find best workflow by capability tags) [run_with_seed] ──
-                if let Some((_, _, Some(SystemNodeKind::CapabilityDispatch { ref required_capabilities, timeout_secs: _ }))) =
-                    self.node_meta.get(&node_id)
+                // ── CapabilityDispatch (match workflow by capability tags) ──
+                if let Some(output) = self
+                    .try_dispatch_capability_dispatch(
+                        node_idx,
+                        node_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let caps = required_capabilities.clone();
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    tracing::info!(
-                        node_id = %node_id,
-                        capabilities = ?caps,
-                        "CapabilityDispatch node — finding best matching workflow (run_with_seed)"
-                    );
-
-                    let capability_result = if let Some(ref store) = self.graph_store {
-                        let matching_row = store
-                            .resolve_by_capabilities(
-                                &caps,
-                                self.user_id.unwrap_or_else(Uuid::nil),
-                            )
-                            .await
-                            .map_err(|e| {
-                                tracing::warn!(
-                                    error = %e,
-                                    "DB query failed during execution",
-                                );
-                                e
-                            })
-                            .ok()
-                            .flatten();
-
-                        match matching_row {
-                            Some((sub_wf_id, sub_wf_name)) => {
-                                tracing::info!(node_id = %node_id, dispatched_workflow_id = %sub_wf_id, dispatched_workflow_name = %sub_wf_name, "CapabilityDispatch resolved to workflow (run_with_seed)");
-                                let graph_row = self.get_sub_workflow_graph(sub_wf_id, self.user_id.unwrap_or_else(Uuid::nil)).await;
-
-                                if let Some(graph_json) = graph_row {
-                                    match self
-                                        .adapter_set()
-                                        .into_engine_with_graph(&graph_json)
-                                    {
-                                        Ok(mut sub_engine) => {
-                                            let sub_execution_id = Uuid::new_v4();
-                                            let clean_input = if let Some(obj) = inputs.as_object() {
-                                                let mut cleaned = obj.clone(); cleaned.retain(|k, _| !k.starts_with("__")); serde_json::Value::Object(cleaned)
-                                            } else { inputs.clone() };
-
-                                            let trigger_node_id = Uuid::new_v4();
-                                            sub_engine.add_node(trigger_node_id, None, None, None);
-                                            sub_engine.node_labels.insert(trigger_node_id, "__trigger__".to_string());
-                                            let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine.graph.node_indices()
-                                                .filter(|&idx| sub_engine.graph[idx] != trigger_node_id && sub_engine.graph.neighbors_directed(idx, Direction::Incoming).count() == 0)
-                                                .collect();
-                                            for root_idx in &root_indices {
-                                                let root_id = sub_engine.graph[*root_idx];
-                                                let _ = sub_engine.add_edge(trigger_node_id, root_id, talos_workflow_engine_core::EdgeLogic {
-                                                    source_handle: "output".to_string(), target_handle: "input".to_string(), mapping: None, condition: None, edge_type: "default".to_string(),
-                                                });
-                                            }
-
-                                            let mut initial_results = HashMap::new();
-                                            initial_results.insert(trigger_node_id, clean_input);
-                                            let sub_labels = sub_engine.node_labels.clone();
-                                            match sub_engine.run_with_seed_with_transport(dispatcher.clone(), worker_shared_key.clone(), initial_results, sub_execution_id).await {
-                                                Ok(ctx) => {
-                                                    let mut sub_outputs = serde_json::Map::new();
-                                                    sub_outputs.insert("__dispatched_workflow_id__".to_string(), serde_json::json!(sub_wf_id.to_string()));
-                                                    sub_outputs.insert("__dispatched_by".to_string(), serde_json::json!("capability_dispatch"));
-                                                    sub_outputs.insert("__dispatched_workflow_name".to_string(), serde_json::json!(sub_wf_name));
-                                                    sub_outputs.insert("__matched_capabilities".to_string(), serde_json::json!(caps));
-                                                    for (nid, output) in &ctx.results {
-                                                        if output.get("__skipped").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                                                        let key = sub_labels.get(nid).cloned().unwrap_or_else(|| nid.to_string());
-                                                        if key == "__trigger__" { continue; }
-                                                        sub_outputs.insert(key, Self::unwrap_output(output).clone());
-                                                    }
-                                                    serde_json::Value::Object(sub_outputs)
-                                                }
-                                                Err(e) => { tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Capability-dispatched workflow failed (run_with_seed)"); serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow failed: {}", e)}) }
-                                            }
-                                        }
-                                        Err(e) => serde_json::json!({"__error": true, "error_message": format!("Failed to build capability-dispatched engine: {}", e)}),
-                                    }
-                                } else { serde_json::json!({"__error": true, "error_message": format!("Capability-dispatched workflow {} graph not found", sub_wf_id)}) }
-                            }
-                            None => {
-                                serde_json::json!({"__error": true, "error_message": format!("No workflow found matching capabilities: {:?}", caps)})
-                            }
-                        }
-                    } else {
-                        serde_json::json!({"__error": true, "error_message": "Registry not available for capability dispatch"})
-                    };
-
-                    // If capability dispatch failed, check continue_on_error before propagating
-                    if capability_result.get("__error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // Capability-dispatch failures are scheduler-fatal unless
+                    // the node opts in to `continue_on_error`. The check
+                    // lives at the caller because the handler itself stays
+                    // policy-neutral.
+                    if output
+                        .get("__error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         let continue_on_error = self
                             .node_configs
                             .get(&node_id)
@@ -6320,612 +4990,80 @@ impl ParallelWorkflowEngine {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         if !continue_on_error {
-                            let err_msg = capability_result
+                            let err_msg = output
                                 .get("error_message")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("capability dispatch failed")
                                 .to_string();
-                            tracing::error!(node_id = %node_id, error = %err_msg, "Capability dispatch failed — failing workflow");
-                            return Err(format!("Capability dispatch node {}: {}", node_id, err_msg));
+                            tracing::error!(
+                                %node_id,
+                                error = %err_msg,
+                                "Capability dispatch failed — failing workflow"
+                            );
+                            return Err(format!(
+                                "Capability dispatch node {node_id}: {err_msg}"
+                            ));
                         }
-                        tracing::info!(node_id = %node_id, "Capability dispatch failed but continue_on_error is set — continuing");
+                        tracing::info!(
+                            %node_id,
+                            "Capability dispatch failed but continue_on_error is set — continuing"
+                        );
                     }
-
-                    results.insert(node_id, capability_result);
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 {
-                                *cnt -= 1;
-                            }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
-                // ── Loop dispatch (re-dispatches body node while condition is true) ──
-                if let Some((_, _, Some(SystemNodeKind::Loop { ref condition, max_iterations }))) =
-                    self.node_meta.get(&node_id)
+                // ── Loop dispatch (re-dispatches body node) ──────────────────
+                if let Some(output) = self
+                    .try_dispatch_loop(
+                        node_idx,
+                        node_id,
+                        execution_id,
+                        &dispatcher,
+                        &worker_shared_key,
+                        &results,
+                    )
+                    .await
                 {
-                    let condition = condition.clone();
-                    let max_iters = *max_iterations;
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    // Find the body_node_id from node config
-                    let body_node_id_str = self.node_configs.get(&node_id)
-                        .and_then(|c| c.get("body_node_id"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    let loop_result = if let Some(body_rf_id) = body_node_id_str {
-                        let body_uuid = self.node_labels.iter()
-                            .find(|(_, label)| label.as_str() == body_rf_id)
-                            .map(|(uuid, _)| *uuid);
-
-                        if let Some(body_uuid) = body_uuid {
-                            let body_module_id = self.node_meta.get(&body_uuid)
-                                .and_then(|(mid, _, _)| *mid);
-
-                            if let Some(body_module_id) = body_module_id {
-                                let mut current_input = inputs.clone();
-                                let mut iteration = 0u32;
-                                let mut last_output = current_input.clone();
-
-                                // Extract __trigger_input__ to inject into every loop iteration.
-                                // Search: (1) gathered inputs, (2) the __trigger__ node's output in results
-                                let trigger_input_val = inputs.as_object()
-                                    .and_then(|o| o.get("__trigger_input__"))
-                                    .cloned()
-                                    .or_else(|| {
-                                        // Find the trigger node by label and use its value
-                                        self.node_labels.iter()
-                                            .find(|(_, label)| label.as_str() == "__trigger__")
-                                            .and_then(|(uuid, _)| results.get(uuid))
-                                            .cloned()
-                                    });
-
-                                while iteration < max_iters {
-                                    // Evaluate condition with iteration_count injected so
-                                    // conditions like `iteration_count < 3` work without
-                                    // the body module needing to echo the counter.
-                                    if iteration > 0 {
-                                        let condition_ctx =
-                                            if let Some(mut obj) = last_output.as_object().cloned() {
-                                                obj.entry("iteration_count".to_string())
-                                                    .or_insert(serde_json::json!(iteration));
-                                                obj.entry("iteration".to_string())
-                                                    .or_insert(serde_json::json!(iteration));
-                                                serde_json::Value::Object(obj)
-                                            } else {
-                                                serde_json::json!({
-                                                    "iteration_count": iteration,
-                                                    "iteration": iteration,
-                                                    "output": last_output,
-                                                })
-                                            };
-                                        if !self.eval_bool(
-                                            &condition,
-                                            &condition_ctx,
-                                        ) {
-                                            break;
-                                        }
-                                    }
-
-                                    iteration += 1;
-
-                                    emit_event_spawn(
-                                        &self.event_sink,
-                                        NodeEventWrite {
-                                            execution_id,
-                                            event_type: "loop_iteration".to_string(),
-                                            node_id: Some(node_id),
-                                            status: "Running".to_string(),
-                                            log_message: Some(format!(
-                                                "Loop iteration {}/{}",
-                                                iteration, max_iters
-                                            )),
-                                            iteration_index: Some(iteration as i32),
-                                        },
-                                    );
-
-                                    // Use fetch_module for full resolution (wasm_modules → template_id → node_templates)
-                                    let fetch_result = self.fetch_module(body_uuid).await
-                                        .map_err(|e| anyhow::anyhow!(e));
-
-                                    match fetch_result {
-                                        Ok(wasm_module) => {
-                                            // Flat-merge input + config (same pattern as regular node dispatch)
-                                            let mut merged_input = serde_json::Map::new();
-                                            // Spread current_input fields at root level
-                                            if let Some(obj) = current_input.as_object() {
-                                                for (k, v) in obj {
-                                                    merged_input.insert(k.clone(), v.clone());
-                                                }
-                                            }
-                                            // Add config sub-key if present
-                                            if let Some(cfg) = self.node_configs.get(&body_uuid) {
-                                                if cfg.is_object() && !cfg.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-                                                    merged_input.insert("config".to_string(), cfg.clone());
-                                                    // Also spread config fields at root for templates that read them directly
-                                                    if let Some(obj) = cfg.as_object() {
-                                                        for (k, v) in obj {
-                                                            merged_input.entry(k.clone()).or_insert(v.clone());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // Include input sub-key for modules that read it explicitly
-                                            if !current_input.is_null() && current_input != serde_json::json!({}) {
-                                                merged_input.entry("input".to_string()).or_insert(current_input.clone());
-                                            }
-                                            // Inject __trigger_input__ into each loop iteration
-                                            if let Some(ref ti) = trigger_input_val {
-                                                merged_input.insert("__trigger_input__".to_string(), ti.clone());
-                                            }
-                                            // Inject loop counter so body modules can read it.
-                                            // `iteration` is already incremented (1-based).
-                                            merged_input.entry("iteration_count".to_string())
-                                                .or_insert(serde_json::json!(iteration));
-                                            merged_input.entry("iteration".to_string())
-                                                .or_insert(serde_json::json!(iteration));
-                                            let job_input = serde_json::Value::Object(merged_input);
-
-                                            let body_timeout_secs =
-                                                self.node_timeouts.get(&body_uuid).copied().unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
-                                            let encrypted_secrets = self
-                                                .build_encrypted_secrets(
-                                                    body_module_id,
-                                                    &worker_shared_key,
-                                                )
-                                                .await;
-                                            let body_job = DispatchJob {
-                                                execution_id,
-                                                node_id: body_uuid,
-                                                module_id: body_module_id,
-                                                job_id: None,
-                                                user_id: self.user_id,
-                                                actor_id: self.actor_id,
-                                                module_uri: wasm_module.oci_url.clone()
-                                                    .unwrap_or_else(|| format!("redis:wasm:{}", body_module_id)),
-                                                wasm_bytes: None,
-                                                expected_wasm_hash: Some(wasm_module.content_hash.clone()),
-                                                capability_world: Some(wasm_module.capability_world.clone()),
-                                                integration_name: wasm_module.integration_name.clone(),
-                                                input_payload: job_input,
-                                                timeout: std::time::Duration::from_secs(body_timeout_secs),
-                                                max_fuel: (wasm_module.max_fuel).min(50_000_000),
-                                                allowed_hosts: wasm_module.allowed_hosts.clone(),
-                                                allowed_methods: wasm_module.allowed_methods.clone(),
-                                                allowed_secrets: wasm_module.allowed_secrets.clone(),
-                                                allowed_sql_operations: vec![],
-                                                allow_tier2_exposure: false,
-                                                encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                                                encrypted_secrets_nonce: encrypted_secrets.nonce,
-                                                priority: 100,
-                                                dry_run: self.dry_run,
-                                                max_retries: 2,
-                                                backoff_ms: 500,
-                                                retry_condition: None,
-                                                retry_delay_expr: None,
-                                                emit_retry_events: false,
-                                            };
-                                            match dispatcher.dispatch(body_job).await {
-                                                Ok(result) => {
-                                                    let clean = Self::unwrap_output(&result.output).clone();
-                                                    last_output = clean.clone();
-                                                    current_input = clean;
-                                                }
-                                                Err(e) => {
-                                                    last_output = serde_json::json!({"__error": true, "error_message": e.to_string()});
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            last_output = serde_json::json!({"__error": true, "error_message": format!("Module fetch failed: {}", e)});
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if iteration >= max_iters {
-                                    tracing::warn!(
-                                        node_id = %node_id,
-                                        max_iterations = max_iters,
-                                        "Loop reached maximum iterations"
-                                    );
-                                }
-
-                                serde_json::json!({
-                                    "iterations": iteration,
-                                    "output": last_output,
-                                })
-                            } else {
-                                serde_json::json!({"__error": true, "error_message": format!("Body node '{}' has no module_id", body_rf_id)})
-                            }
-                        } else {
-                            serde_json::json!({"__error": true, "error_message": format!("Body node '{}' not found in workflow", body_rf_id)})
-                        }
-                    } else {
-                        serde_json::json!({"__error": true, "error_message": "Loop node missing body_node_id in config"})
-                    };
-
-                    results.insert(node_id, loop_result);
-
-                    for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                        if let Some(cnt) = pending.get_mut(&child) {
-                            if *cnt > 0 { *cnt -= 1; }
-                            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                ready.push_back(child);
-                            }
-                        }
-                    }
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── ErrorHandler dispatch (pattern filtering) ───────────────
-                if let Some((_, _, Some(SystemNodeKind::ErrorHandler { ref error_pattern }))) =
-                    self.node_meta.get(&node_id)
+                if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results)
                 {
-                    let inputs = self.gather_inputs(node_idx, &results);
-
-                    // Check if error matches the pattern filter (if specified)
-                    if let Some(pattern) = error_pattern {
-                        let error_msg = inputs.get("error_message")
-                            .or_else(|| {
-                                // Check parent outputs for __error payloads
-                                inputs.as_object().and_then(|obj| {
-                                    obj.values().find_map(|v| v.get("error_message"))
-                                })
-                            })
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        if !error_msg.contains(pattern.as_str()) {
-                            // Error doesn't match pattern — skip this handler, propagate error
-                            results.insert(node_id, serde_json::json!({
-                                "__skipped": true,
-                                "reason": "error_pattern_mismatch",
-                            }));
-
-                            for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 { *cnt -= 1; }
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    // If pattern matches (or no pattern), fall through to normal dispatch below
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
                 }
 
-                // ── Rate limit check ──────────────────────────────────────
-                evict_stale_rate_limits();
-                let module_id_resolved = self.resolve_module_id(node_id);
-                if let Some(&limit) = self.rate_limits.get(&module_id_resolved) {
-                    if limit > 0 {
-                        let now = std::time::Instant::now();
-                        let mut entry = MODULE_RATE_LIMITS.entry(module_id_resolved).or_insert((now, 0));
-                        if now.duration_since(entry.0) > std::time::Duration::from_secs(60) {
-                            entry.0 = now;
-                            entry.1 = 0;
-                        }
-                        entry.1 += 1;
-                        if entry.1 > limit as u32 {
-                            tracing::warn!(
-                                node_id = %node_id,
-                                module_id = %module_id_resolved,
-                                rate_limit = limit,
-                                "Module rate limit exceeded"
-                            );
-                            results.insert(node_id, serde_json::json!({
-                                "__error": true,
-                                "error_message": format!("Module rate limit exceeded ({}/min)", limit)
-                            }));
-                            for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 { *cnt -= 1; }
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
+                // ── Single-node dispatch ─────────────────────────────────────
+                if let Some(error_envelope) = self.check_rate_limit(node_id) {
+                    results.insert(node_id, error_envelope);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
                 }
 
-                let retry = self
-                    .node_meta
-                    .get(&node_id)
-                    .and_then(|(_, rp, _)| rp.clone())
-                    .unwrap_or_default();
                 let inputs = self.gather_inputs(node_idx, &results);
-                let dispatcher_clone = dispatcher.clone();
-                let user_id_clone = self.user_id;
-                let fetch_fut = self.fetch_module(node_id);
-                let secrets_resolver = self.secrets_resolver.clone();
-                let secret_envelope = self.secret_envelope.clone();
-                let approval_gate = self.approval_gate.clone();
-                let module_execution_store = self.module_execution_store.clone();
-                let _exec_sandbox = execution_sandbox.clone();
-                let seed_user_id = self.user_id;
-                let worker_shared_key_clone = worker_shared_key.clone();
-                let node_configs_clone = self.node_configs.clone();
-                let node_timeouts_clone = self.node_timeouts.clone();
-                let trigger_input_clone = trigger_input.clone();
-                let event_sink_clone = self.event_sink.clone();
-                let dry_run = self.dry_run;
-                // Accumulated context snapshot for run_with_seed dispatch.
                 let accumulated_snapshot =
                     Self::build_accumulated_context(&self.node_labels, &results);
-
-                let fut = async move {
-                    let wasm_module = match fetch_fut.await {
-                        Ok(m) => m,
-                        Err(e) => return (node_idx, Err(e)),
-                    };
-
-                    // ── Approval gate ───────────────────────────────────────
-                    if !wasm_module.requires_approval_for.is_empty() {
-                        if let Some(ref gate) = approval_gate {
-                            let approval_webhook = node_configs_clone
-                                .get(&node_id)
-                                .and_then(|cfg| cfg.get("NOTIFICATION_WEBHOOK"))
-                                .and_then(|v| v.as_str());
-                            match gate
-                                .check_or_request(
-                                    execution_id,
-                                    node_id,
-                                    &wasm_module.requires_approval_for,
-                                    approval_webhook,
-                                )
-                                .await
-                            {
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {
-                                    /* proceed */
-                                }
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
-                                    return (
-                                        node_idx,
-                                        Err(format!(
-                                            "Execution paused: module {} requires approval for {:?}. \
-                                             An approval request has been created.",
-                                            node_id, wasm_module.requires_approval_for
-                                        )),
-                                    );
-                                }
-                                Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
-                                    return (node_idx, Err(reason));
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        node_id = %node_id,
-                                        "Approval gate check failed: {}",
-                                        e
-                                    );
-                                    return (
-                                        node_idx,
-                                        Err(format!("Approval gate check failed: {}", e)),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Read compile-time config from the already-fetched
-                    // artifact. See the equivalent block in `run()` for
-                    // why we dropped the best-effort Redis cache warm.
-                    if seed_user_id.is_none() {
-                        return (
-                            node_idx,
-                            Err("Module execution requires user context (user_id not set)"
-                                .to_string()),
-                        );
-                    }
-                    let module_config = wasm_module
-                        .config
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({}));
-
-                    // Merge node-level config from graph_json (takes precedence)
-                    // Filter out internal keys (__skip_condition, skip_condition) that shouldn't be passed to modules
-                    let module_config = if let Some(node_cfg) = node_configs_clone.get(&node_id) {
-                        if module_config.is_object() && node_cfg.is_object() {
-                            let mut merged = module_config.as_object().cloned().unwrap_or_default();
-                            if let Some(node_cfg_obj) = node_cfg.as_object() {
-                                for (k, v) in node_cfg_obj {
-                                    if k == "__skip_condition" || k == "skip_condition" || k == "__continue_on_error" || k == "continue_on_error" { continue; }
-                                    merged.insert(k.clone(), v.clone());
-                                }
-                            }
-                            serde_json::Value::Object(merged)
-                        } else if module_config == serde_json::json!({}) {
-                            node_cfg.clone()
-                        } else {
-                            module_config
-                        }
-                    } else {
-                        module_config
-                    };
-
-                    // Merge config and input into a flat object so templates can
-                    // find their fields at the top level (e.g., "text", "URL").
-                    // Also include "config" and "input" for backwards compatibility.
-                    let wrapped_input = {
-                        let mut merged = serde_json::Map::new();
-                        // Start with config fields at top level
-                        if let Some(obj) = module_config.as_object() {
-                            for (k, v) in obj {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        // Overlay input fields at top level (input takes precedence)
-                        if let Some(obj) = inputs.as_object() {
-                            for (k, v) in obj {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        } else if !inputs.is_null() {
-                            merged.insert("input".to_string(), inputs.clone());
-                        }
-                        // Always include config and input sub-objects for templates
-                        // that explicitly read from these keys
-                        // Only include "config" if it has actual content (skip empty {})
-                        if module_config != serde_json::json!({}) {
-                            merged.insert("config".to_string(), module_config.clone());
-                        }
-                        // Always include "input" sub-key for non-null, non-empty upstream
-                        // outputs so downstream modules can access data["input"] regardless
-                        // of whether the upstream returned an object or a scalar.
-                        let is_empty_object = inputs.as_object().map(|m| m.is_empty()).unwrap_or(false);
-                        if !inputs.is_null() && !is_empty_object {
-                            merged.insert("input".to_string(), inputs.clone());
-                        }
-                        // Inject original trigger input for passthrough to all nodes
-                        merged.insert("__trigger_input__".to_string(), trigger_input_clone.clone());
-                        // Inject accumulated context: all prior nodes' outputs
-                        // keyed by label, with __-prefixed metadata stripped.
-                        if let Some(acc) = &accumulated_snapshot {
-                            merged.insert("__accumulated__".to_string(), acc.clone());
-                        }
-                        // Inject actor memory context into every node.
-                        if let Some(ref ctx) = self.actor_context {
-                            merged.insert("__actor_context__".to_string(), ctx.clone());
-                        }
-                        serde_json::Value::Object(merged)
-                    };
-
-                    // Store truncated node input for debugging (node I/O inspector)
-                    {
-                        let input_preview = {
-                            let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
-                            if s.len() > 4096 { format!("{}...(truncated)", &s[..4096]) } else { s }
-                        };
-                        emit_event_spawn(
-                            &event_sink_clone,
-                            NodeEventWrite {
-                                execution_id,
-                                event_type: "node_input".to_string(),
-                                node_id: Some(node_id),
-                                status: "Input".to_string(),
-                                log_message: Some(input_preview),
-                                iteration_index: None,
-                            },
-                        );
-                    }
-
-                    let job_id = Uuid::new_v4();
-
-                    if let Some(ref store) = module_execution_store {
-                        // Race-safe INSERT via the store; see the primary
-                        // dispatch path for the rationale behind
-                        // race_safe_status=true.
-                        let actual_module_id =
-                            store.resolve_module_id(module_id_resolved).await;
-                        if let Err(db_err) = store
-                            .record_started(ExecutionStartedContext {
-                                id: job_id,
-                                module_id: actual_module_id,
-                                user_id: seed_user_id.unwrap_or_else(Uuid::new_v4),
-                                workflow_execution_id: execution_id,
-                                input: &inputs,
-                                trigger_type: "webhook",
-                                race_safe_status: true,
-                            })
-                            .await
-                        {
-                            tracing::error!(
-                                "module_execution_store.record_started failed: {}",
-                                db_err
-                            );
-                        }
-                    }
-
-                    // Per-node fuel limit: config override > module default, capped at 50M.
-                    let node_max_fuel = module_config
-                        .get("max_fuel")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(wasm_module.max_fuel)
-                        .min(50_000_000);
-
-                    // Resolve encrypted secrets payload (opaque bytes at this layer).
-                    let encrypted_secrets = match (
-                        secrets_resolver.as_ref(),
-                        &worker_shared_key_clone,
-                    ) {
-                        (Some(resolver), Some(key)) => {
-                            let vault_paths = extract_vault_paths(&module_config);
-                            build_encrypted_secrets_for(
-                                resolver.as_ref(),
-                                secret_envelope.as_ref(),
-                                module_id_resolved,
-                                user_id_clone,
-                                &vault_paths,
-                                &wasm_module.allowed_secrets,
-                                key.as_bytes(),
-                            )
-                            .await
-                        }
-                        _ => Default::default(),
-                    };
-
-                    // Wire-format WASM budget. See the matching comment in run().
-                    let node_timeout_secs =
-                        node_timeouts_clone.get(&node_id).copied().unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
-
-                    let job = DispatchJob {
-                        execution_id,
-                        node_id,
-                        module_id: module_id_resolved,
-                        job_id: Some(job_id),
-                        user_id: user_id_clone,
-                        actor_id: self.actor_id,
-                        module_uri: wasm_module
-                            .oci_url
-                            .clone()
-                            .unwrap_or_else(|| format!("redis:wasm:{}", module_id_resolved)),
-                        wasm_bytes: if wasm_module.wasm_bytes.is_empty() { None } else { Some(wasm_module.wasm_bytes.clone()) },
-                        expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
-                            Some(wasm_module.content_hash.clone())
-                        } else {
-                            None
-                        },
-                        capability_world: Some(wasm_module.capability_world.clone()),
-                        integration_name: wasm_module.integration_name.clone(),
-                        input_payload: wrapped_input,
-                        timeout: std::time::Duration::from_secs(node_timeout_secs),
-                        max_fuel: node_max_fuel,
-                        allowed_hosts: wasm_module.allowed_hosts.clone(),
-                        allowed_methods: wasm_module.allowed_methods.clone(),
-                        allowed_secrets: wasm_module.allowed_secrets.clone(),
-                        allowed_sql_operations: vec![],
-                        allow_tier2_exposure: false,
-                        encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                        encrypted_secrets_nonce: encrypted_secrets.nonce,
-                        priority: 100,
-                        dry_run,
-                        max_retries: retry.max_retries,
-                        backoff_ms: retry.backoff_ms,
-                        retry_condition: retry.retry_condition.clone(),
-                        retry_delay_expr: retry.retry_delay_expression.clone(),
-                        emit_retry_events: true,
-                    };
-
-                    match dispatcher_clone.dispatch(job).await {
-                        Ok(result) => {
-                            tracing::info!(node_id = %node_id, "Node execution succeeded");
-                            (node_idx, Ok(result.output))
-                        }
-                        Err(e) => (node_idx, Err(e.to_string())),
-                    }
-                };
+                let fut = self.run_single_node_dispatch(
+                    node_idx,
+                    node_id,
+                    execution_id,
+                    dispatcher.clone(),
+                    worker_shared_key.clone(),
+                    inputs,
+                    accumulated_snapshot,
+                    execution_sandbox.clone(),
+                );
+                // Seed-path timing + node_started event: tracked only on
+                // the seeded scheduler because the returned
+                // `WorkflowContext.node_timings` is observable by callers
+                // resuming via `run_with_seed_with_transport`.
                 node_start_times.insert(node_idx, std::time::Instant::now());
-                // Log node_started event (fire-and-forget)
                 emit_event_spawn(
                     &self.event_sink,
                     NodeEventWrite {
@@ -6941,74 +5079,8 @@ impl ParallelWorkflowEngine {
                     as Pin<
                         Box<dyn Future<Output = (NodeIndex, Result<JsonValue, String>)> + Send>,
                     >);
-
-                // ── Speculative module prefetch (P10) ────────────────────────
-                if self
-                    .node_configs
-                    .get(&node_id)
-                    .and_then(|c| c.get("speculative_prefetch"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    const MAX_PREFETCH_SUCCESSORS: usize = 8;
-                    for succ_idx in self
-                        .graph
-                        .neighbors_directed(node_idx, Direction::Outgoing)
-                        .take(MAX_PREFETCH_SUCCESSORS)
-                    {
-                        let succ_id = self.graph[succ_idx];
-                        // Skip system nodes — they have no module in the registry (resolve_module_id
-                        // returns the node UUID as a fallback for system nodes). Attempting to fetch
-                        // would waste a 5-second timeout and produce noisy debug log entries.
-                        let succ_module_id = match self.node_meta.get(&succ_id)
-                            .and_then(|(mid, _, _)| *mid)
-                        {
-                            Some(mid) => mid,
-                            None => continue,
-                        };
-                        let prefetch_cache = Arc::clone(&self.module_prefetch_cache);
-                        if let Some(ref fetcher) = self.module_fetcher {
-                            let fetcher = Arc::clone(fetcher);
-                            let uid = self.user_id;
-                            tokio::spawn(async move {
-                                if prefetch_cache.contains_key(&succ_id) {
-                                    return;
-                                }
-                                if let Some(uid) = uid {
-                                    let fetch_result = tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        fetcher.fetch(succ_module_id, uid),
-                                    )
-                                    .await;
-                                    match fetch_result {
-                                        Ok(Ok(artifact)) => {
-                                            // Use entry().or_insert to match run() semantics:
-                                            // if two concurrent spawns race, only the first stores.
-                                            prefetch_cache.entry(succ_id).or_insert(artifact);
-                                            tracing::debug!(
-                                                succ_id = %succ_id,
-                                                "speculative prefetch: module cached"
-                                            );
-                                        }
-                                        Ok(Err(e)) => {
-                                            tracing::debug!(
-                                                succ_id = %succ_id,
-                                                error = %e,
-                                                "speculative prefetch: fetch failed (normal dispatch will retry)"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            tracing::debug!(
-                                                succ_id = %succ_id,
-                                                "speculative prefetch: timed out (normal dispatch will fetch)"
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
+                self.maybe_speculative_prefetch(node_id, node_idx);
+                continue;
             }
 
             if let Some((finished_idx, exec_result)) = executing.next().await {

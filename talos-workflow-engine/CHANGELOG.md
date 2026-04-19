@@ -53,16 +53,33 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
   validator + output sanitizer), and `scheduler_handlers` (per-
   `SystemNodeKind` dispatch methods lifted from the reactor body).
   The scheduler body in `run_with_transport_inner` shrank from 3,025
-  lines to ~2,430 by extracting 12 local-computation and
-  sub-workflow-dispatch handlers (Collect, Synthesize, Verify,
-  WhileLoop, RepeatLoop, ConfidenceGate, Judge, Ensemble,
-  ReflectiveRetry, LlmDispatch, SubWorkflow, Loop). A shared
-  `unblock_successors` helper replaces ~12 copies of the decrement-
-  and-enqueue boilerplate. Remaining large inline blocks (AgentLoop,
-  DynamicDispatch, CapabilityDispatch, single-node, pipeline-chain)
-  and the parallel body in `run_with_seed_with_transport_inner` are
-  follow-up work. The public API is unchanged apart from the
-  additions noted above.
+  lines to ~1,713 (~44%) by extracting 18 handlers: local computation
+  (Collect, Synthesize, Verify, FanIn), local iteration (WhileLoop,
+  RepeatLoop), sub-workflow dispatch (SubWorkflow, Loop, AgentLoop,
+  Judge, Ensemble, ReflectiveRetry, LlmDispatch, ConfidenceGate,
+  DynamicDispatch, CapabilityDispatch), and the generic pre-filters
+  (Skip-condition, ErrorHandler pattern-match). A shared
+  `unblock_successors` helper replaces the ~15 copies of the
+  decrement-and-enqueue boilerplate that had drifted between two
+  formulations. `DynamicDispatch` and `CapabilityDispatch` share a new
+  `run_dispatched_subworkflow` helper (seeded with a `DispatchedOrigin`
+  enum) instead of open-coding the same sub-engine-build pattern
+  twice.
+  The two largest remaining inline blocks — single-node module
+  dispatch (~370 lines) and pipeline-chain dispatch (~490 lines) —
+  are now named methods on `ParallelWorkflowEngine`:
+  `run_single_node_dispatch` and `run_pipeline_chain_dispatch`. Each
+  is an `async fn` that the reactor hands to `executing.push` rather
+  than an inline `async move` closure; state that used to be cloned
+  into the closure is now accessed through `&self` directly. The
+  rate-limit check (`check_rate_limit`) and speculative module
+  prefetch (`maybe_speculative_prefetch`) are also separate helpers
+  so the reactor flow reads as rate-limit → dispatch → prefetch →
+  continue.
+  Final scheduler body in `run_with_transport_inner`: 3,025 → 827
+  lines (~73% reduction). The parallel
+  `run_with_seed_with_transport_inner` body remains as follow-up.
+  The public API is unchanged apart from the additions noted above.
 - **Breaking** (behavior, not signature): `load_from_graph_json`
   (sync, `&Value`) and `load_graph_from_json` (async, `&str`) now share
   a single authoritative parser. The sync entry point previously
