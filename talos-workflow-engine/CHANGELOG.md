@@ -76,10 +76,16 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
   prefetch (`maybe_speculative_prefetch`) are also separate helpers
   so the reactor flow reads as rate-limit → dispatch → prefetch →
   continue.
-  Final scheduler body in `run_with_transport_inner`: 3,025 → 827
-  lines (~73% reduction). The parallel
-  `run_with_seed_with_transport_inner` body remains as follow-up.
-  The public API is unchanged apart from the additions noted above.
+  Final scheduler body in `run_with_transport_inner`: 3,025 → 459
+  lines (~85% reduction). The parallel
+  `run_with_seed_with_transport_inner` shrank from 1,967 → 488 lines
+  (~75%) and now reuses the same handler methods. Both schedulers
+  share `handle_completed_future` for the post-completion fan-out
+  (size-guard, sanitize, hook, chain-interior clear, FanIn early-
+  ready via `apply_fan_in_early_ready`, edge-condition skipping,
+  error-edge routing, `continue_on_error`, and scheduler-fatal
+  failure propagation). The public API is unchanged apart from the
+  additions noted above.
 - **Breaking** (behavior, not signature): `load_from_graph_json`
   (sync, `&Value`) and `load_graph_from_json` (async, `&str`) now share
   a single authoritative parser. The sync entry point previously

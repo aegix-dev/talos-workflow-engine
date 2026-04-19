@@ -2817,6 +2817,465 @@ impl ParallelWorkflowEngine {
         self.node_timeouts.get(&node_id).copied()
     }
 
+    /// FanIn early-ready: apply a [`JoinMode::Any`] / `Majority` /
+    /// `N(k)` short-circuit on `child` if it's a FanIn node and enough
+    /// parents have completed to satisfy the join. Mutates `pending`
+    /// by zeroing the child's counter when the join is satisfied.
+    /// `JoinMode::All` waits for every parent and is the default
+    /// zero-action branch.
+    fn apply_fan_in_early_ready(
+        &self,
+        child: NodeIndex,
+        pending: &mut HashMap<NodeIndex, usize>,
+    ) {
+        let Some((_, _, Some(SystemNodeKind::FanIn { join_mode, .. }))) =
+            self.node_meta.get(&self.graph[child])
+        else {
+            return;
+        };
+        let total_parents = self
+            .graph
+            .neighbors_directed(child, Direction::Incoming)
+            .count();
+        let cnt = *pending.get(&child).unwrap_or(&0);
+        let completed_parents = total_parents - cnt;
+        match join_mode {
+            JoinMode::Any => {
+                if cnt > 0 {
+                    pending.insert(child, 0);
+                }
+            }
+            JoinMode::Majority => {
+                if completed_parents > total_parents / 2 && cnt > 0 {
+                    pending.insert(child, 0);
+                }
+            }
+            JoinMode::N(n) => {
+                if completed_parents >= *n as usize && cnt > 0 {
+                    pending.insert(child, 0);
+                }
+            }
+            JoinMode::All => {} // default: wait for everyone
+        }
+    }
+
+    /// Post-completion processing for a node whose dispatch future
+    /// just returned from `executing.next().await`.
+    ///
+    /// Handles both the `Ok(output)` and `Err(error_message)` paths:
+    ///
+    /// * **Success.** Size-guard the output, sanitize it, insert into
+    ///   `results`, fire the `on_node_completed` hook, clear pending
+    ///   counts for any interior chain nodes (primary scheduler only),
+    ///   then walk successors decrementing pending counts, applying
+    ///   FanIn early-ready rules and edge-condition evaluation.
+    ///
+    /// * **Failure.** DLP-scrub the error, emit `node_failed`, and
+    ///   route based on node topology: if the node has outgoing error
+    ///   edges they fire; if the node has `__continue_on_error` set we
+    ///   propagate a `__continued` envelope and keep going; otherwise
+    ///   we notify the hook and return `Err` so the scheduler bails.
+    ///
+    /// `chains_ctx` is the primary scheduler's chain-detection output
+    /// (chains slice + `node_to_chain` map); `None` for the seeded
+    /// scheduler, which doesn't run pipeline batching. `wall_time_ms`
+    /// is 0 on the primary (no per-node timing) and the measured
+    /// elapsed time on the seeded scheduler (threaded back through
+    /// `WorkflowContext.node_timings`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_completed_future(
+        &self,
+        finished_idx: NodeIndex,
+        exec_result: Result<JsonValue, String>,
+        execution_id: Uuid,
+        wall_time_ms: u64,
+        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
+        exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
+        results: &mut HashMap<Uuid, JsonValue>,
+        pending: &mut HashMap<NodeIndex, usize>,
+        ready: &mut VecDeque<NodeIndex>,
+    ) -> Result<(), String> {
+        let finished_id = self.graph[finished_idx];
+        match exec_result {
+            Ok(output) => {
+                self.handle_node_success(
+                    finished_idx,
+                    finished_id,
+                    output,
+                    execution_id,
+                    wall_time_ms,
+                    chains_ctx,
+                    results,
+                    pending,
+                    ready,
+                )
+                .await;
+                Ok(())
+            }
+            Err(error_msg) => {
+                self.handle_node_failure(
+                    finished_idx,
+                    finished_id,
+                    error_msg,
+                    execution_id,
+                    wall_time_ms,
+                    chains_ctx,
+                    exec_ctx,
+                    results,
+                    pending,
+                    ready,
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_node_success(
+        &self,
+        finished_idx: NodeIndex,
+        finished_id: Uuid,
+        output: JsonValue,
+        execution_id: Uuid,
+        wall_time_ms: u64,
+        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
+        results: &mut HashMap<Uuid, JsonValue>,
+        pending: &mut HashMap<NodeIndex, usize>,
+        ready: &mut VecDeque<NodeIndex>,
+    ) {
+        // Log `node_completed` synchronously so child `node_started`
+        // events (fire-and-forget) are always ordered after this insert
+        // in the DB — fixes causally-inconsistent timelines.
+        if let Some(ref sink) = self.event_sink {
+            sink.emit(NodeEventWrite {
+                execution_id,
+                event_type: "node_completed".to_string(),
+                node_id: Some(finished_id),
+                status: "Completed".to_string(),
+                log_message: None,
+                iteration_index: None,
+            })
+            .await;
+        }
+
+        // Per-node output size guard: reject outputs larger than 5 MiB.
+        // A single misbehaving node can otherwise produce a multi-MB
+        // JSON value that is then cloned into every downstream node's
+        // gathered_inputs and the final aggregated workflow output,
+        // cascading into memory exhaustion.
+        const MAX_NODE_OUTPUT_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
+        let output = match serde_json::to_vec(&output) {
+            Ok(bytes) if bytes.len() > MAX_NODE_OUTPUT_BYTES => {
+                tracing::warn!(
+                    node_id = %finished_id,
+                    bytes = bytes.len(),
+                    limit = MAX_NODE_OUTPUT_BYTES,
+                    "Node output exceeds 5 MiB limit — replacing with error"
+                );
+                serde_json::json!({
+                    "__error": true,
+                    "error": format!(
+                        "Node output too large ({} bytes > {} byte limit). \
+                         Reduce the amount of data returned by this node.",
+                        bytes.len(), MAX_NODE_OUTPUT_BYTES
+                    )
+                })
+            }
+            _ => output,
+        };
+        let mut output = output;
+        sanitize_node_output(&mut output);
+        results.insert(finished_id, output.clone());
+
+        // Post-completion hook: drives fuel attribution,
+        // `__memory_write__` persistence, and any future cross-cutting
+        // per-node observers. Fire-and-forget — the hook returns
+        // quickly; impls spawn internally. The primary scheduler
+        // doesn't track wall time (wall_time_ms == 0); the seeded
+        // scheduler threads it through from `node_start_times`.
+        if let Some(hook) = self.node_hook.as_ref() {
+            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
+            let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
+            hook.on_node_completed(
+                talos_workflow_engine_core::NodeCompletionContext {
+                    workflow_id: self.workflow_id.unwrap_or(execution_id),
+                    execution_id,
+                    node_id: finished_id,
+                    node_label,
+                    module_id,
+                    actor_id: self.actor_id,
+                    wall_time_ms,
+                },
+                &output,
+            );
+        }
+
+        // Chain execution: clear `pending` for interior chain nodes so
+        // their would-be successors (already run inside the pipeline)
+        // don't wait on them. Primary scheduler only — seeded path
+        // doesn't run pipeline batching.
+        if let Some((chains, node_to_chain)) = chains_ctx {
+            if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
+                for &n in &chains[chain_idx] {
+                    pending.insert(n, 0);
+                }
+            }
+        }
+
+        // Decrement children counters for finished_idx's successors.
+        // On SUCCESS, skip error-edge children (they only fire on failure).
+        for child in self
+            .graph
+            .neighbors_directed(finished_idx, Direction::Outgoing)
+        {
+            let is_error_edge = self
+                .graph
+                .edges_connecting(finished_idx, child)
+                .any(|e| e.weight().edge_type == "error");
+            if is_error_edge {
+                let child_id = self.graph[child];
+                results.insert(child_id, serde_json::json!({"__skipped": true}));
+                continue;
+            }
+            if let Some(cnt) = pending.get_mut(&child) {
+                *cnt -= 1;
+
+                // FanIn early-ready logic: some join modes don't
+                // require ALL parents to complete.
+                self.apply_fan_in_early_ready(child, pending);
+
+                if pending.get(&child).copied().unwrap_or(1) == 0 {
+                    // Check edge conditions before enqueuing.
+                    let child_node_id = self.graph[child];
+                    let mut condition_failed = false;
+                    for edge_ref in self.graph.edges_connecting(finished_idx, child) {
+                        tracing::debug!(
+                            condition = ?edge_ref.weight().condition,
+                            edge_type = %edge_ref.weight().edge_type,
+                            child = %child_node_id,
+                            "Evaluating edge"
+                        );
+                        if let Some(ref cond) = edge_ref.weight().condition {
+                            let unwrapped = Self::unwrap_output(&output);
+                            if !self.eval_bool(cond, unwrapped) {
+                                tracing::info!(
+                                    child_node_id = %child_node_id,
+                                    condition = %cond,
+                                    output_keys = ?unwrapped
+                                        .as_object()
+                                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                                        .unwrap_or_default(),
+                                    "Edge condition false — child node will be skipped"
+                                );
+                                condition_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if condition_failed {
+                        tracing::info!(
+                            node_id = %child_node_id,
+                            "Skipping node: edge condition evaluated to false"
+                        );
+                        results.insert(child_node_id, serde_json::json!({"__skipped": true}));
+                        // Cascade skip: decrement pending counts for the
+                        // skipped node's children. Those grandchildren
+                        // get picked up when their pending reaches 0 in
+                        // a future iteration.
+                        for grandchild in self
+                            .graph
+                            .neighbors_directed(child, Direction::Outgoing)
+                        {
+                            if let Some(gc_cnt) = pending.get_mut(&grandchild) {
+                                if *gc_cnt > 0 {
+                                    *gc_cnt -= 1;
+                                }
+                            }
+                        }
+                    } else {
+                        ready.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_node_failure(
+        &self,
+        finished_idx: NodeIndex,
+        finished_id: Uuid,
+        error_msg: String,
+        execution_id: Uuid,
+        wall_time_ms: u64,
+        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
+        exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
+        results: &mut HashMap<Uuid, JsonValue>,
+        pending: &mut HashMap<NodeIndex, usize>,
+        ready: &mut VecDeque<NodeIndex>,
+    ) -> Result<(), String> {
+        // Two-pass scrub: value-based (known secrets) then regex DLP.
+        let error_msg = self.redact_str(
+            &exec_ctx
+                .as_ref()
+                .map(|c| c.redact_error(&error_msg))
+                .unwrap_or_else(|| error_msg.clone()),
+        );
+        // Log `node_failed` synchronously — same ordering guarantee as
+        // `node_completed`: child routing happens after this commit.
+        if let Some(ref sink) = self.event_sink {
+            sink.emit(NodeEventWrite {
+                execution_id,
+                event_type: "node_failed".to_string(),
+                node_id: Some(finished_id),
+                status: "Failed".to_string(),
+                log_message: Some(error_msg.clone()),
+                iteration_index: None,
+            })
+            .await;
+        }
+
+        let error_children: Vec<NodeIndex> = self
+            .graph
+            .neighbors_directed(finished_idx, Direction::Outgoing)
+            .filter(|&child_idx| {
+                if let Some(edge_idx) = self.graph.find_edge(finished_idx, child_idx) {
+                    self.graph[edge_idx].edge_type == "error"
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if !error_children.is_empty() {
+            // Route error to error-handler nodes instead of failing.
+            let error_payload = serde_json::json!({
+                "__error": true,
+                "error_message": error_msg,
+                "failed_node": self
+                    .node_labels
+                    .get(&finished_id)
+                    .cloned()
+                    .unwrap_or_else(|| finished_id.to_string()),
+            });
+            results.insert(finished_id, error_payload);
+            tracing::info!(
+                %finished_id,
+                error_handlers = error_children.len(),
+                "Node failed but has error handler edges — routing to error handlers"
+            );
+
+            // Chain interior nodes get their pending cleared too —
+            // primary scheduler only.
+            if let Some((chains, node_to_chain)) = chains_ctx {
+                if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
+                    for &n in &chains[chain_idx] {
+                        pending.insert(n, 0);
+                    }
+                }
+            }
+
+            // Unblock ONLY error-edge children; skip default /
+            // conditional children because the parent failed and the
+            // success path is dead.
+            for child in self
+                .graph
+                .neighbors_directed(finished_idx, Direction::Outgoing)
+            {
+                let has_error_edge = self
+                    .graph
+                    .edges_connecting(finished_idx, child)
+                    .any(|e| e.weight().edge_type == "error");
+                if !has_error_edge {
+                    let child_id = self.graph[child];
+                    results.insert(child_id, serde_json::json!({"__skipped": true}));
+                    continue;
+                }
+
+                if let Some(cnt) = pending.get_mut(&child) {
+                    if *cnt > 0 {
+                        *cnt -= 1;
+                    }
+                    self.apply_fan_in_early_ready(child, pending);
+                    if pending.get(&child).copied().unwrap_or(1) == 0 {
+                        ready.push_back(child);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if self
+            .node_configs
+            .get(&finished_id)
+            .and_then(|c| c.get("__continue_on_error"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            // `continue_on_error`: store the error envelope and keep
+            // executing. Downstream nodes see the `__error: true`
+            // output on their gathered inputs.
+            tracing::info!(
+                %finished_id,
+                "Node failed but continue_on_error is set — continuing execution"
+            );
+            results.insert(
+                finished_id,
+                serde_json::json!({
+                    "__error": true,
+                    "error_message": error_msg,
+                    "__continued": true,
+                }),
+            );
+            for child in self
+                .graph
+                .neighbors_directed(finished_idx, Direction::Outgoing)
+            {
+                if let Some(cnt) = pending.get_mut(&child) {
+                    if *cnt > 0 {
+                        *cnt -= 1;
+                    }
+                    if pending.get(&child).copied().unwrap_or(1) == 0 {
+                        ready.push_back(child);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // No error handlers, no continue_on_error → the failure
+        // propagates. Notify the lifecycle hook (DLQ + sibling-cancel
+        // responsibility; the hook spawns both SQL writes so they
+        // don't delay the return).
+        if let Some(hook) = self.node_hook.as_ref() {
+            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
+            let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
+            hook.on_node_failed(
+                talos_workflow_engine_core::NodeCompletionContext {
+                    workflow_id: self.workflow_id.unwrap_or(execution_id),
+                    execution_id,
+                    node_id: finished_id,
+                    node_label,
+                    module_id,
+                    actor_id: self.actor_id,
+                    wall_time_ms,
+                },
+                &error_msg,
+                results.get(&finished_id),
+            );
+        }
+        let node_label = self
+            .node_labels
+            .get(&finished_id)
+            .cloned()
+            .unwrap_or_else(|| finished_id.to_string());
+        // Clear prefetch cache before returning so unconsumed WASM
+        // modules (potentially MBs each) are not retained in the
+        // engine's `Arc` for the lifetime of the caller.
+        self.module_prefetch_cache.clear();
+        Err(format!("node '{node_label}' failed: {error_msg}"))
+    }
+
     /// Build and await the full pipeline-chain dispatch future.
     ///
     /// Runs when a linear chain is detected (`detect_linear_chains`)
@@ -4197,393 +4656,25 @@ impl ParallelWorkflowEngine {
                 continue;
             }
 
-            // Await next finished task.
+            // Await next finished task and route its outcome through
+            // the shared post-completion handler. Primary scheduler
+            // passes its chain context so interior-chain pending
+            // clears correctly; `wall_time_ms` is 0 because this path
+            // doesn't measure per-node wall time (the seeded scheduler
+            // does).
             if let Some((finished_idx, exec_result)) = executing.next().await {
-                let finished_id = self.graph[finished_idx];
-                match exec_result {
-                    Ok(output) => {
-                        // Log node_completed event synchronously so child node_started
-                        // events (which are fire-and-forget) are always ordered after
-                        // this insert in the DB — fixes causally-inconsistent timelines.
-                        if let Some(ref sink) = self.event_sink {
-                            sink.emit(NodeEventWrite {
-                                execution_id,
-                                event_type: "node_completed".to_string(),
-                                node_id: Some(finished_id),
-                                status: "Completed".to_string(),
-                                log_message: None,
-                                iteration_index: None,
-                            })
-                            .await;
-                        }
-                        // For a pipeline result, mark ALL chain nodes as complete so
-                        // their successors become ready.  The result is stored only for
-                        // the last node (which is what `finished_idx` points to).
-                        //
-                        // Per-node output size guard: reject outputs larger than 5 MiB.
-                        // Without this, a single misbehaving node can produce a multi-MB
-                        // JSON value that is then cloned into every downstream node's
-                        // gathered_inputs and into the final aggregated workflow output,
-                        // leading to cascading memory exhaustion.
-                        const MAX_NODE_OUTPUT_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
-                        let output = match serde_json::to_vec(&output) {
-                            Ok(bytes) if bytes.len() > MAX_NODE_OUTPUT_BYTES => {
-                                tracing::warn!(
-                                    node_id = %finished_id,
-                                    bytes = bytes.len(),
-                                    limit = MAX_NODE_OUTPUT_BYTES,
-                                    "Node output exceeds 5 MiB limit — replacing with error"
-                                );
-                                serde_json::json!({
-                                    "__error": true,
-                                    "error": format!(
-                                        "Node output too large ({} bytes > {} byte limit). \
-                                         Reduce the amount of data returned by this node.",
-                                        bytes.len(), MAX_NODE_OUTPUT_BYTES
-                                    )
-                                })
-                            }
-                            _ => output,
-                        };
-                        let mut output = output;
-                        sanitize_node_output(&mut output);
-                        results.insert(finished_id, output.clone());
-
-                        // Post-completion hook: drives fuel attribution,
-                        // __memory_write__ persistence, and any future
-                        // cross-cutting per-node observers. Fire-and-forget —
-                        // the hook returns quickly; impls spawn internally.
-                        // `run()` doesn't track per-node wall time (only
-                        // `run_with_seed` does), so wall_time_ms is reported
-                        // as 0 ("unknown") here per trait contract.
-                        if let Some(hook) = self.node_hook.as_ref() {
-                            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
-                            let module_id =
-                                self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
-                            hook.on_node_completed(
-                                talos_workflow_engine_core::NodeCompletionContext {
-                                    workflow_id: self.workflow_id.unwrap_or(execution_id),
-                                    execution_id,
-                                    node_id: finished_id,
-                                    node_label,
-                                    module_id,
-                                    actor_id: self.actor_id,
-                                    wall_time_ms: 0,
-                                },
-                                &output,
-                            );
-                        }
-
-                        // If this was a chain execution, also clear pending for
-                        // interior chain nodes (they have already run in the pipeline).
-                        if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
-                            for &n in &chains[chain_idx] {
-                                pending.insert(n, 0); // Mark all chain nodes as done.
-                            }
-                        }
-
-                        // Decrement children counters for finished_idx's successors.
-                        // On SUCCESS, skip error-edge children (they only fire on failure).
-                        for child in self
-                            .graph
-                            .neighbors_directed(finished_idx, Direction::Outgoing)
-                        {
-                            let is_error_edge = self
-                                .graph
-                                .edges_connecting(finished_idx, child)
-                                .any(|e| e.weight().edge_type == "error");
-                            if is_error_edge {
-                                // Skip error-edge children on success
-                                let child_id = self.graph[child];
-                                results.insert(child_id, serde_json::json!({"__skipped": true}));
-                                continue;
-                            }
-                            if let Some(cnt) = pending.get_mut(&child) {
-                                *cnt -= 1;
-
-                                // FanIn early-ready logic: some join modes don't
-                                // require ALL parents to complete.
-                                if let Some((
-                                    _,
-                                    _,
-                                    Some(SystemNodeKind::FanIn { ref join_mode, .. }),
-                                )) = self.node_meta.get(&self.graph[child])
-                                {
-                                    let total_parents = self
-                                        .graph
-                                        .neighbors_directed(child, Direction::Incoming)
-                                        .count();
-                                    let completed_parents = total_parents - *cnt;
-                                    match join_mode {
-                                        JoinMode::Any => {
-                                            if *cnt > 0 {
-                                                pending.insert(child, 0);
-                                            }
-                                        }
-                                        JoinMode::Majority => {
-                                            if completed_parents > total_parents / 2 && *cnt > 0 {
-                                                pending.insert(child, 0);
-                                            }
-                                        }
-                                        JoinMode::N(n) => {
-                                            if completed_parents >= *n as usize && *cnt > 0 {
-                                                pending.insert(child, 0);
-                                            }
-                                        }
-                                        JoinMode::All => {} // default behavior
-                                    }
-                                }
-
-                                if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                    // Check edge conditions before enqueuing.
-                                    let child_node_id = self.graph[child];
-                                    let mut condition_failed = false;
-                                    for edge_ref in self.graph.edges_connecting(finished_idx, child)
-                                    {
-                                        tracing::debug!(
-                                            condition = ?edge_ref.weight().condition,
-                                            edge_type = %edge_ref.weight().edge_type,
-                                            child = %child_node_id,
-                                            "Evaluating edge"
-                                        );
-                                        if let Some(ref cond) = edge_ref.weight().condition {
-                                            let unwrapped = Self::unwrap_output(&output);
-                                            if !self.eval_bool(cond, unwrapped) {
-                                                tracing::info!(
-                                                    child_node_id = %child_node_id,
-                                                    condition = %cond,
-                                                    output_keys = ?unwrapped
-                                                        .as_object()
-                                                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
-                                                        .unwrap_or_default(),
-                                                    "Edge condition false — child node will be skipped"
-                                                );
-                                                condition_failed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if condition_failed {
-                                        tracing::info!(
-                                            node_id = %child_node_id,
-                                            "Skipping node: edge condition evaluated to false"
-                                        );
-                                        // Store a skip marker so downstream nodes know this path was not taken.
-                                        results.insert(
-                                            child_node_id,
-                                            serde_json::json!({"__skipped": true}),
-                                        );
-                                        // Cascade skip: decrement pending counts for the skipped node's children.
-                                        for grandchild in self
-                                            .graph
-                                            .neighbors_directed(child, Direction::Outgoing)
-                                        {
-                                            if let Some(gc_cnt) = pending.get_mut(&grandchild) {
-                                                if *gc_cnt > 0 {
-                                                    *gc_cnt -= 1;
-                                                }
-                                                // Note: grandchild will be picked up if its
-                                                // pending count reaches 0 in a future iteration.
-                                            }
-                                        }
-                                    } else {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error_msg) => {
-                        // Two-pass scrub: value-based (known secrets) then regex DLP patterns.
-                        let error_msg = self.redact_str(
-                            &exec_ctx
-                                .as_ref()
-                                .map(|c| c.redact_error(&error_msg))
-                                .unwrap_or_else(|| error_msg.clone()),
-                        );
-                        // Log node_failed event synchronously — same ordering guarantee
-                        // as node_completed: child routing happens after this commit.
-                        if let Some(ref sink) = self.event_sink {
-                            sink.emit(NodeEventWrite {
-                                execution_id,
-                                event_type: "node_failed".to_string(),
-                                node_id: Some(finished_id),
-                                status: "Failed".to_string(),
-                                log_message: Some(error_msg.clone()),
-                                iteration_index: None,
-                            })
-                            .await;
-                        }
-                        // Check if this node has outgoing "error" edges
-                        let error_children: Vec<NodeIndex> = self
-                            .graph
-                            .neighbors_directed(finished_idx, Direction::Outgoing)
-                            .filter(|&child_idx| {
-                                if let Some(edge_idx) =
-                                    self.graph.find_edge(finished_idx, child_idx)
-                                {
-                                    self.graph[edge_idx].edge_type == "error"
-                                } else {
-                                    false
-                                }
-                            })
-                            .collect();
-
-                        if !error_children.is_empty() {
-                            // Route error to error handler nodes instead of failing
-                            let error_payload = serde_json::json!({
-                                "__error": true,
-                                "error_message": error_msg,
-                                "failed_node": self.node_labels.get(&finished_id).cloned().unwrap_or_else(|| finished_id.to_string()),
-                            });
-                            results.insert(finished_id, error_payload.clone());
-                            tracing::info!(
-                                node_id = %finished_id,
-                                error_handlers = error_children.len(),
-                                "Node failed but has error handler edges — routing to error handlers"
-                            );
-
-                            // If this was a chain execution, also clear pending for
-                            // interior chain nodes.
-                            if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
-                                for &n in &chains[chain_idx] {
-                                    pending.insert(n, 0);
-                                }
-                            }
-
-                            // Unblock ONLY error-edge children; skip default/conditional children.
-                            // Default-edge children should NOT fire when the node fails.
-                            for child in self
-                                .graph
-                                .neighbors_directed(finished_idx, Direction::Outgoing)
-                            {
-                                // Check if ANY edge to this child is an error edge
-                                let has_error_edge = self
-                                    .graph
-                                    .edges_connecting(finished_idx, child)
-                                    .any(|e| e.weight().edge_type == "error");
-                                if !has_error_edge {
-                                    // Skip default/conditional children — parent failed, success path is dead
-                                    let child_id = self.graph[child];
-                                    results
-                                        .insert(child_id, serde_json::json!({"__skipped": true}));
-                                    continue;
-                                }
-
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 {
-                                        *cnt -= 1;
-                                    }
-
-                                    // FanIn early-ready logic
-                                    if let Some((
-                                        _,
-                                        _,
-                                        Some(SystemNodeKind::FanIn { ref join_mode, .. }),
-                                    )) = self.node_meta.get(&self.graph[child])
-                                    {
-                                        let total_parents = self
-                                            .graph
-                                            .neighbors_directed(child, Direction::Incoming)
-                                            .count();
-                                        let completed_parents = total_parents - *cnt;
-                                        match join_mode {
-                                            JoinMode::Any => {
-                                                if *cnt > 0 {
-                                                    pending.insert(child, 0);
-                                                }
-                                            }
-                                            JoinMode::Majority => {
-                                                if completed_parents > total_parents / 2 && *cnt > 0
-                                                {
-                                                    pending.insert(child, 0);
-                                                }
-                                            }
-                                            JoinMode::N(n) => {
-                                                if completed_parents >= *n as usize && *cnt > 0 {
-                                                    pending.insert(child, 0);
-                                                }
-                                            }
-                                            JoinMode::All => {} // default behavior
-                                        }
-                                    }
-
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                        } else if self
-                            .node_configs
-                            .get(&finished_id)
-                            .and_then(|c| c.get("__continue_on_error"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            // continue_on_error: store error result but don't fail the workflow
-                            tracing::info!(
-                                node_id = %finished_id,
-                                "Node failed but continue_on_error is set — continuing execution"
-                            );
-                            results.insert(
-                                finished_id,
-                                serde_json::json!({
-                                    "__error": true,
-                                    "error_message": error_msg,
-                                    "__continued": true,
-                                }),
-                            );
-                            // Unblock successors (same as success path)
-                            for child in self
-                                .graph
-                                .neighbors_directed(finished_idx, Direction::Outgoing)
-                            {
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 {
-                                        *cnt -= 1;
-                                    }
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                        } else {
-                            // No error handlers — notify the lifecycle hook (DLQ +
-                            // sibling-cancellation responsibility) and propagate
-                            // failure. The hook spawns both SQL writes so they
-                            // don't delay the abort return.
-                            if let Some(hook) = self.node_hook.as_ref() {
-                                let node_label =
-                                    self.node_labels.get(&finished_id).map(String::as_str);
-                                let module_id =
-                                    self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
-                                hook.on_node_failed(
-                                    talos_workflow_engine_core::NodeCompletionContext {
-                                        workflow_id: self.workflow_id.unwrap_or(execution_id),
-                                        execution_id,
-                                        node_id: finished_id,
-                                        node_label,
-                                        module_id,
-                                        actor_id: self.actor_id,
-                                        wall_time_ms: 0,
-                                    },
-                                    &error_msg,
-                                    results.get(&finished_id),
-                                );
-                            }
-                            let node_label = self
-                                .node_labels
-                                .get(&finished_id)
-                                .cloned()
-                                .unwrap_or_else(|| finished_id.to_string());
-                            // Clear prefetch cache before returning so unconsumed WASM
-                            // modules (potentially MBs each) are not retained in the
-                            // engine's Arc for the lifetime of the caller.
-                            self.module_prefetch_cache.clear();
-                            return Err(format!("node '{}' failed: {}", node_label, error_msg));
-                        }
-                    }
-                }
+                self.handle_completed_future(
+                    finished_idx,
+                    exec_result,
+                    execution_id,
+                    0,
+                    Some((&chains, &node_to_chain)),
+                    &exec_ctx,
+                    &mut results,
+                    &mut pending,
+                    &mut ready,
+                )
+                .await?;
             }
         }
 
@@ -5083,12 +5174,18 @@ impl ParallelWorkflowEngine {
                 continue;
             }
 
+            // Await next finished task. The seeded scheduler tracks
+            // per-node wall time through `node_start_times` /
+            // `node_timings` and threads `wall_time_ms` through the
+            // post-completion hook. It has no chain context
+            // (`chains_ctx = None`) because seeded resume dispatches
+            // each node individually.
             if let Some((finished_idx, exec_result)) = executing.next().await {
-                // Record per-node timing and stash the elapsed time so the
-                // post-completion hook can report accurate wall_time_ms.
                 let wall_time_ms = if let Some(start) = node_start_times.remove(&finished_idx) {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let label = self.node_labels.get(&self.graph[finished_idx])
+                    let label = self
+                        .node_labels
+                        .get(&self.graph[finished_idx])
                         .cloned()
                         .unwrap_or_else(|| self.graph[finished_idx].to_string());
                     node_timings.insert(label, elapsed_ms);
@@ -5096,317 +5193,18 @@ impl ParallelWorkflowEngine {
                 } else {
                     0
                 };
-                let finished_id = self.graph[finished_idx];
-                match exec_result {
-                    Ok(output) => {
-                        // Log node_completed event synchronously so child node_started
-                        // events (which are fire-and-forget) are always ordered after
-                        // this insert in the DB — fixes causally-inconsistent timelines.
-                        if let Some(ref sink) = self.event_sink {
-                            sink.emit(NodeEventWrite {
-                                execution_id,
-                                event_type: "node_completed".to_string(),
-                                node_id: Some(finished_id),
-                                status: "Completed".to_string(),
-                                log_message: None,
-                                iteration_index: None,
-                            })
-                            .await;
-                        }
-                        // Per-node output size guard (mirrors the same check in run()).
-                        const MAX_NODE_OUTPUT_BYTES_SEED: usize = 5 * 1024 * 1024; // 5 MiB
-                        let output = match serde_json::to_vec(&output) {
-                            Ok(bytes) if bytes.len() > MAX_NODE_OUTPUT_BYTES_SEED => {
-                                tracing::warn!(
-                                    node_id = %finished_id,
-                                    bytes = bytes.len(),
-                                    "Node output exceeds 5 MiB limit (run_with_seed) — replacing with error"
-                                );
-                                serde_json::json!({
-                                    "__error": true,
-                                    "error": format!(
-                                        "Node output too large ({} bytes > {} byte limit).",
-                                        bytes.len(), MAX_NODE_OUTPUT_BYTES_SEED
-                                    )
-                                })
-                            }
-                            _ => output,
-                        };
-                        let mut output = output;
-                        sanitize_node_output(&mut output);
-                        results.insert(finished_id, output.clone());
-
-                        // Post-completion hook: drives fuel attribution +
-                        // __memory_write__ persistence. See `run()` for the
-                        // matching call; shared trait keeps both loops in sync.
-                        if let Some(hook) = self.node_hook.as_ref() {
-                            let node_label =
-                                self.node_labels.get(&finished_id).map(String::as_str);
-                            let module_id = self
-                                .node_meta
-                                .get(&finished_id)
-                                .and_then(|(m, _, _)| *m);
-                            hook.on_node_completed(
-                                talos_workflow_engine_core::NodeCompletionContext {
-                                    workflow_id: self.workflow_id.unwrap_or(execution_id),
-                                    execution_id,
-                                    node_id: finished_id,
-                                    node_label,
-                                    module_id,
-                                    actor_id: self.actor_id,
-                                    wall_time_ms,
-                                },
-                                &output,
-                            );
-                        }
-
-                        // On SUCCESS, skip error-edge children (they only fire on failure).
-                        for child in self
-                            .graph
-                            .neighbors_directed(finished_idx, Direction::Outgoing)
-                        {
-                            let is_error_edge = self.graph.edges_connecting(finished_idx, child)
-                                .any(|e| e.weight().edge_type == "error");
-                            if is_error_edge {
-                                let child_id = self.graph[child];
-                                results.insert(child_id, serde_json::json!({"__skipped": true}));
-                                continue;
-                            }
-                            if let Some(cnt) = pending.get_mut(&child) {
-                                *cnt -= 1;
-
-                                // FanIn early-ready logic: some join modes don't
-                                // require ALL parents to complete.
-                                if let Some((_, _, Some(SystemNodeKind::FanIn { ref join_mode, .. }))) =
-                                    self.node_meta.get(&self.graph[child])
-                                {
-                                    let total_parents = self.graph
-                                        .neighbors_directed(child, Direction::Incoming)
-                                        .count();
-                                    let completed_parents = total_parents - *cnt;
-                                    match join_mode {
-                                        JoinMode::Any => {
-                                            if *cnt > 0 {
-                                                pending.insert(child, 0);
-                                            }
-                                        }
-                                        JoinMode::Majority => {
-                                            if completed_parents > total_parents / 2 && *cnt > 0 {
-                                                pending.insert(child, 0);
-                                            }
-                                        }
-                                        JoinMode::N(n) => {
-                                            if completed_parents >= *n as usize && *cnt > 0 {
-                                                pending.insert(child, 0);
-                                            }
-                                        }
-                                        JoinMode::All => {} // default behavior
-                                    }
-                                }
-
-                                if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                    // Check edge conditions before enqueuing.
-                                    let child_node_id = self.graph[child];
-                                    let mut condition_failed = false;
-                                    for edge_ref in self.graph.edges_connecting(finished_idx, child) {
-                                        tracing::debug!(
-                                            condition = ?edge_ref.weight().condition,
-                                            edge_type = %edge_ref.weight().edge_type,
-                                            child = %child_node_id,
-                                            "Evaluating edge"
-                                        );
-                                        if let Some(ref cond) = edge_ref.weight().condition {
-                                            if !self.eval_bool(cond, Self::unwrap_output(&output)) {
-                                                condition_failed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if condition_failed {
-                                        tracing::info!(
-                                            node_id = %child_node_id,
-                                            "Skipping node: edge condition evaluated to false"
-                                        );
-                                        // Store a skip marker so downstream nodes know this path was not taken.
-                                        results.insert(child_node_id, serde_json::json!({"__skipped": true}));
-                                        // Cascade skip: decrement pending counts for the skipped node's children.
-                                        for grandchild in self.graph.neighbors_directed(child, Direction::Outgoing) {
-                                            if let Some(gc_cnt) = pending.get_mut(&grandchild) {
-                                                if *gc_cnt > 0 {
-                                                    *gc_cnt -= 1;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error_msg) => {
-                        // Two-pass scrub: value-based (known secrets) then regex DLP patterns.
-                        let error_msg = self.redact_str(
-                            &exec_ctx
-                                .as_ref()
-                                .map(|c| c.redact_error(&error_msg))
-                                .unwrap_or_else(|| error_msg.clone()),
-                        );
-                        // Log node_failed event synchronously — same ordering guarantee
-                        // as node_completed: child routing happens after this commit.
-                        if let Some(ref sink) = self.event_sink {
-                            sink.emit(NodeEventWrite {
-                                execution_id,
-                                event_type: "node_failed".to_string(),
-                                node_id: Some(finished_id),
-                                status: "Failed".to_string(),
-                                log_message: Some(error_msg.clone()),
-                                iteration_index: None,
-                            })
-                            .await;
-                        }
-                        // Check if this node has outgoing "error" edges
-                        let error_children: Vec<NodeIndex> = self.graph
-                            .neighbors_directed(finished_idx, Direction::Outgoing)
-                            .filter(|&child_idx| {
-                                if let Some(edge_idx) = self.graph.find_edge(finished_idx, child_idx) {
-                                    self.graph[edge_idx].edge_type == "error"
-                                } else {
-                                    false
-                                }
-                            })
-                            .collect();
-
-                        if !error_children.is_empty() {
-                            // Route error to error handler nodes instead of failing
-                            let error_payload = serde_json::json!({
-                                "__error": true,
-                                "error_message": error_msg,
-                                "failed_node": self.node_labels.get(&finished_id).cloned().unwrap_or_else(|| finished_id.to_string()),
-                            });
-                            results.insert(finished_id, error_payload.clone());
-                            tracing::info!(
-                                node_id = %finished_id,
-                                error_handlers = error_children.len(),
-                                "Node failed but has error handler edges — routing to error handlers"
-                            );
-
-                            // Unblock ONLY error-edge children; skip default/conditional children.
-                            // Default-edge children should NOT fire when the node fails.
-                            for child in self
-                                .graph
-                                .neighbors_directed(finished_idx, Direction::Outgoing)
-                            {
-                                // Check if ANY edge to this child is an error edge
-                                let has_error_edge = self.graph.edges_connecting(finished_idx, child)
-                                    .any(|e| e.weight().edge_type == "error");
-                                if !has_error_edge {
-                                    // Skip default/conditional children — parent failed, success path is dead
-                                    let child_id = self.graph[child];
-                                    results.insert(child_id, serde_json::json!({"__skipped": true}));
-                                    continue;
-                                }
-
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 {
-                                        *cnt -= 1;
-                                    }
-
-                                    // FanIn early-ready logic
-                                    if let Some((_, _, Some(SystemNodeKind::FanIn { ref join_mode, .. }))) =
-                                        self.node_meta.get(&self.graph[child])
-                                    {
-                                        let total_parents = self.graph
-                                            .neighbors_directed(child, Direction::Incoming)
-                                            .count();
-                                        let completed_parents = total_parents - *cnt;
-                                        match join_mode {
-                                            JoinMode::Any => {
-                                                if *cnt > 0 {
-                                                    pending.insert(child, 0);
-                                                }
-                                            }
-                                            JoinMode::Majority => {
-                                                if completed_parents > total_parents / 2 && *cnt > 0 {
-                                                    pending.insert(child, 0);
-                                                }
-                                            }
-                                            JoinMode::N(n) => {
-                                                if completed_parents >= *n as usize && *cnt > 0 {
-                                                    pending.insert(child, 0);
-                                                }
-                                            }
-                                            JoinMode::All => {} // default behavior
-                                        }
-                                    }
-
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                        } else if self.node_configs.get(&finished_id)
-                            .and_then(|c| c.get("__continue_on_error"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            // continue_on_error: store error result but don't fail the workflow
-                            tracing::info!(
-                                node_id = %finished_id,
-                                "Node failed but continue_on_error is set — continuing execution"
-                            );
-                            results.insert(finished_id, serde_json::json!({
-                                "__error": true,
-                                "error_message": error_msg,
-                                "__continued": true,
-                            }));
-                            // Unblock successors (same as success path)
-                            for child in self.graph.neighbors_directed(finished_idx, Direction::Outgoing) {
-                                if let Some(cnt) = pending.get_mut(&child) {
-                                    if *cnt > 0 {
-                                        *cnt -= 1;
-                                    }
-                                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                                        ready.push_back(child);
-                                    }
-                                }
-                            }
-                        } else {
-                            // No error handlers — notify the lifecycle hook (DLQ +
-                            // sibling-cancellation) and propagate failure. Matches
-                            // the run() path above; shared trait keeps both loops
-                            // consistent.
-                            if let Some(hook) = self.node_hook.as_ref() {
-                                let node_label =
-                                    self.node_labels.get(&finished_id).map(String::as_str);
-                                let module_id = self
-                                    .node_meta
-                                    .get(&finished_id)
-                                    .and_then(|(m, _, _)| *m);
-                                hook.on_node_failed(
-                                    talos_workflow_engine_core::NodeCompletionContext {
-                                        workflow_id: self.workflow_id.unwrap_or(execution_id),
-                                        execution_id,
-                                        node_id: finished_id,
-                                        node_label,
-                                        module_id,
-                                        actor_id: self.actor_id,
-                                        wall_time_ms: 0,
-                                    },
-                                    &error_msg,
-                                    results.get(&finished_id),
-                                );
-                            }
-                            let node_label = self.node_labels.get(&finished_id)
-                                .cloned()
-                                .unwrap_or_else(|| finished_id.to_string());
-                            // Clear prefetch cache before returning so unconsumed WASM
-                            // modules are not retained beyond the failing execution.
-                            self.module_prefetch_cache.clear();
-                            return Err(format!("node '{}' failed: {}", node_label, error_msg));
-                        }
-                    }
-                }
+                self.handle_completed_future(
+                    finished_idx,
+                    exec_result,
+                    execution_id,
+                    wall_time_ms,
+                    None,
+                    &exec_ctx,
+                    &mut results,
+                    &mut pending,
+                    &mut ready,
+                )
+                .await?;
             }
         }
 
