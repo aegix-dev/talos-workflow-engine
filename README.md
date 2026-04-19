@@ -15,7 +15,7 @@ for dispatching to remote worker pools.
 - You're running a **WASM module executor** (wasmtime or similar)
   and want a pluggable DAG scheduler that speaks your module format
   natively via `WasmModuleArtifact` + signed NATS dispatch.
-- You need **durable-ish execution** — checkpoint/resume on `Wait`
+- You need **checkpoint-based execution** — pause/resume on `Wait`
   nodes, retry-with-classifier, per-attempt observability — but
   don't want to run a Temporal server.
 
