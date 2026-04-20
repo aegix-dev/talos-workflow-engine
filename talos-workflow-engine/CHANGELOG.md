@@ -39,12 +39,15 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 
 ### Changed
 
-- Added public accessor methods on `ParallelWorkflowEngine`:
-  `graph()`, `node_map()`, `node_labels()`, `node_configs()`,
-  `node_meta()`, `execution_timeout_secs()`, and `dry_run()`. These are
-  the canonical public API for reading engine state. The corresponding
-  struct fields are `#[doc(hidden)]` and will become private in a
-  future minor release; callers should migrate to the accessors.
+- **Breaking**: the `ParallelWorkflowEngine` fields previously marked
+  `#[doc(hidden)] pub` — `graph`, `node_map`, `node_labels`,
+  `node_configs`, `node_meta`, `execution_timeout_secs`, `dry_run` —
+  are now `pub(crate)`. The accessor methods added in the previous
+  pass (same names, called as methods) are the canonical public API.
+  A new `set_execution_timeout_secs` setter complements the existing
+  `set_dry_run` / `set_user_id` setters for mutation. Out-of-tree
+  callers still accessing the fields directly will see a compile
+  error; migrate to the accessor or setter.
 - Internal source reorganisation: `engine.rs` (was 8,967 lines) split
   into `chain_detect` (linear-chain detection), `graph_parser` (JSON →
   `SystemNodeKind` decoding, retry-policy parsing), `sandbox`

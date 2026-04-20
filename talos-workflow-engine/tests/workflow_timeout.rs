@@ -131,7 +131,7 @@ fn engine_with_timeout(
     );
     engine.set_module_fetcher(fetcher);
     engine.set_user_id(Uuid::new_v4());
-    engine.execution_timeout_secs = secs;
+    engine.set_execution_timeout_secs(secs);
     engine
 }
 

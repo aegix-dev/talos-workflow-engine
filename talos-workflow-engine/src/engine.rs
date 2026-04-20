@@ -214,23 +214,21 @@ impl JudgeVerdict {
 /// [`node_map`](Self::node_map), [`node_labels`](Self::node_labels),
 /// [`node_configs`](Self::node_configs), [`node_meta`](Self::node_meta),
 /// [`execution_timeout_secs`](Self::execution_timeout_secs), and
-/// [`dry_run`](Self::dry_run). The corresponding struct fields are
-/// `#[doc(hidden)]` and will become private in a future minor release;
-/// new code should use the accessors.
+/// [`dry_run`](Self::dry_run). Write access uses the dedicated
+/// setters ([`set_user_id`](Self::set_user_id),
+/// [`set_execution_timeout_secs`](Self::set_execution_timeout_secs),
+/// [`set_dry_run`](Self::set_dry_run), etc.). The underlying fields
+/// are `pub(crate)` — not part of the public API surface.
 pub struct ParallelWorkflowEngine {
-    #[doc(hidden)]
-    pub graph: DiGraph<Uuid, EdgeLogic>,
-    #[doc(hidden)]
-    pub node_map: HashMap<Uuid, NodeIndex>,
+    pub(crate) graph: DiGraph<Uuid, EdgeLogic>,
+    pub(crate) node_map: HashMap<Uuid, NodeIndex>,
     /// Maps internal node UUIDs back to user-defined node IDs (e.g., "n1", "fetch").
     /// Populated by `load_graph_from_json`. Used to label output with user-friendly keys.
-    #[doc(hidden)]
-    pub node_labels: HashMap<Uuid, String>,
+    pub(crate) node_labels: HashMap<Uuid, String>,
     /// Per-node configuration from the workflow graph. Merged into the module
     /// config when dispatching jobs, so template modules receive the config
     /// the user specified at workflow creation time.
-    #[doc(hidden)]
-    pub node_configs: HashMap<Uuid, serde_json::Value>,
+    pub(crate) node_configs: HashMap<Uuid, serde_json::Value>,
     /// Pluggable resolver for the wasm module artifact that a node dispatches.
     /// In production wraps [`ModuleRegistry`] (which owns the 4-level fallback
     /// pipeline). Tests and out-of-tree consumers plug in their own impl.
@@ -261,8 +259,7 @@ pub struct ParallelWorkflowEngine {
     /// engine is running in a test/fallback context without a real registry.
     user_id: Option<Uuid>,
     /// Per-node metadata: maps node UUID to (module_id, retry_policy, kind).
-    #[doc(hidden)]
-    pub node_meta: HashMap<
+    pub(crate) node_meta: HashMap<
         Uuid,
         (
             Option<Uuid>,
@@ -271,8 +268,7 @@ pub struct ParallelWorkflowEngine {
         ),
     >,
     /// Maximum execution time for the entire workflow in seconds. Default: 300 (5 minutes).
-    #[doc(hidden)]
-    pub execution_timeout_secs: u64,
+    pub(crate) execution_timeout_secs: u64,
     /// Per-module rate limits (requests per minute), loaded at graph init time.
     rate_limits: HashMap<Uuid, i32>,
     /// Per-node execution timeout in seconds. Overrides the default 30-second timeout.
@@ -300,8 +296,7 @@ pub struct ParallelWorkflowEngine {
     sub_workflow_cache: HashMap<Uuid, JsonValue>,
     /// When true, non-GET HTTP requests are mocked in the worker (returns 200 with dry_run metadata).
     /// Propagated to each JobRequest so the worker can intercept side effects.
-    #[doc(hidden)]
-    pub dry_run: bool,
+    pub(crate) dry_run: bool,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
     /// cost rollups attribute to the right workflow row, not the
@@ -474,9 +469,9 @@ impl ParallelWorkflowEngine {
     // Accessors for internal engine state.
     //
     // These are the canonical public API for reading engine state.
-    // The corresponding struct fields are `#[doc(hidden)]` and will
-    // become private in a future minor release — new code should not
-    // access them directly.
+    // The underlying struct fields are `pub(crate)` — not part of the
+    // public API surface. Write access (where appropriate) uses the
+    // dedicated setters on this impl block.
     // ──────────────────────────────────────────────────────────────
 
     /// The directed graph of nodes connected by [`EdgeLogic`] edges.
@@ -529,9 +524,22 @@ impl ParallelWorkflowEngine {
     /// Workflow-level execution timeout in seconds. Default `300`
     /// (five minutes); overridden by the graph-root
     /// `execution_timeout_secs` field when a graph is loaded.
+    ///
+    /// When `> 0` the scheduler wraps the reactor in
+    /// [`tokio::time::timeout`] — a runaway workflow (pathological
+    /// retry loop, stuck `Wait` dispatch, etc.) can't hold resources
+    /// past this cap. Setting to `0` opts out of the wall-clock cap;
+    /// per-node timeouts become the only safety net.
     #[must_use]
     pub fn execution_timeout_secs(&self) -> u64 {
         self.execution_timeout_secs
+    }
+
+    /// Override the workflow-level execution timeout. See
+    /// [`execution_timeout_secs`](Self::execution_timeout_secs) for
+    /// the field's contract.
+    pub fn set_execution_timeout_secs(&mut self, secs: u64) {
+        self.execution_timeout_secs = secs;
     }
 
     /// Whether side-effectful dispatches are mocked out. See
