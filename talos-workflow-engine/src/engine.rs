@@ -4314,9 +4314,28 @@ impl ParallelWorkflowEngine {
     /// wholesale refactor; the public wrappers promote failures to
     /// [`crate::WorkflowEngineError`].
     ///
+    /// # Tracing
+    ///
+    /// The method is instrumented with a `workflow` span carrying
+    /// `execution_id`, `workflow_id` (when the engine has one), and a
+    /// `seeded` flag distinguishing fresh runs from resumed ones.
+    /// Every `tracing` event emitted inside the reactor — per-node
+    /// dispatch, retry, failure, completion — inherits the span, so
+    /// production log pipelines can correlate without having to
+    /// string-match UUIDs across lines.
+    ///
     /// [`run_with_transport`]: Self::run_with_transport
     /// [`run_with_seed_with_transport`]: Self::run_with_seed_with_transport
     #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(
+        name = "workflow",
+        skip_all,
+        fields(
+            execution_id = %execution_id,
+            workflow_id = ?self.workflow_id,
+            seeded = !initial_results.is_empty(),
+        ),
+    )]
     async fn run_inner(
         &self,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
