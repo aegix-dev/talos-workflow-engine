@@ -86,6 +86,30 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
   error-edge routing, `continue_on_error`, and scheduler-fatal
   failure propagation). The public API is unchanged apart from the
   additions noted above.
+- **Behavior change**: the two scheduler bodies
+  (`run_with_transport_inner` and `run_with_seed_with_transport_inner`,
+  previously independent) have been unified into one `run_inner`
+  method. Both public entry points (`run_with_transport` and
+  `run_with_seed_with_transport`) now delegate to it with
+  `initial_results` as the only difference. This resolves three
+  observability / safety drifts where the seeded path had features
+  the fresh path was silently missing:
+    * **`execution_timeout_secs` is now enforced on both paths.**
+      Previously only the seeded path wrapped the reactor in
+      `tokio::time::timeout`; the fresh path ignored the field
+      entirely, meaning a runaway workflow (pathological retry loop,
+      stuck `Wait` dispatch, etc.) could hold resources indefinitely
+      even when `execution_timeout_secs` was set. Set to `0` to opt
+      out of the workflow-level timeout; per-node timeouts remain the
+      only safety net in that case. Default is unchanged (300 s).
+    * **`WorkflowContext.node_timings` is now populated on both
+      paths.** Previously `run_with_transport` returned an empty map;
+      only `run_with_seed_with_transport` tracked per-node wall time.
+    * **`node_started` events are now emitted on both paths.**
+      Previously only the seeded path emitted them.
+  Pipeline chain detection still runs only when `initial_results` is
+  empty — a seeded resume would otherwise build chains spanning
+  already-completed nodes and re-dispatch them.
 - **Breaking** (behavior, not signature): `load_from_graph_json`
   (sync, `&Value`) and `load_graph_from_json` (async, `&str`) now share
   a single authoritative parser. The sync entry point previously

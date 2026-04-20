@@ -4227,33 +4227,140 @@ impl ParallelWorkflowEngine {
         if petgraph::algo::is_cyclic_directed(&self.graph) {
             return Err(crate::WorkflowEngineError::GraphCyclic);
         }
-        self.run_with_transport_inner(dispatcher, worker_shared_key, execution_id)
+        self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id)
             .await
             .map_err(crate::WorkflowEngineError::execution)
     }
 
-    /// Internal body of [`Self::run_with_transport`]. Kept on a
-    /// `String` error type so the (large) scheduling loop can use `?`
-    /// against pre-existing internal `Result<_, String>` paths
-    /// without wholesale refactor; the public wrapper promotes
-    /// failures to [`crate::WorkflowEngineError`] and adds the
-    /// typed-variant checks for documented failure modes.
-    async fn run_with_transport_inner(
+    /// Execute the graph with pre-seeded node results (e.g., from a webhook trigger).
+    ///
+    /// `initial_results` maps node UUIDs to their pre-computed output.
+    /// Nodes in this map are treated as already completed; only their
+    /// successors (and successors' successors) are executed.
+    ///
+    /// Uses single-node dispatch — the pipeline chain optimisation is
+    /// not applied when resuming from seed because the chain detector
+    /// would build chains spanning already-completed nodes and
+    /// re-dispatch them.
+    ///
+    /// # Errors
+    ///
+    /// Same error contract as [`Self::run_with_transport`].
+    pub fn run_with_seed_with_transport(
         &self,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        initial_results: HashMap<Uuid, JsonValue>,
+        execution_id: Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>>
+                + Send
+                + '_,
+        >,
+    > {
+        // Abstract-entry guard: mirrors `run_with_transport`. See
+        // `WorkflowEngineError::SecretsResolverMissing` for rationale.
+        if self.secrets_resolver.is_none() {
+            return Box::pin(async move { Err(crate::WorkflowEngineError::SecretsResolverMissing) });
+        }
+        if petgraph::algo::is_cyclic_directed(&self.graph) {
+            return Box::pin(async move { Err(crate::WorkflowEngineError::GraphCyclic) });
+        }
+        let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
+        Box::pin(async move { inner.await.map_err(crate::WorkflowEngineError::execution) })
+    }
+
+    /// Unified scheduler body shared by [`run_with_transport`] and
+    /// [`run_with_seed_with_transport`].
+    ///
+    /// The two entry points previously had separate ~2,000-line
+    /// scheduler bodies that drifted on observability (the seeded path
+    /// tracked per-node wall time and emitted `node_started` events;
+    /// the fresh path did neither) and on timeout behavior (the
+    /// seeded path enforced the workflow-level
+    /// `execution_timeout_secs`; the fresh path ignored it entirely).
+    /// The unified body enforces the more careful set of behaviors
+    /// uniformly:
+    ///
+    /// * **Workflow-level timeout.** When `execution_timeout_secs > 0`
+    ///   the scheduler is wrapped in [`tokio::time::timeout`]. This
+    ///   prevents a runaway workflow (pathological retry loop, stuck
+    ///   `Wait` dispatch, etc.) from holding resources forever even
+    ///   when per-node timeouts are configured. Set
+    ///   `execution_timeout_secs = 0` to disable.
+    /// * **Per-node wall-time tracking.** Always populated on the
+    ///   returned [`WorkflowContext::node_timings`], regardless of
+    ///   entry point. Previously only populated by the seeded path.
+    /// * **`node_started` events.** Always emitted before a
+    ///   single-node future is pushed to `executing`. Previously only
+    ///   emitted by the seeded path.
+    ///
+    /// Pipeline chain detection still runs only when
+    /// `initial_results.is_empty()` — seeded resumes would otherwise
+    /// build chains spanning already-completed nodes and re-dispatch
+    /// them.
+    ///
+    /// Kept on a `String` error type so the reactor loop can use `?`
+    /// against the internal `Result<_, String>` paths without
+    /// wholesale refactor; the public wrappers promote failures to
+    /// [`crate::WorkflowEngineError`].
+    ///
+    /// [`run_with_transport`]: Self::run_with_transport
+    /// [`run_with_seed_with_transport`]: Self::run_with_seed_with_transport
+    #[allow(clippy::too_many_lines)]
+    async fn run_inner(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
     ) -> Result<WorkflowContext, String> {
-        // Build the execution-scoped DLP context once — used to value-scrub output/errors
-        // before DB storage. Regex patterns are applied on top in a second pass.
-        // Per-run DLP sanitizer — built once from resolved node configs
-        // and used to scrub error messages before persistence. Stateless
-        // regex-based scrubs (crate::dlp::redact_*) run in a second pass
-        // on top via `self.redact_str` / `self.redact_json`.
+        let timeout_secs = self.execution_timeout_secs;
+        let scheduler = self.run_scheduler_loop(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+        );
+        if timeout_secs == 0 {
+            // Explicitly opted out of workflow-level timeout —
+            // per-node timeouts are the only safety net.
+            scheduler.await
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                scheduler,
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_) => Err(format!(
+                    "Workflow execution timed out after {timeout_secs} seconds"
+                )),
+            }
+        }
+    }
+
+    /// The actual reactor loop, lifted out of [`run_inner`] so the
+    /// timeout wrap in that method can treat the entire scheduler as
+    /// a single future.
+    #[allow(clippy::too_many_lines)]
+    async fn run_scheduler_loop(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        initial_results: HashMap<Uuid, JsonValue>,
+        execution_id: Uuid,
+    ) -> Result<WorkflowContext, String> {
+        // Per-run DLP sanitizer — built once from resolved node
+        // configs and used to scrub error messages before persistence.
+        // Stateless regex-based scrubs (crate::dlp::redact_*) run in a
+        // second pass on top via `self.redact_str` / `self.redact_json`.
         let exec_ctx = self.new_execution_sanitizer();
 
-        // Create temporary sandboxed directory for this execution.
-        // _sandbox_guard ensures the directory is removed even if this task panics.
+        // Create per-execution sandboxed directory. The RAII guard
+        // removes the directory even on panic.
         let (execution_sandbox, _sandbox_guard) = match self.sandbox_root.as_deref() {
             Some(base) => match create_execution_sandbox(base, execution_id) {
                 Ok((sandbox, sandbox_path)) => {
@@ -4277,17 +4384,22 @@ impl ParallelWorkflowEngine {
             None => (None, None),
         };
 
-        // Verify DAG – simple cycle check.
+        // Cycle check.
         if petgraph::algo::is_cyclic_directed(&self.graph) {
             return Err("Workflow contains a cycle".into());
         }
 
-        // Detect linear chains for pipeline optimisation.
-        let chains = detect_linear_chains(&self.graph);
+        let is_fresh_run = initial_results.is_empty();
 
-        // Build a lookup: NodeIndex → chain index (for O(1) chain membership check).
+        // Pipeline chain detection runs ONLY on fresh runs. On seeded
+        // resume the detector would build chains spanning
+        // already-completed nodes and re-dispatch them.
+        let chains: Vec<Vec<NodeIndex>> = if is_fresh_run {
+            detect_linear_chains(&self.graph)
+        } else {
+            Vec::new()
+        };
         let mut node_to_chain: HashMap<NodeIndex, usize> = HashMap::new();
-        // Track which node is the *head* of each chain (for ready-queue dedup).
         let mut chain_heads: HashSet<NodeIndex> = HashSet::new();
         for (chain_idx, chain) in chains.iter().enumerate() {
             chain_heads.insert(chain[0]);
@@ -4298,28 +4410,55 @@ impl ParallelWorkflowEngine {
 
         // In-degree counter.
         let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
-        let mut ready: VecDeque<NodeIndex> = VecDeque::new();
         for idx in self.graph.node_indices() {
             let deps = self
                 .graph
                 .neighbors_directed(idx, Direction::Incoming)
                 .count();
             pending.insert(idx, deps);
-            if deps == 0 {
+        }
+
+        // Seed results and pre-propagate pending counts for already-
+        // completed (seeded) nodes. The fresh-run case sees an empty
+        // `initial_results` and this whole block is a no-op.
+        let mut results: HashMap<Uuid, JsonValue> = initial_results;
+        let seeded: HashSet<Uuid> = results.keys().copied().collect();
+        for &node_id in &seeded {
+            if let Some(&node_idx) = self.node_map.get(&node_id) {
+                pending.insert(node_idx, 0);
+                for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
+                    if let Some(cnt) = pending.get_mut(&child) {
+                        if *cnt > 0 {
+                            *cnt -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initial ready queue: zero-pending nodes that weren't seeded.
+        // Edge-condition evaluation happens in the reactor loop AFTER
+        // nodes produce output, not here at seed time (seeded nodes may
+        // be synthetic triggers whose output doesn't contain the fields
+        // conditions reference).
+        let mut ready: VecDeque<NodeIndex> = VecDeque::new();
+        for idx in self.graph.node_indices() {
+            let node_id = self.graph[idx];
+            if pending.get(&idx).copied().unwrap_or(1) == 0 && !seeded.contains(&node_id) {
                 ready.push_back(idx);
             }
         }
 
-        let mut results: HashMap<Uuid, JsonValue> = HashMap::new();
-        // Use trait objects so we can push both pipeline-chain futures and
-        // single-node futures (which are different concrete async block types).
+        // Trait-object futures so we can push both pipeline-chain and
+        // single-node futures (different concrete async block types).
         let mut executing: FuturesUnordered<ExecFuture<'_>> = FuturesUnordered::new();
+        let mut node_timings: HashMap<String, u64> = HashMap::new();
+        let mut node_start_times: HashMap<NodeIndex, std::time::Instant> = HashMap::new();
 
         // Main reactor loop.
         while !ready.is_empty() || !executing.is_empty() {
-            // Spawn ready nodes / chains.
             while let Some(node_idx) = ready.pop_front() {
-                // ── Pipeline dispatch (chain head) ───────────────────────────
+                // ── Pipeline dispatch (chain head, fresh runs only) ──────
                 if let Some(&chain_idx) = node_to_chain.get(&node_idx) {
                     // Only dispatch when we're at the chain head; non-
                     // head chain nodes roll up under the head's
@@ -4349,511 +4488,6 @@ impl ParallelWorkflowEngine {
                     continue;
                 }
 
-                let node_id = self.graph[node_idx];
-
-                // ── Skip condition check (applies to ALL node kinds) ─────────
-                if let Some(output) =
-                    self.check_skip_condition(node_idx, node_id, execution_id, &results)
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── FanIn aggregation (local computation, no dispatch) ───────
-                if let Some(output) = self.try_dispatch_fan_in(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Collect dispatch (local computation — chain reactor) ─────
-                if let Some(output) =
-                    self.try_dispatch_collect(node_idx, node_id, execution_id, &results)
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Synthesize dispatch (collect + optional Rhai synthesis) ──
-                if let Some(output) =
-                    self.try_dispatch_synthesize(node_idx, node_id, execution_id, &results)
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Verify dispatch (step-level output verification) ─────────
-                if let Some(output) =
-                    self.try_dispatch_verify(node_idx, node_id, execution_id, &results)
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Judge dispatch (LLM-as-Judge evaluation) ─────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_judge(node_idx, node_id, &dispatcher, &worker_shared_key, &results)
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Ensemble dispatch (self-consistency / ensemble voting) ────
-                #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_ensemble(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── ConfidenceGate dispatch ───────────────────────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some(outcome) = self
-                    .try_dispatch_confidence_gate(node_idx, node_id, execution_id, &results)
-                    .await
-                {
-                    use crate::scheduler_handlers::ConfidenceGateOutcome;
-                    match outcome {
-                        ConfidenceGateOutcome::Proceed(output) => {
-                            results.insert(node_id, output);
-                            self.unblock_successors(node_idx, &mut pending, &mut ready);
-                            continue;
-                        }
-                        ConfidenceGateOutcome::Pause { waiting_output } => {
-                            // Pending approval — pause execution with the
-                            // fully-accumulated results map so resume sees
-                            // every completed node's output.
-                            results.insert(node_id, waiting_output);
-                            return Ok(WorkflowContext {
-                                results,
-                                waiting: true,
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-
-                // ── ReflectiveRetry dispatch ──────────────────────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_reflective_retry(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── LlmDispatch dispatch (LLM-based routing) ──────────────────
-                #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_llm_dispatch(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── AgentLoop dispatch (ReAct-style iterative sub-workflow execution) ──
-                #[cfg(feature = "llm-primitives")]
-                if let Some(output) = self
-                    .try_dispatch_agent_loop(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── WhileLoop dispatch (local computation) ──────────────────
-                if let Some(output) = self.try_dispatch_while_loop(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── RepeatLoop dispatch (local computation) ─────────────────
-                if let Some(output) = self.try_dispatch_repeat_loop(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── SubWorkflow dispatch (real execution) ─────────────────
-                if let Some(output) = self
-                    .try_dispatch_sub_workflow(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── DynamicDispatch (Rhai expression → target sub-workflow) ──
-                if let Some(output) = self
-                    .try_dispatch_dynamic_dispatch(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── CapabilityDispatch (match workflow by capability tags) ──
-                if let Some(output) = self
-                    .try_dispatch_capability_dispatch(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    // Capability-dispatch failures are scheduler-fatal unless
-                    // the node opts in to `continue_on_error`. The check
-                    // lives at the caller because the handler itself stays
-                    // policy-neutral: it returns the `__error` envelope and
-                    // lets the scheduler decide whether to propagate.
-                    if output
-                        .get("__error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        let continue_on_error = self
-                            .node_configs
-                            .get(&node_id)
-                            .and_then(|c| c.get("__continue_on_error"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if !continue_on_error {
-                            let err_msg = output
-                                .get("error_message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("capability dispatch failed")
-                                .to_string();
-                            tracing::error!(
-                                %node_id,
-                                error = %err_msg,
-                                "Capability dispatch failed — failing workflow"
-                            );
-                            return Err(format!(
-                                "Capability dispatch node {node_id}: {err_msg}"
-                            ));
-                        }
-                        tracing::info!(
-                            %node_id,
-                            "Capability dispatch failed but continue_on_error is set — continuing"
-                        );
-                    }
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Loop dispatch (re-dispatches body node while condition is true) ──
-                if let Some(output) = self
-                    .try_dispatch_loop(
-                        node_idx,
-                        node_id,
-                        execution_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── ErrorHandler dispatch (pattern filtering) ───────────────
-                // `None` return means "pattern matched (or unset) — fall
-                // through to regular single-node dispatch below." `Some`
-                // means the pattern didn't match and the handler is
-                // short-circuited with a `__skipped` envelope.
-                if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results)
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                // ── Single-node dispatch ─────────────────────────────────────
-                if let Some(error_envelope) = self.check_rate_limit(node_id) {
-                    results.insert(node_id, error_envelope);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
-                    continue;
-                }
-
-                let inputs = self.gather_inputs(node_idx, &results);
-                let accumulated_snapshot =
-                    Self::build_accumulated_context(&self.node_labels, &results);
-                let fut = self.run_single_node_dispatch(
-                    node_idx,
-                    node_id,
-                    execution_id,
-                    dispatcher.clone(),
-                    worker_shared_key.clone(),
-                    inputs,
-                    accumulated_snapshot,
-                    execution_sandbox.clone(),
-                );
-                executing.push(Box::pin(fut));
-
-                // Speculative module prefetch (P10) — kick off background
-                // fetch tasks for direct successors. See the handler's
-                // module docs for the safety caps.
-                self.maybe_speculative_prefetch(node_id, node_idx);
-                continue;
-            }
-
-            // Await next finished task and route its outcome through
-            // the shared post-completion handler. Primary scheduler
-            // passes its chain context so interior-chain pending
-            // clears correctly; `wall_time_ms` is 0 because this path
-            // doesn't measure per-node wall time (the seeded scheduler
-            // does).
-            if let Some((finished_idx, exec_result)) = executing.next().await {
-                self.handle_completed_future(
-                    finished_idx,
-                    exec_result,
-                    execution_id,
-                    0,
-                    Some((&chains, &node_to_chain)),
-                    &exec_ctx,
-                    &mut results,
-                    &mut pending,
-                    &mut ready,
-                )
-                .await?;
-            }
-        }
-
-        // Two-pass scrub: value-based then regex DLP patterns.
-        // Prevents secrets from node configs being stored in the execution trace.
-        let results: HashMap<Uuid, JsonValue> = results
-            .into_iter()
-            .map(|(k, v)| {
-                let v = exec_ctx.as_ref().map(|c| c.redact_output(&v)).unwrap_or(v);
-                (k, self.redact_json(&v))
-            })
-            .collect();
-
-        // Release any unconsumed prefetch cache entries — skipped branches leave
-        // stale WASM bytebuffers (potentially MBs each) in memory indefinitely.
-        self.module_prefetch_cache.clear();
-
-        Ok(WorkflowContext {
-            results,
-            ..Default::default()
-        })
-    }
-
-    /// Execute the graph with pre-seeded node results (e.g., from a webhook trigger).
-    ///
-    /// `initial_results` maps node UUIDs to their pre-computed output.  Nodes in
-    /// this map are treated as already completed; only their successors (and
-    /// successors' successors) are executed.
-    ///
-    /// Uses single-node dispatch — the pipeline chain optimisation is not applied,
-    /// keeping the implementation simple for trigger-based workflow runs.
-    ///
-    /// # Errors
-    ///
-    /// Same error contract as [`Self::run_with_transport`].
-    pub fn run_with_seed_with_transport(
-        &self,
-        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
-        initial_results: HashMap<Uuid, JsonValue>,
-        execution_id: Uuid,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>>
-                + Send
-                + '_,
-        >,
-    > {
-        // Abstract-entry guard: mirrors `run_with_transport`. See
-        // `WorkflowEngineError::SecretsResolverMissing` for rationale.
-        if self.secrets_resolver.is_none() {
-            return Box::pin(async move { Err(crate::WorkflowEngineError::SecretsResolverMissing) });
-        }
-        if petgraph::algo::is_cyclic_directed(&self.graph) {
-            return Box::pin(async move { Err(crate::WorkflowEngineError::GraphCyclic) });
-        }
-        let inner = self.run_with_seed_with_transport_inner(
-            dispatcher,
-            worker_shared_key,
-            initial_results,
-            execution_id,
-        );
-        Box::pin(async move { inner.await.map_err(crate::WorkflowEngineError::execution) })
-    }
-
-    /// Internal body of [`Self::run_with_seed_with_transport`]. Kept
-    /// on a `String` error type so the (large) scheduling loop can
-    /// use `?` against pre-existing internal `Result<_, String>`
-    /// paths without wholesale refactor; the public wrapper promotes
-    /// failures to [`crate::WorkflowEngineError`] and adds the
-    /// typed-variant checks for documented failure modes.
-    fn run_with_seed_with_transport_inner(
-        &self,
-        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
-        initial_results: HashMap<Uuid, JsonValue>,
-        execution_id: Uuid,
-    ) -> Pin<Box<dyn Future<Output = Result<WorkflowContext, String>> + Send + '_>> {
-        let timeout_secs = self.execution_timeout_secs;
-        // Build the execution-scoped DLP context before the closure captures `self` by reference.
-        // It is moved into the async closure and used to value-scrub output/errors before persistence.
-        // Per-run DLP sanitizer — built once from resolved node configs
-        // and used to scrub error messages before persistence. Stateless
-        // regex-based scrubs (crate::dlp::redact_*) run in a second pass
-        // on top via `self.redact_str` / `self.redact_json`.
-        let exec_ctx = self.new_execution_sanitizer();
-        // Clone so the `async move` closure owns it without borrowing `self`.
-        let sandbox_root = self.sandbox_root.clone();
-        Box::pin(async move {
-            let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-            let result = tokio::time::timeout(timeout_duration, async {
-        let (execution_sandbox, _sandbox_guard) = match sandbox_root.as_deref() {
-            Some(base) => match create_execution_sandbox(base, execution_id) {
-                Ok((sandbox, sandbox_path)) => {
-                    tracing::debug!("Created execution sandbox: {}", execution_id);
-                    (
-                        Some(sandbox),
-                        Some(SandboxGuard {
-                            execution_id,
-                            sandbox_path,
-                        }),
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to create execution sandbox: {}. File I/O will be unavailable.",
-                        e
-                    );
-                    (None, None)
-                }
-            },
-            None => (None, None),
-        };
-
-        if petgraph::algo::is_cyclic_directed(&self.graph) {
-            return Err("Workflow contains a cycle".into());
-        }
-
-        // Initialise Kahn's in-degree counter.
-        let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
-        for idx in self.graph.node_indices() {
-            let deps = self
-                .graph
-                .neighbors_directed(idx, Direction::Incoming)
-                .count();
-            pending.insert(idx, deps);
-        }
-
-        // Pre-seed results and propagate pending counts to unblock successors.
-        let mut results: HashMap<Uuid, JsonValue> = initial_results;
-
-        // Store original trigger input for passthrough to all downstream nodes.
-        // This allows any node to access the original trigger data via the
-        // `__trigger_input__` key in its input payload.
-        // Seeded trigger input is preserved in `results` — the inline
-        // dispatch switch previously read it via `_trigger_input__` on
-        // gathered inputs; the extracted handlers access `results`
-        // directly so no prelude needed here.
-        let _trigger_input: JsonValue =
-            results.values().next().cloned().unwrap_or(serde_json::json!({}));
-
-        let seeded: HashSet<Uuid> = results.keys().cloned().collect();
-        for &node_id in &seeded {
-            if let Some(&node_idx) = self.node_map.get(&node_id) {
-                pending.insert(node_idx, 0);
-                for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                    if let Some(cnt) = pending.get_mut(&child) {
-                        if *cnt > 0 {
-                            *cnt -= 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build initial ready queue: nodes with 0 pending deps that were NOT pre-seeded.
-        // Condition evaluation happens in the reactor loop AFTER nodes produce output,
-        // not here at seed time (seeded nodes may be synthetic triggers whose output
-        // doesn't contain the fields conditions reference).
-        let mut ready: VecDeque<NodeIndex> = VecDeque::new();
-        for idx in self.graph.node_indices() {
-            let node_id = self.graph[idx];
-            if pending.get(&idx).copied().unwrap_or(1) == 0 && !seeded.contains(&node_id) {
-                ready.push_back(idx);
-            }
-        }
-
-        let mut executing: FuturesUnordered<ExecFuture<'_>> = FuturesUnordered::new();
-        let mut node_timings: HashMap<String, u64> = HashMap::new();
-        let mut node_start_times: HashMap<NodeIndex, std::time::Instant> = HashMap::new();
-
-        // DB pool for execution event logging (fire-and-forget)
-
-        // Main reactor loop — single-node dispatch (no pipeline chain
-        // optimisation; the seeded-resume path dispatches each node
-        // individually because chain detection was performed on the
-        // original workflow, not the residual ready set).
-        while !ready.is_empty() || !executing.is_empty() {
-            while let Some(node_idx) = ready.pop_front() {
                 let node_id = self.graph[node_idx];
 
                 // ── Skip condition check (applies to ALL node kinds) ─────────
@@ -5065,10 +4699,6 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    // Capability-dispatch failures are scheduler-fatal unless
-                    // the node opts in to `continue_on_error`. The check
-                    // lives at the caller because the handler itself stays
-                    // policy-neutral.
                     if output
                         .get("__error")
                         .and_then(|v| v.as_bool())
@@ -5150,10 +4780,9 @@ impl ParallelWorkflowEngine {
                     accumulated_snapshot,
                     execution_sandbox.clone(),
                 );
-                // Seed-path timing + node_started event: tracked only on
-                // the seeded scheduler because the returned
-                // `WorkflowContext.node_timings` is observable by callers
-                // resuming via `run_with_seed_with_transport`.
+                // Per-node timing + node_started event: always emitted
+                // so callers using WorkflowContext.node_timings get
+                // data regardless of entry point.
                 node_start_times.insert(node_idx, std::time::Instant::now());
                 emit_event_spawn(
                     &self.event_sink,
@@ -5174,12 +4803,10 @@ impl ParallelWorkflowEngine {
                 continue;
             }
 
-            // Await next finished task. The seeded scheduler tracks
-            // per-node wall time through `node_start_times` /
-            // `node_timings` and threads `wall_time_ms` through the
-            // post-completion hook. It has no chain context
-            // (`chains_ctx = None`) because seeded resume dispatches
-            // each node individually.
+            // Await next finished task and route its outcome through
+            // the shared post-completion handler. Chain context is
+            // passed only when chain detection actually ran
+            // (fresh-run path); seeded runs supply `None`.
             if let Some((finished_idx, exec_result)) = executing.next().await {
                 let wall_time_ms = if let Some(start) = node_start_times.remove(&finished_idx) {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -5193,12 +4820,17 @@ impl ParallelWorkflowEngine {
                 } else {
                     0
                 };
+                let chains_ctx = if is_fresh_run {
+                    Some((chains.as_slice(), &node_to_chain))
+                } else {
+                    None
+                };
                 self.handle_completed_future(
                     finished_idx,
                     exec_result,
                     execution_id,
                     wall_time_ms,
-                    None,
+                    chains_ctx,
                     &exec_ctx,
                     &mut results,
                     &mut pending,
@@ -5212,27 +4844,19 @@ impl ParallelWorkflowEngine {
         let results: HashMap<Uuid, JsonValue> = results
             .into_iter()
             .map(|(k, v)| {
-                let v = exec_ctx
-                    .as_ref()
-                    .map(|c| c.redact_output(&v))
-                    .unwrap_or(v);
+                let v = exec_ctx.as_ref().map(|c| c.redact_output(&v)).unwrap_or(v);
                 (k, self.redact_json(&v))
             })
             .collect();
 
-        // Release unconsumed prefetch cache entries (skipped branches).
+        // Release unconsumed prefetch cache entries.
         self.module_prefetch_cache.clear();
 
-        Ok(WorkflowContext { results, node_timings, ..Default::default() })
-        }).await; // tokio::time::timeout
-            match result {
-                Ok(inner) => inner,
-                Err(_) => Err(format!(
-                    "Workflow execution timed out after {} seconds",
-                    timeout_secs
-                )),
-            }
-        }) // Box::pin(async move { ... })
+        Ok(WorkflowContext {
+            results,
+            node_timings,
+            ..Default::default()
+        })
     }
 }
 
