@@ -1,0 +1,105 @@
+name: bench
+
+# Scheduler-bench regression detection. Runs on PRs targeting `main`
+# and on direct pushes to `main` itself. Compares the current run
+# against a baseline restored from cache (keyed on the merge-base
+# commit of `main`); if the cache misses, the baseline is captured
+# fresh and uploaded so the next run has something to compare to.
+#
+# Documented end-to-end in docs/benchmarking.md. Override the noise
+# threshold via the BENCH_NOISE env (default 10%).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # Only run on PRs that touch the engine surface — bench runs are
+    # ~3 minutes and gating every doc/spelling PR on them is
+    # excessive. Adjust paths if more crates grow scheduler-relevant
+    # code.
+    paths:
+      - 'talos-workflow-engine/**'
+      - 'talos-workflow-engine-core/**'
+      - 'talos-workflow-job-protocol/**'
+      - '.github/workflows/bench.yml'
+      - 'scripts/bench-*.sh'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Default noise threshold for bench-check.sh; override per-PR via
+  # GitHub repo variables if a perf-sensitive change needs a tighter
+  # gate.
+  BENCH_NOISE: "0.10"
+  BENCH_BASELINE: main
+
+jobs:
+  bench:
+    name: scheduler bench regression check
+    runs-on: ubuntu-latest
+    # Don't gate the merge queue on bench failures while the workflow
+    # is settling in. Switch to false once we're confident the
+    # baseline cache is reliable.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so we can compute the merge-base for
+          # cache-key derivation.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bench artifacts go under target/release; cache them too
+          # so we don't recompile dependencies for the bench harness
+          # on every PR.
+          shared-key: bench
+
+      # Determine the SHA we're baselining against. For PRs that's
+      # the merge-base with the target branch; for pushes to main
+      # it's the previous commit on main.
+      - name: Resolve baseline SHA
+        id: baseline
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              SHA=$(git merge-base HEAD origin/${{ github.base_ref }})
+          else
+              SHA=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "baselining against $SHA"
+
+      # Restore the criterion baseline directory if we have one for
+      # this base commit. A cache miss means we'll capture and upload
+      # a fresh baseline at the end of the job (so the next PR
+      # against the same base can compare against it).
+      - name: Restore criterion baseline
+        id: cache-baseline
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ steps.baseline.outputs.sha }}
+
+      # If we have a baseline → compare against it. If not → just
+      # capture one. Either way, store the result for the next run.
+      - name: Run bench check (vs cached baseline)
+        if: steps.cache-baseline.outputs.cache-hit == 'true'
+        run: ./scripts/bench-check.sh
+
+      - name: Capture fresh baseline (cache miss)
+        if: steps.cache-baseline.outputs.cache-hit != 'true'
+        run: |
+          echo "no baseline cached for ${{ steps.baseline.outputs.sha }};"
+          echo "capturing one for next run."
+          ./scripts/bench-baseline.sh
+
+      # On `push` to main, re-save the baseline so subsequent PRs
+      # against the new HEAD can find it.
+      - name: Update baseline cache (push to main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ github.sha }}

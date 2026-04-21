@@ -9,11 +9,120 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{LazyLock, OnceLock};
 
-/// Global rate-limit counter: module_id -> (window_start, request_count).
-/// Shared across all concurrent engine runs so rate limits are enforced globally.
-/// Eviction: entries older than 5 minutes are pruned when the map exceeds 1000 entries.
-static MODULE_RATE_LIMITS: LazyLock<dashmap::DashMap<uuid::Uuid, (std::time::Instant, u32)>> =
-    LazyLock::new(dashmap::DashMap::new);
+/// Wrap a scheduler future in the workflow-level wall-clock cap and
+/// produce the typed [`crate::WorkflowEngineError`] result.
+///
+/// Lifted out of `run_inner` so the timeout sentinel can be
+/// constructed with the configured `secs` value directly, matching
+/// the [`crate::WorkflowEngineError::Timeout`] variant's contract,
+/// without forcing the inner reactor body to thread a typed error.
+///
+/// `secs == 0` opts out of the wall-clock cap entirely (per-node
+/// timeouts remain the only safety net). Non-zero wraps with
+/// [`tokio::time::timeout`].
+async fn run_with_workflow_timeout(
+    secs: u64,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    fut: impl std::future::Future<Output = Result<talos_workflow_engine_core::WorkflowContext, String>>,
+) -> Result<talos_workflow_engine_core::WorkflowContext, crate::WorkflowEngineError> {
+    // Race the inner scheduler against:
+    // 1. The optional caller-supplied cancellation token (returns
+    //    `WorkflowEngineError::Cancelled`).
+    // 2. The workflow-level wall-clock cap (returns `Timeout`).
+    // 3. The inner scheduler's own completion (returns its result).
+    //
+    // `tokio::pin!` keeps the future on the stack so it can be polled
+    // from within `select!` without needing `Box::pin`. The cancel
+    // branch is only enabled when a token was provided — using
+    // `if let Some(...)` inside `select!` would require pre-cloning
+    // the token, so we branch above instead.
+    tokio::pin!(fut);
+    let timeout_dur = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+
+    let inner_result: Result<Result<_, String>, ()> = match (cancel, timeout_dur) {
+        (Some(token), Some(dur)) => tokio::select! {
+            biased; // honour cancellation before timeout if both fire same tick
+            () = token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
+            r = tokio::time::timeout(dur, &mut fut) => match r {
+                Ok(inner) => Ok(inner),
+                Err(_) => return Err(crate::WorkflowEngineError::Timeout { secs }),
+            },
+        },
+        (Some(token), None) => tokio::select! {
+            biased;
+            () = token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
+            inner = &mut fut => Ok(inner),
+        },
+        (None, Some(dur)) => match tokio::time::timeout(dur, fut).await {
+            Ok(inner) => Ok(inner),
+            Err(_) => return Err(crate::WorkflowEngineError::Timeout { secs }),
+        },
+        (None, None) => Ok(fut.await),
+    };
+    match inner_result {
+        Ok(Ok(ctx)) => Ok(ctx),
+        Ok(Err(e)) => Err(crate::WorkflowEngineError::execution(e)),
+        // Unreachable in practice — the early returns above cover
+        // both cancel + timeout. Kept so the match is exhaustive.
+        Err(()) => Err(crate::WorkflowEngineError::Cancelled),
+    }
+}
+
+/// Process-global per-module rate-limit counter:
+/// `module_id -> (window_start, request_count)`.
+///
+/// **Why global?** Rate limits are typically capacity guards for the
+/// underlying *resource* (an LLM provider key, a downstream API
+/// quota), not the workflow run that touches it. A single key with
+/// `60 RPM` should still be capped at 60 RPM whether one workflow or
+/// twenty hit it concurrently. Per-engine state would let a sharded
+/// fleet trivially exceed the cap by spreading dispatches across
+/// instances.
+///
+/// **Lifecycle.** Entries are inserted by [`check_rate_limit`] on the
+/// first dispatch for a given module and rolled over on each 60-
+/// second window boundary. Stale entries are pruned by a background
+/// tokio task spawned idempotently from
+/// [`ensure_rate_limit_eviction_task`] — every
+/// [`RATE_LIMIT_EVICTION_INTERVAL_SECS`] (60 s) it runs
+/// [`evict_stale_rate_limits`], which prunes entries older than
+/// [`RATE_LIMIT_STALE_SECS`] (≥ 300 s) when the map exceeds
+/// [`RATE_LIMIT_MAX_ENTRIES`] (1 000). The map is process-static —
+/// there is no runtime way to drop it short of restarting the
+/// process or calling [`reset_global_rate_limits`].
+///
+/// **Test isolation.** Tests that depend on counter values use
+/// [`reset_global_rate_limits`] between cases. Without this, a test
+/// that exercises the limit will leave the counter populated for the
+/// next test in the binary's run.
+///
+/// **Wanting per-engine instead?** Use a `NodeDispatcher` impl that
+/// tracks its own counters — the engine's check is a guardrail, not
+/// the only enforcement layer. The engine-level enforcement is
+/// process-global by design and a downstream limiter is the right
+/// place for tenant-scoped or worker-pool-scoped variants.
+pub(crate) static MODULE_RATE_LIMITS: LazyLock<
+    dashmap::DashMap<uuid::Uuid, (std::time::Instant, u32)>,
+> = LazyLock::new(dashmap::DashMap::new);
+
+/// Clear the process-global per-module rate-limit counters.
+///
+/// Use in tests that exercise the limit (and in long-lived tools that
+/// want to reset metering after a configuration reload). Production
+/// engines should not call this — it disables the rate-limit
+/// guarantees for any in-flight workflow until the counter
+/// reaccumulates.
+pub fn reset_global_rate_limits() {
+    MODULE_RATE_LIMITS.clear();
+}
+
+/// Number of entries currently held in the process-global rate-limit
+/// counter. Useful for tests and observability tooling that needs to
+/// confirm eviction is keeping the map bounded.
+#[must_use]
+pub fn global_rate_limit_entry_count() -> usize {
+    MODULE_RATE_LIMITS.len()
+}
 
 /// Default per-node execution timeout (in seconds) applied when a node's
 /// graph data doesn't carry an explicit `timeout_secs`.
@@ -34,14 +143,72 @@ pub static DEFAULT_NODE_TIMEOUT_SECS: LazyLock<u64> = LazyLock::new(|| {
         .unwrap_or(60)
 });
 
-/// Evict stale entries from MODULE_RATE_LIMITS when the map grows beyond the threshold.
-fn evict_stale_rate_limits() {
-    const MAX_ENTRIES: usize = 1000;
-    const STALE_SECS: u64 = 300;
-    if MODULE_RATE_LIMITS.len() > MAX_ENTRIES {
-        let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(STALE_SECS);
+/// Maximum entries the rate-limit counter retains before eviction
+/// kicks in. Tuned to be cheap to scan (`DashMap::retain` over ≤ 1000
+/// shards-worth of entries is sub-millisecond) while still letting a
+/// burst of distinct module ids accumulate without thrashing.
+const RATE_LIMIT_MAX_ENTRIES: usize = 1000;
+
+/// Window after which a stale rate-limit entry is eligible for
+/// eviction. Five minutes is well past the 60-second metering window
+/// the limiter itself uses, so a recently-active module never gets
+/// pruned mid-window.
+const RATE_LIMIT_STALE_SECS: u64 = 300;
+
+/// How often the background eviction task wakes up to scan
+/// [`MODULE_RATE_LIMITS`]. 60 seconds matches the metering window —
+/// at most one scan per window is enough to keep the map bounded
+/// even under steady-state burst.
+const RATE_LIMIT_EVICTION_INTERVAL_SECS: u64 = 60;
+
+/// Evict stale entries from [`MODULE_RATE_LIMITS`] when the map grows
+/// beyond [`RATE_LIMIT_MAX_ENTRIES`].
+///
+/// Lifted out of the hot path (used to run inline on every
+/// `check_rate_limit` invocation, even when the map was tiny). Now
+/// invoked from the background task spawned by
+/// [`ensure_rate_limit_eviction_task`]. Leaving the function `pub(crate)`
+/// + free for tests that want to force an immediate scan.
+pub(crate) fn evict_stale_rate_limits() {
+    if MODULE_RATE_LIMITS.len() > RATE_LIMIT_MAX_ENTRIES {
+        let cutoff =
+            std::time::Instant::now() - std::time::Duration::from_secs(RATE_LIMIT_STALE_SECS);
         MODULE_RATE_LIMITS.retain(|_, (window_start, _)| *window_start > cutoff);
     }
+}
+
+/// Spawn the background eviction task on first invocation of
+/// [`check_rate_limit`].
+///
+/// The task lives for the lifetime of the process — `OnceLock` makes
+/// it idempotent across concurrent first-callers. Each tick wakes
+/// after [`RATE_LIMIT_EVICTION_INTERVAL_SECS`] and runs
+/// [`evict_stale_rate_limits`].
+///
+/// **Why first-use lazy spawn?** The eviction task needs a tokio
+/// runtime, and the engine's `check_rate_limit` path is only ever
+/// reached from inside `run_with_transport` /
+/// `run_with_seed_with_transport` — both `async fn`s, both called
+/// from a tokio context by definition. Spawning at module-load time
+/// would panic for consumers that pull in `talos-workflow-engine`
+/// without a runtime (test-only paths, doc examples, etc.).
+pub(crate) fn ensure_rate_limit_eviction_task() {
+    static SPAWN_GUARD: OnceLock<()> = OnceLock::new();
+    SPAWN_GUARD.get_or_init(|| {
+        tokio::spawn(async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                RATE_LIMIT_EVICTION_INTERVAL_SECS,
+            ));
+            // First tick fires immediately; skip it so the very first
+            // scan happens after one full interval rather than at
+            // task start (when the map is guaranteed near-empty).
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                evict_stale_rate_limits();
+            }
+        });
+    });
 }
 
 // Alias to silence Clippy's `type_complexity` warning and improve readability.
@@ -52,19 +219,78 @@ type ExecFuture<'a> =
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Maximum number of successor nodes to speculatively prefetch per node.
-/// Prevents fan-out DoS when a single node has many outgoing edges.
-const MAX_PREFETCH_SUCCESSORS: usize = 8;
+/// Default for [`ParallelWorkflowEngine::max_prefetch_successors`] —
+/// the upper bound on successor nodes the engine will speculatively
+/// prefetch when a node opts in via `speculative_prefetch: true`.
+///
+/// 8 is enough for typical fan-out shapes (a few branches per node)
+/// without giving a pathological 1-to-N graph an easy `DoS` vector.
+/// Override per-engine via
+/// [`ParallelWorkflowEngine::set_max_prefetch_successors`].
+pub const DEFAULT_MAX_PREFETCH_SUCCESSORS: usize = 8;
 
-/// Maximum history entries maintained in AgentLoop's sliding window.
-/// Keeps the last N iteration outputs injected as `__agent_history__`.
-pub(crate) const AGENT_LOOP_MAX_HISTORY: usize = 20;
+/// Default for [`ParallelWorkflowEngine::max_workflow_nodes`] — the
+/// hard cap on `add_node` calls per engine instance. Prevents a
+/// malformed or adversarial graph from exhausting memory before
+/// dispatch starts.
+///
+/// 500 is well above any reasonable hand-authored workflow but small
+/// enough to make a runaway code-gen path obvious. Override per-engine
+/// via [`ParallelWorkflowEngine::set_max_workflow_nodes`].
+pub const DEFAULT_MAX_WORKFLOW_NODES: usize = 500;
+
+/// Default for [`ParallelWorkflowEngine::max_node_output_bytes`] — the
+/// per-node output size guard. Outputs over this limit get replaced
+/// with an `__error: true` envelope so the result map / accumulated
+/// snapshot can't blow up downstream.
+///
+/// 5 MiB covers every shape we've observed in production; larger
+/// outputs are almost always a bug (stringified binary, unfiltered
+/// query result, etc.). Override per-engine via
+/// [`ParallelWorkflowEngine::set_max_node_output_bytes`].
+pub const DEFAULT_MAX_NODE_OUTPUT_BYTES: usize = 5 * 1024 * 1024;
+
+/// Default for [`ParallelWorkflowEngine::max_fuel_per_node`] — the
+/// upper bound on Wasmtime fuel granted to any single dispatch.
+///
+/// Caps both per-node fuel overrides from the graph JSON and the
+/// module's declared fuel budget; a malicious or careless module
+/// can't request unbounded compute time. 50M corresponds to ~5 s of
+/// dense numeric work on the reference worker; HTTP-bound and LLM
+/// modules use a tiny fraction of this. Override per-engine via
+/// [`ParallelWorkflowEngine::set_max_fuel_per_node`].
+pub const DEFAULT_MAX_FUEL_PER_NODE: u64 = 50_000_000;
+
+/// Default for [`ParallelWorkflowEngine::agent_loop_max_history`] —
+/// the maximum number of prior-iteration outputs injected as
+/// `__agent_history__` on each `AgentLoop` / `ReActLoop` body
+/// invocation.
+///
+/// 20 is the calibrated default for `ReAct` chains with ~5 KiB outputs
+/// per step (the engine's typical workload). Larger windows raise per-
+/// iteration context cost; shorter windows lose context. Override per-
+/// engine with [`ParallelWorkflowEngine::set_agent_loop_max_history`].
+pub const DEFAULT_AGENT_LOOP_MAX_HISTORY: usize = 20;
+
+/// Default for [`ParallelWorkflowEngine::max_subflow_depth`] — the
+/// recursion-depth ceiling for sub-workflow dispatch.
+///
+/// Every sub-workflow handler hydrates a child engine via
+/// [`AdapterSet::into_engine_with_graph`]; that path increments the
+/// dispatch depth. A workflow that transitively references itself —
+/// or a sufficiently deep composition graph — would stack-overflow
+/// the reactor without this cap.
+///
+/// 16 is well above any hand-authored composition (deepest patterns
+/// observed in production are ~5: `AgentLoop` body containing a
+/// `Judge` whose rubric runs a sub-workflow). Override per-engine
+/// via [`ParallelWorkflowEngine::set_max_subflow_depth`].
+pub const DEFAULT_MAX_SUBFLOW_DEPTH: usize = 16;
 
 use crate::emit_event_spawn;
 use talos_workflow_engine_core::{
-    DispatchJob, EdgeLogic, EventSink, ExecutionStartedContext, JoinMode, ModuleFetcher,
-    NodeEventWrite, NodeLifecycleHook, SecretsResolver, SystemNodeKind,
-    WorkflowContext, WorkflowGraphStore,
+    EdgeLogic, EventSink, JoinMode, ModuleFetcher, NodeEventWrite, NodeLifecycleHook,
+    SecretsResolver, SystemNodeKind, WorkflowContext, WorkflowGraphStore,
 };
 
 // Checkpoint encryption + persistence is the responsibility of the
@@ -73,13 +299,16 @@ use talos_workflow_engine_core::{
 // holds only an `Arc<dyn CheckpointStore>` and never talks to a
 // database directly.
 
+use crate::graph_parser::{parse_system_node_kind, read_node_retry_policy_with_actor_cap};
+#[allow(deprecated)]
 pub use crate::sandbox::DEFAULT_SANDBOX_ROOT;
-use crate::graph_parser::{
-    parse_system_node_kind, read_node_retry_policy_with_actor_cap,
-};
 use crate::sandbox::{create_execution_sandbox, SandboxGuard};
+pub use crate::sandbox::{default_sandbox_root, DEFAULT_SANDBOX_DIR_NAME};
 use crate::secrets_pipeline::{build_encrypted_secrets_for, extract_vault_paths};
-use crate::validation::sanitize_node_output;
+// `sanitize_node_output` is used by `engine_completion::handle_node_success`
+// (the post-completion path). Re-imported there because the helper moved
+// out of this file; left without a use here so we don't pull a now-unused
+// import.
 
 pub(crate) use crate::chain_detect::detect_linear_chains;
 
@@ -93,15 +322,27 @@ pub(crate) use crate::chain_detect::detect_linear_chains;
 /// Callers convert these into their own error envelopes via
 /// [`SubflowError::into_error_envelope`] so each system-node kind can keep its
 /// own context-specific messages ("Judge workflow X not found", etc).
+///
+/// Marked [`#[non_exhaustive]`] so the engine can promote new failure modes
+/// (invalid ownership, schema-version mismatch, ...) into their own variants
+/// without breaking downstream `match` arms. Consumers should always include
+/// a wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SubflowError {
     /// Engine has no registry configured — sub-workflow execution impossible.
     NoRegistry,
-    /// Engine has no user_id — all sub-workflow execution requires it.
+    /// Engine has no `user_id` — all sub-workflow execution requires it.
     NoUserId,
     /// Secrets resolver not attached — sub-workflow modules couldn't fetch secrets.
     NoSecretsResolver,
-    /// No workflow matching `sub_wf_id` exists (or not visible to user_id).
+    /// No workflow matching `sub_wf_id` exists (or not visible to `user_id`).
+    ///
+    /// Typically means the referenced workflow was deleted after the
+    /// parent graph was authored, or the parent and sub-workflow are
+    /// owned by different users. Carries the missing ID so callers can
+    /// surface a precise diagnostic (e.g. "judge workflow X was
+    /// deleted; edit the parent to reference a valid judge").
     GraphNotFound(Uuid),
     /// `build_engine_from_graph_json_with_resolver` failed — usually a module resolution issue.
     BuildFailed(String),
@@ -133,18 +374,66 @@ impl SubflowError {
         };
         serde_json::json!({ "__error": true, "error_message": msg })
     }
+
+    /// Returns the missing sub-workflow id when this error is
+    /// [`GraphNotFound`](Self::GraphNotFound), else `None`.
+    ///
+    /// Callers that need to branch on "missing sub-workflow" without
+    /// exhaustively matching every variant (e.g. to surface a
+    /// structured `{kind: "sub_workflow_not_found", id}` response in
+    /// their API layer) can pattern-match on this accessor instead.
+    pub fn missing_sub_workflow_id(&self) -> Option<Uuid> {
+        match self {
+            SubflowError::GraphNotFound(id) => Some(*id),
+            _ => None,
+        }
+    }
 }
 
 /// Structured judge verdict parsed from a collapsed sub-workflow output.
 ///
-/// Downstream consumers (judge_node, ensemble best_of_n) want the same 4 fields;
+/// Downstream consumers (`judge_node`, ensemble `best_of_n`) want the same 4 fields;
 /// this struct centralizes parsing and logs when fields are missing so malformed
 /// judge workflows fail loudly rather than silently scoring 0.0.
-#[derive(Debug, Clone)]
+///
+/// # Using outside the engine's own dispatch paths
+///
+/// Third-party call sites (HTTP handlers, CLI tools, contract tests) that
+/// need to score a sub-workflow's output should construct one of these via
+/// [`from_collapsed`](Self::from_collapsed) rather than hand-parsing the
+/// JSON — otherwise the parse logic drifts from what the engine itself
+/// uses to score judge nodes, and malformed-verdict warnings stop firing.
+///
+/// ```no_run
+/// use serde_json::json;
+/// use talos_workflow_engine::JudgeVerdict;
+///
+/// let collapsed = json!({
+///     "score": 0.82,
+///     "passed": true,
+///     "reasoning": "meets the rubric",
+///     "feedback": "tighten the closing line",
+/// });
+/// let verdict = JudgeVerdict::from_collapsed(&collapsed);
+/// assert!(verdict.passed);
+/// assert_eq!(verdict.malformed_field_count, 0);
+/// ```
+///
+/// `Serialize` / `Deserialize` are implemented so the verdict can be
+/// shipped over an API without an intermediate conversion.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JudgeVerdict {
+    /// Verdict score in `0.0..=1.0`. Higher = better. Sub-workflow
+    /// outputs missing this field default to `0.0`.
     pub score: f64,
+    /// Did the upstream output pass the rubric? Sub-workflow outputs
+    /// missing this field default to `false`.
     pub passed: bool,
+    /// Human-readable explanation of the verdict. Used for audit
+    /// trails and downstream context.
     pub reasoning: String,
+    /// Suggested correction or improvement that downstream nodes
+    /// (e.g. `ReflectiveRetry`) can feed back into the next attempt.
     pub feedback: String,
     /// Number of expected fields that were missing or wrong-typed in the
     /// sub-workflow output (0..=4). Non-zero indicates a malformed judge workflow.
@@ -232,33 +521,33 @@ pub struct ParallelWorkflowEngine {
     /// Pluggable resolver for the wasm module artifact that a node dispatches.
     /// In production wraps [`ModuleRegistry`] (which owns the 4-level fallback
     /// pipeline). Tests and out-of-tree consumers plug in their own impl.
-    module_fetcher: Option<Arc<dyn ModuleFetcher>>,
+    pub(crate) module_fetcher: Option<Arc<dyn ModuleFetcher>>,
     /// Pluggable fire-and-forget sink for per-node execution events
     /// (`node_started`, `node_completed`, `node_failed`, retries, loop
     /// iterations, etc.). In production wraps `execution_events` table
     /// writes; tests can plug in a no-op or in-memory capture.
-    event_sink: Option<Arc<dyn EventSink>>,
+    pub(crate) event_sink: Option<Arc<dyn EventSink>>,
     /// Post-completion hook invoked after each node finalizes its
     /// output. In production drives fuel-cost attribution and the
     /// `__memory_write__` actor-memory protocol; tests can plug in a
     /// capture hook to assert per-node outputs.
-    node_hook: Option<Arc<dyn NodeLifecycleHook>>,
+    pub(crate) node_hook: Option<Arc<dyn NodeLifecycleHook>>,
     /// Pluggable read-only access to workflow graph definitions — used
     /// when the engine hits a sub-workflow-ish system node (sub-workflow,
     /// judge, ensemble child, agent-loop body, reflective-retry child,
     /// LLM-dispatch route, etc.) and needs to hydrate its body's
     /// `graph_json`. In production wraps `WorkflowRepository`.
-    graph_store: Option<Arc<dyn WorkflowGraphStore>>,
+    pub(crate) graph_store: Option<Arc<dyn WorkflowGraphStore>>,
     /// Pluggable secret resolver. All module-secret, vault-path, and LLM-key
     /// lookups — plus the pre-resolution OAuth refresh hook — flow through
     /// this trait object, which in production wraps a `SecretsManager`.
     /// Tests and out-of-tree consumers plug in their own implementation.
-    secrets_resolver: Option<Arc<dyn SecretsResolver>>,
+    pub(crate) secrets_resolver: Option<Arc<dyn SecretsResolver>>,
     /// Owner of the workflow execution — required to enforce module ownership
     /// when fetching WASM bytes/config from the registry. `None` means the
     /// engine is running in a test/fallback context without a real registry.
-    user_id: Option<Uuid>,
-    /// Per-node metadata: maps node UUID to (module_id, retry_policy, kind).
+    pub(crate) user_id: Option<Uuid>,
+    /// Per-node metadata: maps node UUID to (`module_id`, `retry_policy`, kind).
     pub(crate) node_meta: HashMap<
         Uuid,
         (
@@ -270,32 +559,32 @@ pub struct ParallelWorkflowEngine {
     /// Maximum execution time for the entire workflow in seconds. Default: 300 (5 minutes).
     pub(crate) execution_timeout_secs: u64,
     /// Per-module rate limits (requests per minute), loaded at graph init time.
-    rate_limits: HashMap<Uuid, i32>,
+    pub(crate) rate_limits: HashMap<Uuid, i32>,
     /// Per-node execution timeout in seconds. Overrides the default 30-second timeout.
     /// Loaded from `node.data.timeout_secs` or `node.timeout_secs` in the graph JSON.
-    node_timeouts: HashMap<Uuid, u64>,
-    /// Actor ID that owns this execution — used for __memory_write__ write-back.
-    actor_id: Option<Uuid>,
+    pub(crate) node_timeouts: HashMap<Uuid, u64>,
+    /// Actor ID that owns this execution — used for __`memory_write`__ write-back.
+    pub(crate) actor_id: Option<Uuid>,
     /// Actor memory context injected into every node's input as `__actor_context__`.
-    /// Populated by the scheduler or trigger_workflow when an actor owns the execution.
-    /// Enables LLM nodes to reference learned_preferences, persona, and other actor
+    /// Populated by the scheduler or `trigger_workflow` when an actor owns the execution.
+    /// Enables LLM nodes to reference `learned_preferences`, persona, and other actor
     /// state without per-workflow plumbing.
-    actor_context: Option<serde_json::Value>,
+    pub(crate) actor_context: Option<serde_json::Value>,
     /// Speculative module prefetch cache — populated by background fetch tasks when a node
     /// has `speculative_prefetch: true`. `fetch_module` checks here first to avoid a DB
     /// round-trip when the module was pre-loaded while a slow predecessor was executing.
-    module_prefetch_cache:
+    pub(crate) module_prefetch_cache:
         Arc<dashmap::DashMap<Uuid, talos_workflow_engine_core::WasmModuleArtifact>>,
-    /// Pre-fetched sub-workflow graphs, keyed by workflow_id.
+    /// Pre-fetched sub-workflow graphs, keyed by `workflow_id`.
     /// Populated at execution start to avoid N+1 queries during node dispatch.
-    /// Workflows referenced by SubWorkflow, AgentLoop, Ensemble, Judge,
-    /// ReflectiveRetry, LlmDispatch, and ReActLoop nodes are batch-loaded
-    /// in a single `WHERE id = ANY($1)` query. DynamicDispatch and
-    /// CapabilityDispatch resolve workflow IDs at runtime and fall back to
+    /// Workflows referenced by `SubWorkflow`, `AgentLoop`, Ensemble, Judge,
+    /// `ReflectiveRetry`, `LlmDispatch`, and `ReActLoop` nodes are batch-loaded
+    /// in a single `WHERE id = ANY($1)` query. `DynamicDispatch` and
+    /// `CapabilityDispatch` resolve workflow IDs at runtime and fall back to
     /// individual queries on cache miss.
-    sub_workflow_cache: HashMap<Uuid, JsonValue>,
-    /// When true, non-GET HTTP requests are mocked in the worker (returns 200 with dry_run metadata).
-    /// Propagated to each JobRequest so the worker can intercept side effects.
+    pub(crate) sub_workflow_cache: HashMap<Uuid, JsonValue>,
+    /// When true, non-GET HTTP requests are mocked in the worker (returns 200 with `dry_run` metadata).
+    /// Propagated to each `JobRequest` so the worker can intercept side effects.
     pub(crate) dry_run: bool,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
@@ -304,31 +593,33 @@ pub struct ParallelWorkflowEngine {
     /// (tests, one-off diagnostic runs) don't have a durable workflow —
     /// dispatch sites fall back to `execution_id` when this is unset,
     /// which matches the pre-extraction behavior.
-    workflow_id: Option<Uuid>,
+    pub(crate) workflow_id: Option<Uuid>,
     /// Pluggable evaluator for edge conditions, retry-delay expressions,
     /// and `Synthesize` expressions. In production wraps a `rhai::Engine`
     /// configured with sandbox limits; tests can plug in a no-op.
-    expression_evaluator: Option<Arc<dyn talos_workflow_engine_core::ExpressionEvaluator>>,
+    pub(crate) expression_evaluator:
+        Option<Arc<dyn talos_workflow_engine_core::ExpressionEvaluator>>,
     /// Pluggable output sanitizer — applied to node output / error
     /// strings before persistence. Production deployments typically
     /// wire a DLP-aware impl here; tests opt out via a passthrough.
-    output_sanitizer: Option<Arc<dyn talos_workflow_engine_core::OutputSanitizer>>,
+    pub(crate) output_sanitizer: Option<Arc<dyn talos_workflow_engine_core::OutputSanitizer>>,
     /// Pluggable classifier for dispatch-error strings. Tells the
     /// retry loop whether a given failure is worth retrying. In
     /// production wraps `retry_intelligence`.
-    retry_classifier: Option<Arc<dyn talos_workflow_engine_core::RetryClassifier>>,
+    pub(crate) retry_classifier: Option<Arc<dyn talos_workflow_engine_core::RetryClassifier>>,
     /// Pluggable per-dispatch audit log. Single-node + pipeline-step
     /// dispatch paths write a "running" row pre-dispatch and an
     /// "completed" / "failed" / "timeout" / "cancelled" row after the
     /// worker replies. In production writes to the `module_executions`
     /// Postgres table; tests plug in a capture impl.
-    module_execution_store: Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
+    pub(crate) module_execution_store:
+        Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
     /// Pluggable human-in-the-loop approval gate. Nodes whose module
     /// declares `requires_approval_for: [...]` route through this
     /// before dispatch to check / create a pending approval row.
     /// In production writes to `execution_approvals`; tests can plug
     /// in an auto-approve or auto-deny impl.
-    approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
+    pub(crate) approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
     /// Seals per-dispatch plaintext secrets into the opaque
     /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
     /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
@@ -339,7 +630,7 @@ pub struct ParallelWorkflowEngine {
     ///
     /// The field is non-optional so the engine never silently
     /// downgrades to plaintext secret transport on the wire.
-    secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
+    pub(crate) secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     /// Root directory under which per-execution scratch sandboxes are
     /// created. `Some(path)` → `<path>/<execution_id>` is created at
     /// run-start and torn down at run-end (RAII guard cleans up even on
@@ -347,11 +638,67 @@ pub struct ParallelWorkflowEngine {
     /// that request filesystem scratch space will observe `None` and
     /// fall back to in-memory paths.
     ///
-    /// Defaults to `Some(PathBuf::from(`[`DEFAULT_SANDBOX_ROOT`]`))`.
-    /// Use [`set_sandbox_root`](Self::set_sandbox_root) to change or
-    /// disable, e.g. when running on a read-only filesystem, Windows,
-    /// or a sandboxed container.
-    sandbox_root: Option<std::path::PathBuf>,
+    /// Defaults to `Some(`[`default_sandbox_root()`](crate::default_sandbox_root)`)` —
+    /// the platform-appropriate `<tmp>/workflow-engine-sandboxes`. Use
+    /// [`set_sandbox_root`](Self::set_sandbox_root) to change or
+    /// disable, e.g. when running on a read-only filesystem or a
+    /// locked-down container.
+    pub(crate) sandbox_root: Option<std::path::PathBuf>,
+    /// Sliding-window cap on `__agent_history__` injection inside
+    /// `AgentLoop` and `ReActLoop` bodies. Defaults to
+    /// [`DEFAULT_AGENT_LOOP_MAX_HISTORY`]. Override per-engine via
+    /// [`set_agent_loop_max_history`](Self::set_agent_loop_max_history).
+    pub(crate) agent_loop_max_history: usize,
+    /// Max successors prefetched per node when
+    /// `speculative_prefetch: true` is set on the node config.
+    /// Defaults to [`DEFAULT_MAX_PREFETCH_SUCCESSORS`].
+    pub(crate) max_prefetch_successors: usize,
+    /// Hard cap on `add_node` calls per engine instance. Defaults to
+    /// [`DEFAULT_MAX_WORKFLOW_NODES`]; calls past the cap emit a
+    /// warning and are dropped on the floor.
+    pub(crate) max_workflow_nodes: usize,
+    /// Per-node output size guard (bytes). Defaults to
+    /// [`DEFAULT_MAX_NODE_OUTPUT_BYTES`]; outputs over the limit get
+    /// replaced with an `__error: true` envelope so the result map /
+    /// accumulated snapshot can't blow up downstream.
+    pub(crate) max_node_output_bytes: usize,
+    /// Upper bound on Wasmtime fuel granted to any single dispatch.
+    /// Defaults to [`DEFAULT_MAX_FUEL_PER_NODE`]; caps both per-node
+    /// `max_fuel` overrides from the graph JSON and the module's
+    /// declared fuel budget.
+    pub(crate) max_fuel_per_node: u64,
+    /// Optional pluggable backing store for the per-module
+    /// rate-limit counter. When `None` (the default), the engine
+    /// uses the process-global in-memory `MODULE_RATE_LIMITS`
+    /// `DashMap` — fine for single-process deployments. When `Some`,
+    /// every `check_rate_limit` call routes through the trait
+    /// instead, letting a sharded fleet share a counter (Redis,
+    /// shared DB, etc.) so caps hold across replicas. See
+    /// [`set_rate_limit_store`](Self::set_rate_limit_store).
+    pub(crate) rate_limit_store: Option<Arc<dyn talos_workflow_engine_core::RateLimitStore>>,
+    /// Optional engine-level cancellation token. When set, the
+    /// non-`_cancellable` run methods (`run_with_transport`,
+    /// `run_with_seed_with_transport`) consult this token before
+    /// each dispatch and short-circuit with
+    /// [`crate::WorkflowEngineError::Cancelled`] if it fires.
+    /// Inherits through `AdapterSet` so sub-workflow loops see the
+    /// same cancel signal as the parent.
+    ///
+    /// The `_cancellable` variants take a token as a parameter
+    /// instead and ignore this field — useful when a single test
+    /// run needs to control cancellation without persisting it on
+    /// the engine. See
+    /// [`set_cancellation_token`](Self::set_cancellation_token).
+    pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// Recursion-depth ceiling for sub-workflow dispatch. Defaults
+    /// to [`DEFAULT_MAX_SUBFLOW_DEPTH`]. Override via
+    /// [`set_max_subflow_depth`](Self::set_max_subflow_depth).
+    pub(crate) max_subflow_depth: usize,
+    /// Current sub-workflow dispatch depth. `0` for the top-level
+    /// engine; `N` for a sub-engine `N` levels deep. Set by
+    /// [`AdapterSet::into_engine_with_graph`] when hydrating a
+    /// sub-engine from the parent's adapter set.
+    pub(crate) current_subflow_depth: usize,
 }
 
 impl Default for ParallelWorkflowEngine {
@@ -388,6 +735,15 @@ pub struct AdapterSet {
     actor_id: Option<Uuid>,
     dry_run: bool,
     sandbox_root: Option<std::path::PathBuf>,
+    agent_loop_max_history: usize,
+    max_prefetch_successors: usize,
+    max_workflow_nodes: usize,
+    max_node_output_bytes: usize,
+    max_fuel_per_node: u64,
+    rate_limit_store: Option<Arc<dyn talos_workflow_engine_core::RateLimitStore>>,
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    max_subflow_depth: usize,
+    current_subflow_depth: usize,
 }
 
 impl AdapterSet {
@@ -401,6 +757,20 @@ impl AdapterSet {
         self,
         graph_json: &JsonValue,
     ) -> Result<ParallelWorkflowEngine, crate::WorkflowEngineError> {
+        // Recursion-depth guard: every sub-workflow handler hydrates
+        // through this method (Judge, Ensemble, AgentLoop, …). The
+        // hydrated engine sits one dispatch level deeper than its
+        // parent. Reject before doing any work if the chain would
+        // exceed the configured ceiling — the alternative is a
+        // stack overflow (or unbounded resource consumption) when a
+        // workflow transitively references itself.
+        let next_depth = self.current_subflow_depth.saturating_add(1);
+        if next_depth > self.max_subflow_depth {
+            return Err(crate::WorkflowEngineError::SubflowRecursionLimit {
+                depth: next_depth,
+                limit: self.max_subflow_depth,
+            });
+        }
         let mut engine = self.into_engine();
         engine.load_from_graph_json(graph_json)?;
         Ok(engine)
@@ -427,12 +797,42 @@ impl AdapterSet {
         engine.actor_id = self.actor_id;
         engine.dry_run = self.dry_run;
         engine.sandbox_root = self.sandbox_root;
+        engine.agent_loop_max_history = self.agent_loop_max_history;
+        engine.max_prefetch_successors = self.max_prefetch_successors;
+        engine.max_workflow_nodes = self.max_workflow_nodes;
+        engine.max_node_output_bytes = self.max_node_output_bytes;
+        engine.max_fuel_per_node = self.max_fuel_per_node;
+        engine.rate_limit_store = self.rate_limit_store;
+        engine.cancellation_token = self.cancellation_token;
+        engine.max_subflow_depth = self.max_subflow_depth;
+        // The new engine is one level deeper than the parent. The
+        // depth check happens in `into_engine_with_graph`; this
+        // unguarded path is for tests / pre-load scenarios where
+        // the caller is responsible for not creating cycles.
+        engine.current_subflow_depth = self.current_subflow_depth.saturating_add(1);
         engine
     }
 }
 
-
 impl ParallelWorkflowEngine {
+    /// Construct a bare engine with no adapters wired and the
+    /// documented defaults for every limit / timeout / sandbox /
+    /// agent-loop history setting.
+    ///
+    /// A fresh engine cannot dispatch on its own —
+    /// [`run_with_transport`](Self::run_with_transport) refuses to
+    /// proceed until [`set_secrets_resolver`](Self::set_secrets_resolver)
+    /// has been called (and, for graphs containing module-backed
+    /// nodes, [`set_module_fetcher`](Self::set_module_fetcher) and
+    /// [`set_user_id`](Self::set_user_id)). The exact contract is
+    /// enforced by [`precheck_runnable`] and surfaced through typed
+    /// [`crate::WorkflowEngineError`] variants.
+    ///
+    /// For tests, prefer `talos_workflow_engine_test_utils::minimal_engine`
+    /// which returns an engine with every adapter wired to an
+    /// in-memory stub.
+    ///
+    /// [`precheck_runnable`]: Self::run_with_transport
     pub fn new() -> Self {
         Self {
             graph: DiGraph::new(),
@@ -461,7 +861,16 @@ impl ParallelWorkflowEngine {
             module_execution_store: None,
             approval_gate: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
-            sandbox_root: Some(std::path::PathBuf::from(DEFAULT_SANDBOX_ROOT)),
+            sandbox_root: Some(default_sandbox_root().to_path_buf()),
+            agent_loop_max_history: DEFAULT_AGENT_LOOP_MAX_HISTORY,
+            max_prefetch_successors: DEFAULT_MAX_PREFETCH_SUCCESSORS,
+            max_workflow_nodes: DEFAULT_MAX_WORKFLOW_NODES,
+            max_node_output_bytes: DEFAULT_MAX_NODE_OUTPUT_BYTES,
+            max_fuel_per_node: DEFAULT_MAX_FUEL_PER_NODE,
+            rate_limit_store: None,
+            cancellation_token: None,
+            max_subflow_depth: DEFAULT_MAX_SUBFLOW_DEPTH,
+            current_subflow_depth: 0,
         }
     }
 
@@ -528,18 +937,56 @@ impl ParallelWorkflowEngine {
     /// When `> 0` the scheduler wraps the reactor in
     /// [`tokio::time::timeout`] — a runaway workflow (pathological
     /// retry loop, stuck `Wait` dispatch, etc.) can't hold resources
-    /// past this cap. Setting to `0` opts out of the wall-clock cap;
-    /// per-node timeouts become the only safety net.
+    /// past this cap. `0` is a sentinel meaning "no wall-clock cap;
+    /// per-node timeouts are the only safety net" — see
+    /// [`execution_timeout`](Self::execution_timeout) for the typed
+    /// equivalent.
     #[must_use]
     pub fn execution_timeout_secs(&self) -> u64 {
         self.execution_timeout_secs
     }
 
-    /// Override the workflow-level execution timeout. See
-    /// [`execution_timeout_secs`](Self::execution_timeout_secs) for
-    /// the field's contract.
+    /// Workflow-level execution timeout as an `Option<Duration>` —
+    /// the typed view of [`execution_timeout_secs`](Self::execution_timeout_secs).
+    ///
+    /// Returns `None` when the wall-clock cap is disabled, `Some(d)`
+    /// otherwise. Sub-second precision is not preserved (the engine
+    /// stores a `u64` of seconds internally).
+    #[must_use]
+    pub fn execution_timeout(&self) -> Option<std::time::Duration> {
+        match self.execution_timeout_secs {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
+
+    /// Set the workflow-level execution timeout from a `u64` of seconds.
+    ///
+    /// Passing `0` **disables** the wall-clock cap; per-node timeouts
+    /// become the only safety net. Prefer
+    /// [`set_execution_timeout`](Self::set_execution_timeout)
+    /// (`Option<Duration>`) on new code — the typed form makes
+    /// "disabled" obvious at the call site instead of relying on a
+    /// magic-zero sentinel. This shorter form remains for callers who
+    /// already have a `u64` of seconds handy (graph JSON parsing,
+    /// configuration files, environment variables).
     pub fn set_execution_timeout_secs(&mut self, secs: u64) {
         self.execution_timeout_secs = secs;
+    }
+
+    /// Set the workflow-level execution timeout from an `Option<Duration>`.
+    ///
+    /// `None` disables the wall-clock cap; `Some(d)` truncates to the
+    /// nearest whole second and uses that as the cap. Equivalent to
+    /// [`set_execution_timeout_secs`](Self::set_execution_timeout_secs)
+    /// with `0` for the disabled case, but reads cleaner at call sites:
+    ///
+    /// ```ignore
+    /// engine.set_execution_timeout(None);                                   // disabled
+    /// engine.set_execution_timeout(Some(Duration::from_secs(60)));          // 60s
+    /// ```
+    pub fn set_execution_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.execution_timeout_secs = timeout.map_or(0, |d| d.as_secs());
     }
 
     /// Whether side-effectful dispatches are mocked out. See
@@ -563,6 +1010,195 @@ impl ParallelWorkflowEngine {
         self.secret_envelope = envelope;
     }
 
+    /// Sliding-window cap on `__agent_history__` injection inside
+    /// `AgentLoop` and `ReActLoop` bodies. See
+    /// [`set_agent_loop_max_history`](Self::set_agent_loop_max_history)
+    /// for the contract.
+    #[must_use]
+    pub fn agent_loop_max_history(&self) -> usize {
+        self.agent_loop_max_history
+    }
+
+    /// Override the per-engine sliding-window cap on
+    /// `__agent_history__` entries injected into `AgentLoop` /
+    /// `ReActLoop` body iterations.
+    ///
+    /// The window holds the last N iteration outputs and rolls
+    /// FIFO-style as new iterations land. Defaults to
+    /// [`DEFAULT_AGENT_LOOP_MAX_HISTORY`] (20). Larger values let an
+    /// agent reason over more history at the cost of context size on
+    /// every iteration; smaller values trim context but lose long-
+    /// range reasoning.
+    ///
+    /// `0` is accepted and disables history injection entirely
+    /// (equivalent to `inject_history: false` on every loop variant
+    /// in the graph). Useful for stateless / pure-tool agents.
+    pub fn set_agent_loop_max_history(&mut self, max_history: usize) {
+        self.agent_loop_max_history = max_history;
+    }
+
+    /// Maximum number of successor nodes the engine prefetches per
+    /// node when `speculative_prefetch: true` is set. See
+    /// [`set_max_prefetch_successors`](Self::set_max_prefetch_successors).
+    #[must_use]
+    pub fn max_prefetch_successors(&self) -> usize {
+        self.max_prefetch_successors
+    }
+
+    /// Override the per-engine speculative-prefetch fan-out cap.
+    /// Defaults to [`DEFAULT_MAX_PREFETCH_SUCCESSORS`] (8). Lower it
+    /// to throttle background fetches on memory-constrained hosts;
+    /// raise it when graphs legitimately fan out widely. `0`
+    /// effectively disables speculative prefetch (no successors will
+    /// be fetched even with the per-node opt-in).
+    pub fn set_max_prefetch_successors(&mut self, n: usize) {
+        self.max_prefetch_successors = n;
+    }
+
+    /// Hard cap on the number of nodes this engine will accept via
+    /// [`add_node`](Self::add_node). See
+    /// [`set_max_workflow_nodes`](Self::set_max_workflow_nodes).
+    #[must_use]
+    pub fn max_workflow_nodes(&self) -> usize {
+        self.max_workflow_nodes
+    }
+
+    /// Override the per-engine maximum graph size. Defaults to
+    /// [`DEFAULT_MAX_WORKFLOW_NODES`] (500). `add_node` calls past
+    /// the cap emit a `tracing::warn!` and are dropped.
+    ///
+    /// Raise for legitimately large workflows (code-generated DAGs,
+    /// fan-out-of-fan-out aggregations); lower as a defence-in-depth
+    /// measure for trust-boundary inputs.
+    pub fn set_max_workflow_nodes(&mut self, n: usize) {
+        self.max_workflow_nodes = n;
+    }
+
+    /// Per-node output size guard in bytes. See
+    /// [`set_max_node_output_bytes`](Self::set_max_node_output_bytes).
+    #[must_use]
+    pub fn max_node_output_bytes(&self) -> usize {
+        self.max_node_output_bytes
+    }
+
+    /// Override the per-node output size guard. Defaults to
+    /// [`DEFAULT_MAX_NODE_OUTPUT_BYTES`] (5 MiB). Outputs over the
+    /// limit get replaced with an `__error: true` envelope before
+    /// they land in `results`, preventing one runaway node from
+    /// cascading a multi-MB clone into every downstream
+    /// `gathered_inputs` snapshot.
+    ///
+    /// Raise for nodes that legitimately produce large blobs (PDF
+    /// rendering, image processing, log aggregation); lower as a
+    /// defence-in-depth measure on memory-constrained hosts.
+    pub fn set_max_node_output_bytes(&mut self, bytes: usize) {
+        self.max_node_output_bytes = bytes;
+    }
+
+    /// Upper bound on Wasmtime fuel granted to any single dispatch.
+    /// See [`set_max_fuel_per_node`](Self::set_max_fuel_per_node).
+    #[must_use]
+    pub fn max_fuel_per_node(&self) -> u64 {
+        self.max_fuel_per_node
+    }
+
+    /// Override the per-node fuel ceiling. Defaults to
+    /// [`DEFAULT_MAX_FUEL_PER_NODE`] (50 M, ~5 s of dense numeric
+    /// work on the reference worker). Both per-node `max_fuel`
+    /// overrides from the graph JSON and the module's declared fuel
+    /// budget get clamped to this value before reaching the worker.
+    ///
+    /// Raise for compute-heavy workloads on dedicated workers; lower
+    /// on shared infrastructure to bound the worst-case wall-clock
+    /// any single dispatch can occupy.
+    pub fn set_max_fuel_per_node(&mut self, max_fuel: u64) {
+        self.max_fuel_per_node = max_fuel;
+    }
+
+    /// Replace the per-module rate-limit counter backing store.
+    ///
+    /// When `None` (the default), the engine routes
+    /// `check_rate_limit` calls through the process-global in-memory
+    /// `DashMap`. That's fine for a single-process deployment but
+    /// resets on restart and doesn't share state across replicas.
+    ///
+    /// Wire a `Some(Arc<MyRedisStore>)` (or whatever your shared
+    /// state is) for production fleets that need the cap to hold
+    /// across rolling deploys and horizontal scaling. The trait
+    /// surface is [`talos_workflow_engine_core::RateLimitStore`].
+    /// Failure mode is **fail-open**: a store-side error logs a
+    /// warning and allows the dispatch — see the trait docstring.
+    pub fn set_rate_limit_store(
+        &mut self,
+        store: Arc<dyn talos_workflow_engine_core::RateLimitStore>,
+    ) {
+        self.rate_limit_store = Some(store);
+    }
+
+    /// Persist a [`CancellationToken`](tokio_util::sync::CancellationToken)
+    /// on the engine. The non-`_cancellable` run methods
+    /// ([`run_with_transport`](Self::run_with_transport),
+    /// [`run_with_seed_with_transport`](Self::run_with_seed_with_transport))
+    /// consult it before each dispatch and short-circuit with
+    /// [`crate::WorkflowEngineError::Cancelled`] if it fires.
+    ///
+    /// Inherits through [`AdapterSet`] so sub-workflow loops
+    /// (`AgentLoop`, `ReActLoop`, `Ensemble`, `ReflectiveRetry`,
+    /// `Judge`, `LlmDispatch`, etc.) see the same cancel signal as
+    /// the parent — cancelling a parent token aborts every running
+    /// sub-workflow at the next dispatch boundary, not just the
+    /// outer reactor.
+    ///
+    /// Pass `None` to clear a previously-set token. The
+    /// `_cancellable` variants
+    /// ([`run_with_transport_cancellable`](Self::run_with_transport_cancellable),
+    /// [`run_with_seed_with_transport_cancellable`](Self::run_with_seed_with_transport_cancellable))
+    /// take a token as a parameter and ignore this field —
+    /// the parameter wins by design so a one-off run can override
+    /// the engine's persistent token.
+    pub fn set_cancellation_token(&mut self, token: Option<tokio_util::sync::CancellationToken>) {
+        self.cancellation_token = token;
+    }
+
+    /// The engine-level cancellation token if set via
+    /// [`set_cancellation_token`](Self::set_cancellation_token).
+    /// Cloned (cheap — `CancellationToken` is itself an `Arc`
+    /// internally).
+    #[must_use]
+    pub fn cancellation_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.cancellation_token.clone()
+    }
+
+    /// Recursion-depth ceiling for sub-workflow dispatch. See
+    /// [`set_max_subflow_depth`](Self::set_max_subflow_depth).
+    #[must_use]
+    pub fn max_subflow_depth(&self) -> usize {
+        self.max_subflow_depth
+    }
+
+    /// Override the sub-workflow recursion-depth ceiling. Defaults
+    /// to [`DEFAULT_MAX_SUBFLOW_DEPTH`] (16). Every sub-workflow
+    /// handler (`Judge`, `Ensemble`, `AgentLoop`, etc.) hydrates a
+    /// child engine via [`AdapterSet::into_engine_with_graph`],
+    /// which checks the depth before doing any work and returns
+    /// [`crate::WorkflowEngineError::SubflowRecursionLimit`] if the
+    /// next dispatch would exceed the cap.
+    ///
+    /// Raise for genuinely-deep compositions; lower as a defence-
+    /// in-depth measure for trust-boundary inputs.
+    pub fn set_max_subflow_depth(&mut self, depth: usize) {
+        self.max_subflow_depth = depth;
+    }
+
+    /// The sub-workflow dispatch depth this engine is operating at.
+    /// `0` for top-level engines; `N` for engines hydrated `N`
+    /// sub-workflow levels below the root. Useful for tests
+    /// asserting on dispatch chain shape.
+    #[must_use]
+    pub fn current_subflow_depth(&self) -> usize {
+        self.current_subflow_depth
+    }
+
     /// Override the per-execution sandbox root.
     ///
     /// * `Some(path)` — every execution creates `<path>/<execution_id>`
@@ -576,15 +1212,17 @@ impl ParallelWorkflowEngine {
     ///   that request filesystem scratch space will observe `None` and
     ///   fall back to in-memory paths.
     ///
-    /// The default is `Some(`[`DEFAULT_SANDBOX_ROOT`]`)` for backwards
-    /// compatibility with the engine's pre-0.1 behavior.
+    /// The default is `Some(`[`default_sandbox_root()`](crate::default_sandbox_root)`.to_path_buf())` —
+    /// the platform's `<tmp>/workflow-engine-sandboxes`. The Linux/macOS-only
+    /// [`DEFAULT_SANDBOX_ROOT`](crate::DEFAULT_SANDBOX_ROOT) constant
+    /// is deprecated; new code should reference the function form.
     pub fn set_sandbox_root(&mut self, root: Option<std::path::PathBuf>) {
         self.sandbox_root = root;
     }
 
     /// Replace the default approval gate. Out-of-tree consumers plug
     /// in their own impl (auto-approve for tests, a remote
-    /// approval service for SaaS deployments).
+    /// approval service for `SaaS` deployments).
     pub fn set_approval_gate(&mut self, gate: Arc<dyn talos_workflow_engine_core::ApprovalGate>) {
         self.approval_gate = Some(gate);
     }
@@ -651,6 +1289,18 @@ impl ParallelWorkflowEngine {
             actor_id: self.actor_id,
             dry_run: self.dry_run,
             sandbox_root: self.sandbox_root.clone(),
+            agent_loop_max_history: self.agent_loop_max_history,
+            max_prefetch_successors: self.max_prefetch_successors,
+            max_workflow_nodes: self.max_workflow_nodes,
+            max_node_output_bytes: self.max_node_output_bytes,
+            max_fuel_per_node: self.max_fuel_per_node,
+            rate_limit_store: self.rate_limit_store.clone(),
+            cancellation_token: self.cancellation_token.clone(),
+            max_subflow_depth: self.max_subflow_depth,
+            // Carry the parent's depth — the sub-engine hydrated
+            // from this AdapterSet sits one level deeper, computed
+            // by `into_engine` / `into_engine_with_graph`.
+            current_subflow_depth: self.current_subflow_depth,
         }
     }
 
@@ -752,14 +1402,23 @@ impl ParallelWorkflowEngine {
         self.retry_classifier = Some(classifier);
     }
 
-    /// Set the actor ID for __memory_write__ protocol write-back.
+    /// Set the actor ID that owns this execution. Threaded into every
+    /// `DispatchJob` so workers can route agent-memory `__memory_write__`
+    /// protocol fields (and similar actor-scoped side effects) back to
+    /// the correct rows. Distinct from
+    /// [`set_user_id`](Self::set_user_id) — actors are a layer above
+    /// users and not every execution has one. Skip on test paths.
     pub fn set_actor_id(&mut self, id: Uuid) {
         self.actor_id = Some(id);
     }
 
     /// Set the owning user ID used for per-user secret resolution and
-    /// module-artifact cache scoping. Controller-side builders set this
-    /// automatically; out-of-tree consumers call it directly.
+    /// module-artifact cache scoping. **Required** for any run that
+    /// dispatches to a [`ModuleFetcher`] — the engine refuses to
+    /// dispatch a node without one rather than risk a cross-tenant
+    /// artifact resolution. Controller-side builders set this
+    /// automatically from the request context; out-of-tree consumers
+    /// call it directly before [`run_with_transport`](Self::run_with_transport).
     pub fn set_user_id(&mut self, id: Uuid) {
         self.user_id = Some(id);
     }
@@ -826,14 +1485,14 @@ impl ParallelWorkflowEngine {
             .map_err(|e| e.to_string())
     }
 
-    fn redact_str(&self, s: &str) -> String {
+    pub(crate) fn redact_str(&self, s: &str) -> String {
         self.output_sanitizer
             .as_ref()
             .map(|sz| sz.redact_str(s))
             .unwrap_or_else(|| s.to_string())
     }
 
-    fn redact_json(&self, v: &JsonValue) -> JsonValue {
+    pub(crate) fn redact_json(&self, v: &JsonValue) -> JsonValue {
         self.output_sanitizer
             .as_ref()
             .map(|sz| sz.redact_json(v))
@@ -854,24 +1513,52 @@ impl ParallelWorkflowEngine {
         Some(sanitizer.new_execution(&configs))
     }
 
-    /// Set the parent workflow id. Threaded into
-    /// [`NodeLifecycleHook::on_node_completed`] so cost rollups and
-    /// other workflow-scoped observations attribute correctly. Unset
-    /// engines fall back to the execution id (pre-extraction behavior),
-    /// which still works but conflates per-run and per-workflow rollups.
+    /// Set the **definition** id of the workflow this engine is
+    /// running. Distinct from `execution_id` (a per-run UUID): the
+    /// workflow id is stable across every run of the same workflow
+    /// definition and is what cost / metrics / audit rollups should
+    /// attribute against. Threaded into
+    /// [`NodeLifecycleHook::on_node_completed`] via
+    /// [`NodeCompletionContext::workflow_id`].
+    ///
+    /// Unset engines fall back to the per-run `execution_id` for
+    /// attribution — works, but conflates per-run rollups with
+    /// per-workflow rollups. Set this when you have a stable workflow
+    /// row in your storage layer.
+    ///
+    /// [`NodeCompletionContext::workflow_id`]: talos_workflow_engine_core::NodeCompletionContext::workflow_id
     pub fn set_workflow_id(&mut self, id: Uuid) {
         self.workflow_id = Some(id);
     }
 
-    /// Set actor memory context to be injected into every node's input.
-    /// Called by the scheduler and trigger_workflow after loading actor memories.
-    /// The value should be a JSON object with `actor_id` and `memories` fields.
+    /// Inject an actor-memory context blob that the engine merges into
+    /// every node's input under the reserved key `__actor_context__`.
+    ///
+    /// Use this when an actor (a long-lived entity with persistent
+    /// memory: persona, learned preferences, conversational history,
+    /// …) owns the execution and downstream LLM nodes need that
+    /// context without per-workflow plumbing. The expected shape is a
+    /// JSON object — at minimum `{"actor_id": "...", "memories": [...]}`
+    /// — but the engine doesn't validate; it just forwards.
+    ///
+    /// Skip on plain test harnesses or executions with no actor.
     pub fn set_actor_context(&mut self, context: serde_json::Value) {
         self.actor_context = Some(context);
     }
 
-    /// Enable dry-run mode: non-GET HTTP requests, webhooks, and messaging calls
-    /// are mocked in the worker with success responses.
+    /// Enable dry-run mode for this engine.
+    ///
+    /// When set, every dispatched [`DispatchJob`](talos_workflow_engine_core::DispatchJob) carries
+    /// [`DispatchJob::dry_run = true`](talos_workflow_engine_core::DispatchJob::dry_run).
+    /// What that means is the **dispatcher**'s decision; the reference
+    /// NATS dispatcher tells the worker to mock non-GET HTTP requests,
+    /// webhooks, and messaging calls so the workflow can run end-to-
+    /// end without producing externally-visible side effects. A
+    /// custom dispatcher that ignores the field will still execute
+    /// normally — propagation is the engine's promise; honouring it
+    /// is the dispatcher's.
+    ///
+    /// Common use: pre-merge "preview" runs in a workflow editor.
     pub fn set_dry_run(&mut self, v: bool) {
         self.dry_run = v;
     }
@@ -912,7 +1599,7 @@ impl ParallelWorkflowEngine {
     ///
     /// Called once at the start of `run()` / `run_with_seed()` to eliminate N+1 queries
     /// during node dispatch. Nodes whose workflow IDs are resolved at runtime
-    /// (DynamicDispatch, CapabilityDispatch) will fall back to individual queries
+    /// (`DynamicDispatch`, `CapabilityDispatch`) will fall back to individual queries
     /// via `get_sub_workflow_graph()` on cache miss.
     async fn populate_sub_workflow_cache(&mut self) {
         let (store, user_id) = match (self.graph_store.as_ref(), self.user_id) {
@@ -1019,7 +1706,7 @@ impl ParallelWorkflowEngine {
     }
 
     /// Look up a sub-workflow's graph JSON, checking the pre-populated cache first.
-    /// Falls back to an individual DB query on cache miss (e.g., DynamicDispatch
+    /// Falls back to an individual DB query on cache miss (e.g., `DynamicDispatch`
     /// targets that are resolved at runtime).
     pub(crate) async fn get_sub_workflow_graph(
         &self,
@@ -1113,9 +1800,12 @@ impl ParallelWorkflowEngine {
     /// * Edges carry `sourceHandle` / `targetHandle` / `condition` /
     ///   `edge_type` when present.
     ///
-    /// Returns [`crate::WorkflowEngineError::LoadGraph`] when `nodes` is
-    /// missing or empty (the engine refuses to run a graph with no
-    /// work).
+    /// Returns [`crate::WorkflowEngineError::EmptyGraph`] when `nodes`
+    /// is missing or empty (the engine refuses to run a graph with no
+    /// work). Parse-time failures surface as
+    /// [`crate::WorkflowEngineError::GraphJson`]; other load-time
+    /// rejections surface as
+    /// [`crate::WorkflowEngineError::LoadGraph`].
     ///
     /// Async follow-ups (rate-limit pre-load, sub-workflow graph
     /// prefetch) are intentionally out of scope — see
@@ -1134,7 +1824,7 @@ impl ParallelWorkflowEngine {
             .unwrap_or(&empty_vec);
 
         if nodes.is_empty() {
-            return Err(crate::WorkflowEngineError::load_graph("Workflow has no nodes"));
+            return Err(crate::WorkflowEngineError::EmptyGraph);
         }
 
         if let Some(timeout) = graph
@@ -1262,9 +1952,10 @@ impl ParallelWorkflowEngine {
                         }
                     }
 
-                    let kind = node.get("kind").and_then(|k| k.as_str()).and_then(|k| {
-                        parse_system_node_kind(k, node)
-                    });
+                    let kind = node
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .and_then(|k| parse_system_node_kind(k, node));
                     let retry_policy = read_node_retry_policy_with_actor_cap(node, self.actor_id);
                     self.add_node(node_id, Some(module_id), retry_policy, kind);
                     let node_timeout_secs: Option<u64> = node
@@ -1390,7 +2081,7 @@ impl ParallelWorkflowEngine {
     // invoke `store.load(id)` themselves and feed the result into
     // `run_with_seed`.
 
-    /// Extract module UUIDs referenced in a graph_json string.
+    /// Extract module UUIDs referenced in a `graph_json` string.
     ///
     /// Useful for consumers that maintain a workflow → module junction
     /// table in their own storage.
@@ -1428,13 +2119,9 @@ impl ParallelWorkflowEngine {
         module_ids
     }
 
-    /// Maximum number of nodes allowed in a single workflow graph.
-    /// Prevents unbounded resource consumption from malformed or adversarial workflows.
-    const MAX_WORKFLOW_NODES: usize = 500;
-
     /// Resolve the actual module UUID for a node.
-    /// Nodes have their own unique IDs in the graph; the module_id (which WASM to load)
-    /// is stored in node_meta. Falls back to node_id for backwards compatibility.
+    /// Nodes have their own unique IDs in the graph; the `module_id` (which WASM to load)
+    /// is stored in `node_meta`. Falls back to `node_id` for backwards compatibility.
     pub(crate) fn resolve_module_id(&self, node_id: Uuid) -> Uuid {
         self.node_meta
             .get(&node_id)
@@ -1442,6 +2129,20 @@ impl ParallelWorkflowEngine {
             .unwrap_or(node_id)
     }
 
+    /// Add a node to the engine's graph.
+    ///
+    /// `id` is the engine-local node UUID; `module_id` is the
+    /// resolved module to dispatch (or `None` for system-only
+    /// nodes); `retry_policy` overrides the workflow-level default;
+    /// `kind` carries the [`SystemNodeKind`] discriminator (or
+    /// `None` for plain module nodes).
+    ///
+    /// Calls past [`max_workflow_nodes`](Self::max_workflow_nodes)
+    /// emit a `tracing::warn!` and are silently dropped — by
+    /// design, so a misbehaving graph generator can't exhaust
+    /// memory before dispatch starts. Raise the cap via
+    /// [`set_max_workflow_nodes`](Self::set_max_workflow_nodes) if
+    /// the limit is too low for legitimate use.
     pub fn add_node(
         &mut self,
         id: Uuid,
@@ -1449,10 +2150,10 @@ impl ParallelWorkflowEngine {
         retry_policy: Option<talos_workflow_engine_core::RetryPolicy>,
         kind: Option<SystemNodeKind>,
     ) {
-        if self.graph.node_count() >= Self::MAX_WORKFLOW_NODES {
+        if self.graph.node_count() >= self.max_workflow_nodes {
             tracing::warn!(
                 node_count = self.graph.node_count(),
-                max = Self::MAX_WORKFLOW_NODES,
+                max = self.max_workflow_nodes,
                 "Workflow graph exceeds maximum node count — ignoring add_node"
             );
             return;
@@ -1462,6 +2163,9 @@ impl ParallelWorkflowEngine {
         self.node_meta.insert(id, (module_id, retry_policy, kind));
     }
 
+    /// Add a directed edge between two nodes already present in the
+    /// graph. Returns `Err(WorkflowEngineError::LoadGraph)` if either
+    /// endpoint is unknown — typically a typo in the graph builder.
     #[allow(dead_code)]
     pub fn add_edge(
         &mut self,
@@ -1479,12 +2183,115 @@ impl ParallelWorkflowEngine {
         Ok(())
     }
 
+    /// Install a synthetic `__trigger__` root node that carries the
+    /// caller-supplied trigger input, wiring it to every current root
+    /// so root-level nodes execute with the trigger as their input.
+    ///
+    /// Idempotent: if a `__trigger__` node is already present (for
+    /// instance because this method ran once before), its Uuid is
+    /// reused and only missing trigger → root edges are added. That
+    /// means repeat invocations with the same or an expanded graph
+    /// produce the same wiring without stacking parallel triggers.
+    ///
+    /// Returns the Uuid of the trigger node so the caller can seed
+    /// `initial_results` with it before dispatching the engine.
+    ///
+    /// Shared by [`execute_subworkflow_graph`](Self::execute_subworkflow_graph)
+    /// (operating on a fresh sub-engine) and
+    /// [`run_with_trigger_input_transport`](Self::run_with_trigger_input_transport)
+    /// (operating on the top-level engine). Kept private so the
+    /// `__trigger__` mechanism stays an implementation detail of the
+    /// crate — future refactors can replace it with a native seeding
+    /// path without a public-API break.
+    fn ensure_trigger_node_wired_to_roots(&mut self) -> Uuid {
+        // Reuse an existing synthetic trigger if one is already
+        // registered. The label is the authoritative marker — the
+        // Uuid itself is engine-generated and opaque to callers.
+        let existing = self
+            .node_labels
+            .iter()
+            .find(|(_, label)| label.as_str() == talos_workflow_engine_core::reserved_keys::TRIGGER)
+            .map(|(uuid, _)| *uuid);
+
+        let trigger_node_id = match existing {
+            Some(id) => id,
+            None => {
+                let id = Uuid::new_v4();
+                self.add_node(id, None, None, None);
+                self.node_labels.insert(
+                    id,
+                    talos_workflow_engine_core::reserved_keys::TRIGGER.to_string(),
+                );
+                id
+            }
+        };
+
+        // Roots are every node with zero incoming edges, excluding the
+        // trigger itself. Collect root Uuids (not NodeIndices) so the
+        // subsequent `add_edge` calls — which do their own index
+        // lookup — stay correct if the graph is mutated between
+        // iterations.
+        let root_ids: Vec<Uuid> = self
+            .graph
+            .node_indices()
+            .filter_map(|idx| {
+                let id = self.graph[idx];
+                if id == trigger_node_id {
+                    return None;
+                }
+                let in_degree = self
+                    .graph
+                    .neighbors_directed(idx, Direction::Incoming)
+                    .count();
+                if in_degree == 0 {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for root_id in root_ids {
+            // `add_edge` is a no-op-ish idempotent operation only for
+            // structurally distinct edges; petgraph does allow
+            // duplicates. On a fresh trigger node every `add_edge`
+            // adds a new edge exactly once. On a reused trigger node,
+            // we only add an edge if one doesn't already exist —
+            // otherwise repeat invocations would stack parallel edges
+            // from trigger → the same root, and the scheduler would
+            // see the root with in-degree > 1 (breaking the root
+            // identification on the next call).
+            let trigger_idx = self.node_map[&trigger_node_id];
+            let root_idx = self.node_map[&root_id];
+            let already_wired = self
+                .graph
+                .edges_connecting(trigger_idx, root_idx)
+                .next()
+                .is_some();
+            if !already_wired {
+                let _ = self.add_edge(
+                    trigger_node_id,
+                    root_id,
+                    EdgeLogic {
+                        source_handle: "output".to_string(),
+                        target_handle: "input".to_string(),
+                        mapping: None,
+                        condition: None,
+                        edge_type: "default".to_string(),
+                    },
+                );
+            }
+        }
+
+        trigger_node_id
+    }
+
     /// Unwrap engine wrapper from node output if present.
     /// Templates receive `{"config": ..., "input": ...}` and many echo it back.
     /// For inter-node data flow, we want the raw payload, not the engine wrapper.
     /// Collapse a completed sub-workflow's per-node results into a single output value.
     ///
-    /// All sub-workflow invocation sites (judge, reflective-retry, ensemble, sub_workflow)
+    /// All sub-workflow invocation sites (judge, reflective-retry, ensemble, `sub_workflow`)
     /// need the same semantics; authoring a sub-workflow whose output is a shaped record
     /// (e.g. judge returning `{score, passed, reasoning, feedback}`) should "just work"
     /// regardless of how the sub-workflow graph is wired internally.
@@ -1509,7 +2316,7 @@ impl ParallelWorkflowEngine {
     /// - `first_pass`: first non-error result.
     /// - `best_of_n`: requires `judge_wf_id_opt`; scores each candidate via the
     ///   judge workflow and picks the highest score.
-    /// - anything else ("majority_vote" / default): most common value at
+    /// - anything else ("`majority_vote`" / default): most common value at
     ///   `result`/`output` key (with an 8 KiB vote-key cap to bound memory).
     ///
     /// Output is enriched with `__ensemble_method__` and `__ensemble_size__`.
@@ -1670,7 +2477,7 @@ impl ParallelWorkflowEngine {
         serde_json::Value::Object(out)
     }
 
-    /// One-shot dispatch of a LlmDispatch system node.
+    /// One-shot dispatch of a `LlmDispatch` system node.
     ///
     /// Flow:
     /// 1. Run `classifier_wf_id` with the inbound inputs (stripped of `__*`).
@@ -1832,6 +2639,16 @@ impl ParallelWorkflowEngine {
     /// Returns the child's collapsed terminal output enriched with
     /// `__reflective_retry_attempts__` on success, or an error envelope on
     /// exhaustion.
+    #[tracing::instrument(
+        level = "info",
+        name = "reflective_retry",
+        skip_all,
+        fields(
+            child_workflow_id = %child_wf_id,
+            reflection_workflow_id = %reflection_wf_id,
+            max_retries,
+        ),
+    )]
     pub async fn dispatch_reflective_retry(
         &self,
         initial_input: JsonValue,
@@ -1940,7 +2757,7 @@ impl ParallelWorkflowEngine {
         })
     }
 
-    /// One-shot dispatch of a SubWorkflow system node.
+    /// One-shot dispatch of a `SubWorkflow` system node.
     ///
     /// Strips engine metadata (`__*`) from the inbound parent inputs before
     /// passing as the sub-workflow trigger, then returns the collapsed
@@ -2003,8 +2820,36 @@ impl ParallelWorkflowEngine {
     /// returns the final output envelope that the outer loop will insert into
     /// the results map.
     ///
+    /// # When to call this directly
+    ///
+    /// Most consumers don't — putting a [`SystemNodeKind::Judge`] node
+    /// in the workflow graph and letting the scheduler call this method
+    /// is the supported path. This method is also `pub` so embedders
+    /// who want a one-off judge invocation outside any graph (e.g. an
+    /// MCP handler that scores a single LLM output, a CLI tool, an
+    /// HTTP endpoint that takes content + rubric and returns a
+    /// verdict) can call it directly without authoring a wrapper
+    /// graph. Same `JudgeVerdict` shape, same sub-workflow lookup
+    /// path, same envelope. See
+    /// [`docs/sub-workflow-composition.md`](https://github.com/aegix-dev/talos-workflow-engine/blob/main/docs/sub-workflow-composition.md)
+    /// for the verdict-shape contract.
+    ///
     /// Shared by the `run` and `run_with_seed` dispatch loops — both previously
     /// inlined ~100 lines of near-identical logic here.
+    //
+    // `skip_all` is load-bearing: `parent_inputs` may carry plaintext
+    // post-template-interpolation secrets; never forward it to a tracing
+    // sink. Identifying fields are explicit so production debugging can
+    // correlate without UUID hand-tracing.
+    #[tracing::instrument(
+        level = "info",
+        name = "judge",
+        skip_all,
+        fields(
+            judge_workflow_id = %judge_wf_id,
+            pass_threshold = ?pass_threshold,
+        ),
+    )]
     pub async fn dispatch_judge(
         &self,
         parent_inputs: JsonValue,
@@ -2078,6 +2923,120 @@ impl ParallelWorkflowEngine {
         }
     }
 
+    /// Inline-expression judge — evaluate `verdict_expr` against the
+    /// gathered parent inputs via the configured
+    /// [`ExpressionEvaluator`](talos_workflow_engine_core::ExpressionEvaluator),
+    /// parse the result as a [`JudgeVerdict`], and produce the same
+    /// pass / reject envelope shape as the sub-workflow
+    /// [`dispatch_judge`](Self::dispatch_judge) path.
+    ///
+    /// Synchronous because it does no I/O — purely an expression
+    /// evaluation. Useful when the verdict reduces to a one-line
+    /// scoring function and the cost of authoring + dispatching a
+    /// separate sub-workflow isn't justified. Promote to a full
+    /// `Judge` once the rubric grows its own model call or branching.
+    ///
+    /// On evaluator failure (no evaluator wired, expression error,
+    /// non-object output) the function emits an error envelope rather
+    /// than panicking — the engine already treats `__error: true` as
+    /// a node-level failure routable through `ErrorHandler` edges.
+    ///
+    /// # When to call this directly
+    ///
+    /// Same shape as
+    /// [`dispatch_judge`](Self::dispatch_judge): the supported path
+    /// is to author a [`SystemNodeKind::InlineJudge`] in the graph
+    /// and let the scheduler dispatch it. Embedders who want to
+    /// score a single value outside any graph (e.g. a CLI checking
+    /// quality of a one-off LLM output, an HTTP handler that scores
+    /// content + verdict-expr and returns a verdict) can call this
+    /// method directly. Synchronous — no `await` required at the
+    /// call site.
+    //
+    // `skip_all` keeps `parent_inputs` and the expression text out of
+    // the span — both can carry plaintext secrets after caller-side
+    // template interpolation.
+    #[cfg(feature = "llm-primitives")]
+    #[tracing::instrument(
+        level = "info",
+        name = "inline_judge",
+        skip_all,
+        fields(pass_threshold = ?pass_threshold),
+    )]
+    pub fn dispatch_inline_judge(
+        &self,
+        parent_inputs: JsonValue,
+        verdict_expr: &str,
+        pass_threshold: Option<f64>,
+    ) -> JsonValue {
+        let raw_verdict = match self.eval_json(verdict_expr, &parent_inputs) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "InlineJudge: verdict expression failed to evaluate",
+                );
+                return serde_json::json!({
+                    "__error": true,
+                    "error_message": format!("InlineJudge expression failed: {e}"),
+                });
+            }
+        };
+        let verdict = JudgeVerdict::from_collapsed(&raw_verdict);
+        let JudgeVerdict {
+            score,
+            passed: passed_raw,
+            reasoning,
+            feedback,
+            malformed_field_count,
+        } = verdict;
+        let passed = if let Some(threshold) = pass_threshold {
+            passed_raw && score >= threshold
+        } else {
+            passed_raw
+        };
+        Self::emit_quality_gate_event(
+            "inline_judge",
+            passed,
+            Some(score),
+            None,
+            if malformed_field_count > 0 {
+                Some("malformed_verdict")
+            } else {
+                None
+            },
+        );
+        if passed {
+            let mut out = if let Some(obj) = parent_inputs.as_object() {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("__judge_score__".to_string(), serde_json::json!(score));
+            out.insert("__judge_passed__".to_string(), serde_json::json!(true));
+            out.insert(
+                "__judge_reasoning__".to_string(),
+                serde_json::json!(reasoning),
+            );
+            out.insert(
+                "__judge_feedback__".to_string(),
+                serde_json::json!(feedback),
+            );
+            serde_json::Value::Object(out)
+        } else {
+            serde_json::json!({
+                "__error": true,
+                "error_message": format!(
+                    "InlineJudge rejected output: {} (score: {:.2})",
+                    reasoning, score
+                ),
+                "__judge_score__": score,
+                "__judge_passed__": false,
+                "__judge_feedback__": feedback,
+            })
+        }
+    }
+
     /// Execute a sub-workflow by ID with the given trigger input, and return
     /// the collapsed terminal output.
     ///
@@ -2096,6 +3055,12 @@ impl ParallelWorkflowEngine {
     /// Returns `Ok(JsonValue)` with the collapsed output, or [`SubflowError`]
     /// which each caller converts into their own error envelope via
     /// [`SubflowError::into_error_envelope`].
+    #[tracing::instrument(
+        level = "info",
+        name = "subworkflow",
+        skip_all,
+        fields(sub_workflow_id = %sub_wf_id),
+    )]
     pub async fn execute_subworkflow_graph(
         &self,
         sub_wf_id: Uuid,
@@ -2117,45 +3082,21 @@ impl ParallelWorkflowEngine {
             .ok_or_else(|| SubflowError::GraphNotFound(sub_wf_id))?;
 
         // Reuse the parent's adapter Arcs (Arc::clone is a refcount
-        // bump per trait object — cheap) and populate the graph.
-        let mut sub_engine = self.new_subengine();
-        sub_engine
-            .load_from_graph_json(&graph_json)
+        // bump per trait object — cheap). Use the *guarded* path
+        // (`into_engine_with_graph`) so the recursion-depth check
+        // fires here — without it, a self-referential workflow
+        // would stack-overflow the reactor instead of returning a
+        // typed error.
+        let mut sub_engine = self
+            .adapter_set()
+            .into_engine_with_graph(&graph_json)
             .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
 
-        // Synthetic trigger node: seeded with the caller's input, wired to
-        // every root so root-level modules actually execute.
-        let trigger_node_id = Uuid::new_v4();
-        sub_engine.add_node(trigger_node_id, None, None, None);
-        sub_engine
-            .node_labels
-            .insert(trigger_node_id, "__trigger__".to_string());
-        let root_indices: Vec<NodeIndex> = sub_engine
-            .graph
-            .node_indices()
-            .filter(|&idx| {
-                sub_engine.graph[idx] != trigger_node_id
-                    && sub_engine
-                        .graph
-                        .neighbors_directed(idx, Direction::Incoming)
-                        .count()
-                        == 0
-            })
-            .collect();
-        for root_idx in &root_indices {
-            let root_id = sub_engine.graph[*root_idx];
-            let _ = sub_engine.add_edge(
-                trigger_node_id,
-                root_id,
-                talos_workflow_engine_core::EdgeLogic {
-                    source_handle: "output".to_string(),
-                    target_handle: "input".to_string(),
-                    mapping: None,
-                    condition: None,
-                    edge_type: "default".to_string(),
-                },
-            );
-        }
+        // Synthetic trigger node: seeded with the caller's input,
+        // wired to every root so root-level modules actually execute.
+        // Delegates to the shared helper so this path and the public
+        // `run_with_trigger_input_transport` can't drift.
+        let trigger_node_id = sub_engine.ensure_trigger_node_wired_to_roots();
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
 
@@ -2172,6 +3113,22 @@ impl ParallelWorkflowEngine {
         Ok(Self::collapse_subworkflow_output(&ctx.results, &sub_engine))
     }
 
+    /// Reduce a sub-workflow's `results` map into the single value
+    /// the parent dispatch site sees as "the sub-workflow's output."
+    ///
+    /// Two cases:
+    ///
+    /// * **One terminal node.** Returns that node's output unwrapped.
+    ///   This is the canonical case — `Judge`, `Ensemble`, and
+    ///   `ReflectiveRetry` all rely on it for their structured-shape
+    ///   parsing.
+    /// * **Multiple terminal nodes (or a complex shape).** Falls back
+    ///   to a label-keyed map so the parent retains every terminal's
+    ///   output by its node label.
+    ///
+    /// Skipped nodes (`{"__skipped": true}`) and the synthetic
+    /// `__trigger__` node added by sub-workflow dispatch are filtered
+    /// out before collapse.
     pub fn collapse_subworkflow_output(
         ctx_results: &HashMap<Uuid, JsonValue>,
         sub_engine: &ParallelWorkflowEngine,
@@ -2240,6 +3197,53 @@ impl ParallelWorkflowEngine {
         JsonValue::Object(map)
     }
 
+    /// Resolve the workflow's original trigger input from the completed-
+    /// results map. Returns `None` when the synthetic `__trigger__` node
+    /// hasn't emitted yet (should never happen on the main dispatch
+    /// path, but the reactor may call this before seed hydration under
+    /// some edge cases).
+    ///
+    /// Behaviour for nested cases:
+    ///
+    /// * When the parent workflow was itself invoked as a sub-workflow,
+    ///   its `results[__trigger__]` is a wrapper blob shaped like
+    ///   `{..upstream, "__trigger_input__": <root-user-trigger>}`. We
+    ///   unwrap one level so callers downstream see the **original
+    ///   user-facing trigger** — which is the whole point of the
+    ///   `__trigger_input__` key (survive sub-workflow boundaries).
+    /// * When no wrapper is present (top-level workflow), the trigger
+    ///   blob IS the trigger input — returned as-is.
+    ///
+    /// This keeps the scaffold's "`__trigger_input__` is always preserved"
+    /// contract honest even for 2+ level deep composition. Single source
+    /// of truth — all three callers (loop body dispatcher, single-node
+    /// dispatcher, sub-workflow dispatcher) use this helper.
+    pub(crate) fn extract_trigger_input(
+        &self,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let trigger_blob = self
+            .node_labels
+            .iter()
+            .find(|(_, label)| label.as_str() == "__trigger__")
+            .and_then(|(uuid, _)| results.get(uuid))
+            .cloned()?;
+        // Nested case: we're a sub-workflow whose trigger carries the
+        // outer user trigger under `__trigger_input__`. Unwrap one level.
+        if let Some(obj) = trigger_blob.as_object() {
+            if let Some(inner) = obj.get("__trigger_input__") {
+                return Some(inner.clone());
+            }
+        }
+        Some(trigger_blob)
+    }
+
+    /// Strip the engine's wrapping envelope from a node output if
+    /// present. Workers sometimes return `{"input": <real>, "score":
+    /// ..., "passed": ...}` where the real payload is under `"input"`
+    /// and the outer keys are duplicated for convenience; this helper
+    /// returns a reference to the unwrapped inner value when that
+    /// wrapper is detected, otherwise to `output` unchanged.
     pub fn unwrap_output(output: &JsonValue) -> &JsonValue {
         // If output is a JSON string that contains JSON, try to parse it
         if let JsonValue::String(_s) = output {
@@ -2387,7 +3391,7 @@ impl ParallelWorkflowEngine {
     // is responsible for inserting the result, emitting lifecycle events, and
     // unblocking successors.
 
-    /// Aggregate parent outputs for a FanIn node.
+    /// Aggregate parent outputs for a `FanIn` node.
     ///
     /// Collects all incoming node outputs and combines them according to
     /// `join_mode`.  If `aggregation_expr` is provided, it is evaluated as a
@@ -2669,6 +3673,16 @@ impl ParallelWorkflowEngine {
     /// `Err(waiting_json)` when the gate is paused awaiting approval.
     /// The caller must handle the `Err` case by early-returning from the
     /// reactor loop with a `waiting: true` WorkflowContext.
+    #[tracing::instrument(
+        level = "info",
+        name = "confidence_gate",
+        skip_all,
+        fields(
+            execution_id = %execution_id,
+            threshold,
+            on_low_confidence,
+        ),
+    )]
     pub(crate) async fn evaluate_confidence_gate(
         &self,
         node_idx: NodeIndex,
@@ -2834,13 +3848,13 @@ impl ParallelWorkflowEngine {
         self.node_timeouts.get(&node_id).copied()
     }
 
-    /// FanIn early-ready: apply a [`JoinMode::Any`] / `Majority` /
-    /// `N(k)` short-circuit on `child` if it's a FanIn node and enough
+    /// `FanIn` early-ready: apply a [`JoinMode::Any`] / `Majority` /
+    /// `N(k)` short-circuit on `child` if it's a `FanIn` node and enough
     /// parents have completed to satisfy the join. Mutates `pending`
     /// by zeroing the child's counter when the join is satisfied.
     /// `JoinMode::All` waits for every parent and is the default
     /// zero-action branch.
-    fn apply_fan_in_early_ready(
+    pub(crate) fn apply_fan_in_early_ready(
         &self,
         child: NodeIndex,
         pending: &mut HashMap<NodeIndex, usize>,
@@ -2876,1251 +3890,6 @@ impl ParallelWorkflowEngine {
         }
     }
 
-    /// Post-completion processing for a node whose dispatch future
-    /// just returned from `executing.next().await`.
-    ///
-    /// Handles both the `Ok(output)` and `Err(error_message)` paths:
-    ///
-    /// * **Success.** Size-guard the output, sanitize it, insert into
-    ///   `results`, fire the `on_node_completed` hook, clear pending
-    ///   counts for any interior chain nodes (primary scheduler only),
-    ///   then walk successors decrementing pending counts, applying
-    ///   FanIn early-ready rules and edge-condition evaluation.
-    ///
-    /// * **Failure.** DLP-scrub the error, emit `node_failed`, and
-    ///   route based on node topology: if the node has outgoing error
-    ///   edges they fire; if the node has `__continue_on_error` set we
-    ///   propagate a `__continued` envelope and keep going; otherwise
-    ///   we notify the hook and return `Err` so the scheduler bails.
-    ///
-    /// `chains_ctx` is the primary scheduler's chain-detection output
-    /// (chains slice + `node_to_chain` map); `None` for the seeded
-    /// scheduler, which doesn't run pipeline batching. `wall_time_ms`
-    /// is 0 on the primary (no per-node timing) and the measured
-    /// elapsed time on the seeded scheduler (threaded back through
-    /// `WorkflowContext.node_timings`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn handle_completed_future(
-        &self,
-        finished_idx: NodeIndex,
-        exec_result: Result<JsonValue, String>,
-        execution_id: Uuid,
-        wall_time_ms: u64,
-        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
-        exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
-        results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
-        ready: &mut VecDeque<NodeIndex>,
-    ) -> Result<(), String> {
-        let finished_id = self.graph[finished_idx];
-        match exec_result {
-            Ok(output) => {
-                self.handle_node_success(
-                    finished_idx,
-                    finished_id,
-                    output,
-                    execution_id,
-                    wall_time_ms,
-                    chains_ctx,
-                    results,
-                    pending,
-                    ready,
-                )
-                .await;
-                Ok(())
-            }
-            Err(error_msg) => {
-                self.handle_node_failure(
-                    finished_idx,
-                    finished_id,
-                    error_msg,
-                    execution_id,
-                    wall_time_ms,
-                    chains_ctx,
-                    exec_ctx,
-                    results,
-                    pending,
-                    ready,
-                )
-                .await
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_node_success(
-        &self,
-        finished_idx: NodeIndex,
-        finished_id: Uuid,
-        output: JsonValue,
-        execution_id: Uuid,
-        wall_time_ms: u64,
-        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
-        results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
-        ready: &mut VecDeque<NodeIndex>,
-    ) {
-        // Log `node_completed` synchronously so child `node_started`
-        // events (fire-and-forget) are always ordered after this insert
-        // in the DB — fixes causally-inconsistent timelines.
-        if let Some(ref sink) = self.event_sink {
-            sink.emit(NodeEventWrite {
-                execution_id,
-                event_type: "node_completed".to_string(),
-                node_id: Some(finished_id),
-                status: "Completed".to_string(),
-                log_message: None,
-                iteration_index: None,
-            })
-            .await;
-        }
-
-        // Per-node output size guard: reject outputs larger than 5 MiB.
-        // A single misbehaving node can otherwise produce a multi-MB
-        // JSON value that is then cloned into every downstream node's
-        // gathered_inputs and the final aggregated workflow output,
-        // cascading into memory exhaustion.
-        const MAX_NODE_OUTPUT_BYTES: usize = 5 * 1024 * 1024; // 5 MiB
-        let output = match serde_json::to_vec(&output) {
-            Ok(bytes) if bytes.len() > MAX_NODE_OUTPUT_BYTES => {
-                tracing::warn!(
-                    node_id = %finished_id,
-                    bytes = bytes.len(),
-                    limit = MAX_NODE_OUTPUT_BYTES,
-                    "Node output exceeds 5 MiB limit — replacing with error"
-                );
-                serde_json::json!({
-                    "__error": true,
-                    "error": format!(
-                        "Node output too large ({} bytes > {} byte limit). \
-                         Reduce the amount of data returned by this node.",
-                        bytes.len(), MAX_NODE_OUTPUT_BYTES
-                    )
-                })
-            }
-            _ => output,
-        };
-        let mut output = output;
-        sanitize_node_output(&mut output);
-        results.insert(finished_id, output.clone());
-
-        // Post-completion hook: drives fuel attribution,
-        // `__memory_write__` persistence, and any future cross-cutting
-        // per-node observers. Fire-and-forget — the hook returns
-        // quickly; impls spawn internally. The primary scheduler
-        // doesn't track wall time (wall_time_ms == 0); the seeded
-        // scheduler threads it through from `node_start_times`.
-        if let Some(hook) = self.node_hook.as_ref() {
-            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
-            let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
-            hook.on_node_completed(
-                talos_workflow_engine_core::NodeCompletionContext {
-                    workflow_id: self.workflow_id.unwrap_or(execution_id),
-                    execution_id,
-                    node_id: finished_id,
-                    node_label,
-                    module_id,
-                    actor_id: self.actor_id,
-                    wall_time_ms,
-                },
-                &output,
-            );
-        }
-
-        // Chain execution: clear `pending` for interior chain nodes so
-        // their would-be successors (already run inside the pipeline)
-        // don't wait on them. Primary scheduler only — seeded path
-        // doesn't run pipeline batching.
-        if let Some((chains, node_to_chain)) = chains_ctx {
-            if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
-                for &n in &chains[chain_idx] {
-                    pending.insert(n, 0);
-                }
-            }
-        }
-
-        // Decrement children counters for finished_idx's successors.
-        // On SUCCESS, skip error-edge children (they only fire on failure).
-        for child in self
-            .graph
-            .neighbors_directed(finished_idx, Direction::Outgoing)
-        {
-            let is_error_edge = self
-                .graph
-                .edges_connecting(finished_idx, child)
-                .any(|e| e.weight().edge_type == "error");
-            if is_error_edge {
-                let child_id = self.graph[child];
-                results.insert(child_id, serde_json::json!({"__skipped": true}));
-                continue;
-            }
-            if let Some(cnt) = pending.get_mut(&child) {
-                *cnt -= 1;
-
-                // FanIn early-ready logic: some join modes don't
-                // require ALL parents to complete.
-                self.apply_fan_in_early_ready(child, pending);
-
-                if pending.get(&child).copied().unwrap_or(1) == 0 {
-                    // Check edge conditions before enqueuing.
-                    let child_node_id = self.graph[child];
-                    let mut condition_failed = false;
-                    for edge_ref in self.graph.edges_connecting(finished_idx, child) {
-                        tracing::debug!(
-                            condition = ?edge_ref.weight().condition,
-                            edge_type = %edge_ref.weight().edge_type,
-                            child = %child_node_id,
-                            "Evaluating edge"
-                        );
-                        if let Some(ref cond) = edge_ref.weight().condition {
-                            let unwrapped = Self::unwrap_output(&output);
-                            if !self.eval_bool(cond, unwrapped) {
-                                tracing::info!(
-                                    child_node_id = %child_node_id,
-                                    condition = %cond,
-                                    output_keys = ?unwrapped
-                                        .as_object()
-                                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
-                                        .unwrap_or_default(),
-                                    "Edge condition false — child node will be skipped"
-                                );
-                                condition_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if condition_failed {
-                        tracing::info!(
-                            node_id = %child_node_id,
-                            "Skipping node: edge condition evaluated to false"
-                        );
-                        results.insert(child_node_id, serde_json::json!({"__skipped": true}));
-                        // Cascade skip: decrement pending counts for the
-                        // skipped node's children. Those grandchildren
-                        // get picked up when their pending reaches 0 in
-                        // a future iteration.
-                        for grandchild in self
-                            .graph
-                            .neighbors_directed(child, Direction::Outgoing)
-                        {
-                            if let Some(gc_cnt) = pending.get_mut(&grandchild) {
-                                if *gc_cnt > 0 {
-                                    *gc_cnt -= 1;
-                                }
-                            }
-                        }
-                    } else {
-                        ready.push_back(child);
-                    }
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_node_failure(
-        &self,
-        finished_idx: NodeIndex,
-        finished_id: Uuid,
-        error_msg: String,
-        execution_id: Uuid,
-        wall_time_ms: u64,
-        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
-        exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
-        results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
-        ready: &mut VecDeque<NodeIndex>,
-    ) -> Result<(), String> {
-        // Two-pass scrub: value-based (known secrets) then regex DLP.
-        let error_msg = self.redact_str(
-            &exec_ctx
-                .as_ref()
-                .map(|c| c.redact_error(&error_msg))
-                .unwrap_or_else(|| error_msg.clone()),
-        );
-        // Log `node_failed` synchronously — same ordering guarantee as
-        // `node_completed`: child routing happens after this commit.
-        if let Some(ref sink) = self.event_sink {
-            sink.emit(NodeEventWrite {
-                execution_id,
-                event_type: "node_failed".to_string(),
-                node_id: Some(finished_id),
-                status: "Failed".to_string(),
-                log_message: Some(error_msg.clone()),
-                iteration_index: None,
-            })
-            .await;
-        }
-
-        let error_children: Vec<NodeIndex> = self
-            .graph
-            .neighbors_directed(finished_idx, Direction::Outgoing)
-            .filter(|&child_idx| {
-                if let Some(edge_idx) = self.graph.find_edge(finished_idx, child_idx) {
-                    self.graph[edge_idx].edge_type == "error"
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        if !error_children.is_empty() {
-            // Route error to error-handler nodes instead of failing.
-            let error_payload = serde_json::json!({
-                "__error": true,
-                "error_message": error_msg,
-                "failed_node": self
-                    .node_labels
-                    .get(&finished_id)
-                    .cloned()
-                    .unwrap_or_else(|| finished_id.to_string()),
-            });
-            results.insert(finished_id, error_payload);
-            tracing::info!(
-                %finished_id,
-                error_handlers = error_children.len(),
-                "Node failed but has error handler edges — routing to error handlers"
-            );
-
-            // Chain interior nodes get their pending cleared too —
-            // primary scheduler only.
-            if let Some((chains, node_to_chain)) = chains_ctx {
-                if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
-                    for &n in &chains[chain_idx] {
-                        pending.insert(n, 0);
-                    }
-                }
-            }
-
-            // Unblock ONLY error-edge children; skip default /
-            // conditional children because the parent failed and the
-            // success path is dead.
-            for child in self
-                .graph
-                .neighbors_directed(finished_idx, Direction::Outgoing)
-            {
-                let has_error_edge = self
-                    .graph
-                    .edges_connecting(finished_idx, child)
-                    .any(|e| e.weight().edge_type == "error");
-                if !has_error_edge {
-                    let child_id = self.graph[child];
-                    results.insert(child_id, serde_json::json!({"__skipped": true}));
-                    continue;
-                }
-
-                if let Some(cnt) = pending.get_mut(&child) {
-                    if *cnt > 0 {
-                        *cnt -= 1;
-                    }
-                    self.apply_fan_in_early_ready(child, pending);
-                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                        ready.push_back(child);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        if self
-            .node_configs
-            .get(&finished_id)
-            .and_then(|c| c.get("__continue_on_error"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            // `continue_on_error`: store the error envelope and keep
-            // executing. Downstream nodes see the `__error: true`
-            // output on their gathered inputs.
-            tracing::info!(
-                %finished_id,
-                "Node failed but continue_on_error is set — continuing execution"
-            );
-            results.insert(
-                finished_id,
-                serde_json::json!({
-                    "__error": true,
-                    "error_message": error_msg,
-                    "__continued": true,
-                }),
-            );
-            for child in self
-                .graph
-                .neighbors_directed(finished_idx, Direction::Outgoing)
-            {
-                if let Some(cnt) = pending.get_mut(&child) {
-                    if *cnt > 0 {
-                        *cnt -= 1;
-                    }
-                    if pending.get(&child).copied().unwrap_or(1) == 0 {
-                        ready.push_back(child);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        // No error handlers, no continue_on_error → the failure
-        // propagates. Notify the lifecycle hook (DLQ + sibling-cancel
-        // responsibility; the hook spawns both SQL writes so they
-        // don't delay the return).
-        if let Some(hook) = self.node_hook.as_ref() {
-            let node_label = self.node_labels.get(&finished_id).map(String::as_str);
-            let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
-            hook.on_node_failed(
-                talos_workflow_engine_core::NodeCompletionContext {
-                    workflow_id: self.workflow_id.unwrap_or(execution_id),
-                    execution_id,
-                    node_id: finished_id,
-                    node_label,
-                    module_id,
-                    actor_id: self.actor_id,
-                    wall_time_ms,
-                },
-                &error_msg,
-                results.get(&finished_id),
-            );
-        }
-        let node_label = self
-            .node_labels
-            .get(&finished_id)
-            .cloned()
-            .unwrap_or_else(|| finished_id.to_string());
-        // Clear prefetch cache before returning so unconsumed WASM
-        // modules (potentially MBs each) are not retained in the
-        // engine's `Arc` for the lifetime of the caller.
-        self.module_prefetch_cache.clear();
-        Err(format!("node '{node_label}' failed: {error_msg}"))
-    }
-
-    /// Build and await the full pipeline-chain dispatch future.
-    ///
-    /// Runs when a linear chain is detected (`detect_linear_chains`)
-    /// and the scheduler is at the chain head. Fetches each step's
-    /// module artifact, runs the approval gate per step, encrypts the
-    /// per-step secrets, assembles a `ChainDispatchRequest`, and hands
-    /// it to the [`NodeDispatcher::dispatch_chain`] impl.
-    ///
-    /// Extracted from the reactor loop for the same reason as
-    /// [`run_single_node_dispatch`](Self::run_single_node_dispatch) —
-    /// the scheduler reads as a sequence of handler calls rather than
-    /// a ~490-line inline closure. Semantics are preserved verbatim.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) async fn run_pipeline_chain_dispatch(
-        &self,
-        chain: Vec<NodeIndex>,
-        chain_input: JsonValue,
-        accumulated_snapshot: Option<JsonValue>,
-        execution_id: Uuid,
-        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
-    ) -> (NodeIndex, Result<JsonValue, String>) {
-        let chain_tail = chain[chain.len() - 1];
-        let chain_node_ids: Vec<Uuid> = chain.iter().map(|&n| self.graph[n]).collect();
-        // Pre-resolve graph node UUIDs → module UUIDs. Graph node IDs
-        // are SHA256-derived from the node label string and don't
-        // match any `wasm_modules` row; `resolve_module_id` maps them
-        // back to the template / module UUID stored in `node_meta` at
-        // graph load time.
-        let chain_module_ids: Vec<Uuid> = chain_node_ids
-            .iter()
-            .map(|&nid| self.resolve_module_id(nid))
-            .collect();
-        let chain_head_id = chain_node_ids[0];
-        let chain_retry = self
-            .node_meta
-            .get(&chain_head_id)
-            .and_then(|(_, rp, _)| rp.clone())
-            .unwrap_or_default();
-
-        // Resolve user_id early — required for all module-fetcher calls.
-        let uid_for_chain: Option<Uuid> = if self.module_fetcher.is_some() {
-            match self.user_id {
-                Some(u) => Some(u),
-                None => {
-                    return (
-                        chain_tail,
-                        Err("Module execution requires user context (user_id not set)".to_string()),
-                    );
-                }
-            }
-        } else {
-            None
-        };
-
-        // Build `DispatchJob`s for every node in the chain. The
-        // dispatcher's `dispatch_chain` adapter maps these into
-        // whatever batch wire format its backing transport uses (the
-        // reference NATS dispatcher emits a signed
-        // `PipelineJobRequest`; an in-process test dispatcher might
-        // just loop `dispatch` via `dispatch_chain_sequential`).
-        let mut step_jobs: Vec<DispatchJob> = Vec::with_capacity(chain.len());
-        for (i, &_step_idx) in chain.iter().enumerate() {
-            let step_node_id = chain_node_ids[i];
-            let step_module_id = chain_module_ids[i];
-            let uid = match uid_for_chain {
-                Some(u) => u,
-                None => {
-                    return (
-                        chain_tail,
-                        Err(format!("Missing user ID for module {step_node_id} in chain")),
-                    );
-                }
-            };
-
-            // Fetch the step's module artifact. `WasmModuleArtifact.config`
-            // mirrors `wasm_modules.config` — same data the pre-extraction
-            // code read via `reg.get_execution_info`. The Redis cache-warm
-            // that used to fire here is dropped: `wasm_bytes` is embedded
-            // in the dispatched chain, so the worker doesn't depend on it.
-            let (artifact, module_config) = match self.module_fetcher.as_ref() {
-                Some(fetcher) => match fetcher.fetch(step_module_id, uid).await {
-                    Ok(a) => {
-                        let config = a
-                            .config
-                            .clone()
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        (Some(a), config)
-                    }
-                    Err(e) => {
-                        return (
-                            chain_tail,
-                            Err(format!("Failed to prepare module: {e}")),
-                        );
-                    }
-                },
-                None => (None, serde_json::json!({})),
-            };
-
-            // Approval gate (per pipeline step).
-            let requires_approval: Vec<String> = artifact
-                .as_ref()
-                .map(|a| a.requires_approval_for.clone())
-                .unwrap_or_default();
-            if !requires_approval.is_empty() {
-                if let Some(ref gate) = self.approval_gate {
-                    let approval_webhook = module_config
-                        .get("NOTIFICATION_WEBHOOK")
-                        .and_then(|v| v.as_str());
-                    match gate
-                        .check_or_request(
-                            execution_id,
-                            step_node_id,
-                            &requires_approval,
-                            approval_webhook,
-                        )
-                        .await
-                    {
-                        Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {}
-                        Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
-                            return (
-                                chain_tail,
-                                Err(format!(
-                                    "Execution paused: module {step_node_id} requires approval for {requires_approval:?}. \
-                                     An approval request has been created."
-                                )),
-                            );
-                        }
-                        Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
-                            return (chain_tail, Err(reason));
-                        }
-                        Err(e) => {
-                            return (chain_tail, Err(format!("Approval gate check failed: {e}")));
-                        }
-                    }
-                }
-            }
-
-            // Extract vault:// paths from module_config before it is
-            // moved into the DispatchJob below.
-            let vault_paths = extract_vault_paths(&module_config);
-
-            // Per-node fuel precedence: node-config `max_fuel` > module
-            // default > 1M fallback. Capped at 50M.
-            let module_default_fuel = artifact
-                .as_ref()
-                .map(|a| a.max_fuel)
-                .filter(|f| *f > 0)
-                .unwrap_or(1_000_000);
-            let node_max_fuel = module_config
-                .get("max_fuel")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(module_default_fuel)
-                .min(50_000_000);
-
-            let encrypted_secrets =
-                match (self.secrets_resolver.as_ref(), &worker_shared_key) {
-                    (Some(resolver), Some(key)) => {
-                        build_encrypted_secrets_for(
-                            resolver.as_ref(),
-                            self.secret_envelope.as_ref(),
-                            step_node_id,
-                            self.user_id,
-                            &vault_paths,
-                            &[],
-                            key.as_bytes(),
-                        )
-                        .await
-                    }
-                    _ => Default::default(),
-                };
-            step_jobs.push(DispatchJob {
-                execution_id,
-                node_id: step_node_id,
-                module_id: step_node_id,
-                // Chain-level wire format derives a single `job_id`;
-                // per-step ids aren't correlated to individual
-                // `module_executions` rows (those use `step_exec_ids`).
-                job_id: None,
-                user_id: Some(uid),
-                actor_id: self.actor_id,
-                // Match pre-extraction behavior: the redis fallback key
-                // is `redis:wasm:{module_id}` keyed on `step_module_id`
-                // to match the worker's redis-key convention.
-                module_uri: artifact
-                    .as_ref()
-                    .and_then(|a| a.oci_url.clone())
-                    .unwrap_or_else(|| format!("redis:wasm:{step_module_id}")),
-                wasm_bytes: None,
-                expected_wasm_hash: artifact.as_ref().map(|a| a.content_hash.clone()),
-                // Pipeline dispatch uses a chain-level capability
-                // world; the adapter drops the per-step value.
-                capability_world: None,
-                integration_name: artifact.as_ref().and_then(|a| a.integration_name.clone()),
-                // `PipelineStep` calls this `config`; the adapter maps
-                // `input_payload` to it.
-                input_payload: module_config,
-                timeout: std::time::Duration::from_secs(
-                    self.node_timeouts.get(&step_node_id).copied().unwrap_or(30),
-                ),
-                max_fuel: node_max_fuel,
-                allowed_hosts: artifact
-                    .as_ref()
-                    .map(|a| a.allowed_hosts.clone())
-                    .unwrap_or_default(),
-                allowed_methods: artifact
-                    .as_ref()
-                    .map(|a| a.allowed_methods.clone())
-                    .unwrap_or_default(),
-                allowed_secrets: artifact
-                    .as_ref()
-                    .map(|a| a.allowed_secrets.clone())
-                    .unwrap_or_default(),
-                allowed_sql_operations: vec![],
-                allow_tier2_exposure: false,
-                encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-                encrypted_secrets_nonce: encrypted_secrets.nonce,
-                priority: 100,
-                dry_run: self.dry_run,
-                max_retries: 0,
-                backoff_ms: 0,
-                retry_condition: None,
-                retry_delay_expr: None,
-                // Chain-level retry emits under the chain's aggregate
-                // policy, not per-step.
-                emit_retry_events: false,
-            });
-        }
-
-        // First-step input wrapping: inject gathered inputs under
-        // `pipeline_input`, preserve the original `config`, and fold in
-        // any accumulated prior-node context and actor memory.
-        if let Some(first) = step_jobs.first_mut() {
-            let mut wrapped = serde_json::json!({
-                "pipeline_input": chain_input,
-                "config": first.input_payload,
-            });
-            if let Some(ref acc) = accumulated_snapshot {
-                if let Some(obj) = wrapped.as_object_mut() {
-                    obj.insert("__accumulated__".to_string(), acc.clone());
-                }
-            }
-            if let Some(ref ctx) = self.actor_context {
-                if let Some(obj) = wrapped.as_object_mut() {
-                    obj.insert("__actor_context__".to_string(), ctx.clone());
-                }
-            }
-            first.input_payload = wrapped;
-        }
-
-        // Pre-INSERT `module_executions` rows for each step so
-        // observers can see the chain's in-flight state. Row ids
-        // (`step_exec_ids`) are engine-level bookkeeping; the wire
-        // format doesn't carry them. The post-dispatch UPDATE below
-        // targets the right row by id.
-        let mut step_exec_ids = Vec::new();
-        if let Some(ref store) = self.module_execution_store {
-            for (i, &step_node_id) in chain_node_ids.iter().enumerate() {
-                let step_exec_id = Uuid::new_v4();
-                step_exec_ids.push(step_exec_id);
-                let input_for_db = if i == 0 {
-                    serde_json::json!({ "input": chain_input })
-                } else {
-                    serde_json::json!(null)
-                };
-                let actual_mid = store.resolve_module_id(step_node_id).await;
-                if let Err(db_err) = store
-                    .record_started(ExecutionStartedContext {
-                        id: step_exec_id,
-                        module_id: actual_mid,
-                        user_id: uid_for_chain.unwrap_or_else(Uuid::new_v4),
-                        workflow_execution_id: execution_id,
-                        input: &input_for_db,
-                        trigger_type: "webhook",
-                        // Pipeline steps dispatch as a unit — no concurrent
-                        // sibling to race against.
-                        race_safe_status: false,
-                    })
-                    .await
-                {
-                    tracing::error!(
-                        "module_execution_store.record_started failed: {}",
-                        db_err
-                    );
-                }
-            }
-        }
-
-        // Aggregate timeout = sum of per-step budgets + 5s NATS
-        // overhead, clamped to the operator-configurable
-        // `TALOS_NATS_TIMEOUT_SECS` floor.
-        static NATS_TIMEOUT_FLOOR_SECS: OnceLock<u64> = OnceLock::new();
-        let nats_floor = *NATS_TIMEOUT_FLOOR_SECS.get_or_init(|| {
-            std::env::var("TALOS_NATS_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
-        });
-        let chain_computed_secs: u64 = chain_node_ids
-            .iter()
-            .map(|id| self.node_timeouts.get(id).copied().unwrap_or(30))
-            .sum::<u64>()
-            + 5;
-        let timeout_secs = chain_computed_secs.max(nats_floor);
-
-        let chain_request = talos_workflow_engine_core::ChainDispatchRequest {
-            workflow_execution_id: execution_id,
-            user_id: uid_for_chain,
-            job_id: None,
-            steps: step_jobs,
-            share_sandbox: true,
-            total_timeout: std::time::Duration::from_secs(timeout_secs),
-            max_retries: chain_retry.max_retries,
-            backoff_ms: chain_retry.backoff_ms,
-            retry_condition: chain_retry.retry_condition.clone(),
-            retry_delay_expr: chain_retry.retry_delay_expression.clone(),
-        };
-
-        let chain_result = match dispatcher.dispatch_chain(chain_request).await {
-            Ok(r) => r,
-            Err(e) => return (chain_tail, Err(e.to_string())),
-        };
-
-        // Per-step post-processing: update `module_executions` rows
-        // with status/output/error; persist `__memory_write__`
-        // payloads for successful steps via the node-lifecycle hook.
-        if let Some(ref store) = self.module_execution_store {
-            for (i, step_result) in chain_result.steps.iter().enumerate() {
-                if let Some(&step_exec_id) = step_exec_ids.get(i) {
-                    let status_str = match step_result.status {
-                        talos_workflow_engine_core::StepStatus::Success => "completed",
-                        talos_workflow_engine_core::StepStatus::TimedOut => "timeout",
-                        talos_workflow_engine_core::StepStatus::Failed => "failed",
-                    };
-                    let error_msg = step_result
-                        .error
-                        .as_deref()
-                        .map(|s| self.redact_str(s));
-                    let duration = i32::try_from(step_result.execution_time_ms)
-                        .unwrap_or(i32::MAX);
-                    if let Err(db_err) = store
-                        .record_completed(
-                            step_exec_id,
-                            status_str,
-                            &self.redact_json(&step_result.output),
-                            duration,
-                            error_msg.as_deref(),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            "module_execution_store.record_completed failed: {}",
-                            db_err
-                        );
-                    }
-
-                    // `__memory_write__` protocol for pipeline steps:
-                    // only fire the hook on success (failed steps may
-                    // carry partial/corrupt output). The hook owns
-                    // extraction + spawn semantics; the engine just
-                    // forwards per-step outputs.
-                    if matches!(
-                        step_result.status,
-                        talos_workflow_engine_core::StepStatus::Success
-                    ) {
-                        if let Some(hook) = self.node_hook.as_ref() {
-                            hook.on_pipeline_step_completed(self.actor_id, &step_result.output);
-                        }
-                    }
-                }
-            }
-            // Mark any unexecuted trailing steps as aborted so the
-            // module-executions audit log shows them as failed rather
-            // than lingering forever in "running".
-            for i in chain_result.steps.len()..step_exec_ids.len() {
-                if let Some(&step_exec_id) = step_exec_ids.get(i) {
-                    if let Err(db_err) = store
-                        .record_completed(
-                            step_exec_id,
-                            "failed",
-                            &serde_json::Value::Null,
-                            0,
-                            Some("Pipeline aborted before this step"),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            "Database operation failed in engine: {}",
-                            db_err
-                        );
-                    }
-                }
-            }
-        }
-
-        match chain_result.overall_status {
-            talos_workflow_engine_core::StepStatus::Success => {
-                (chain_tail, Ok(chain_result.final_output))
-            }
-            _ => (
-                chain_tail,
-                Err(format!(
-                    "Pipeline execution failed: {:?}",
-                    chain_result.final_output
-                )),
-            ),
-        }
-    }
-
-    /// Evict stale entries, then apply the per-module rate limit for
-    /// `node_id`'s resolved module id. Returns `Some(error_envelope)`
-    /// when the limit was exceeded — the scheduler treats that as a
-    /// completed-node-with-error path (insert into results, unblock
-    /// successors, continue). Returns `None` when the dispatch may
-    /// proceed.
-    pub(crate) fn check_rate_limit(&self, node_id: Uuid) -> Option<JsonValue> {
-        evict_stale_rate_limits();
-        let module_id_resolved = self.resolve_module_id(node_id);
-        let limit = *self.rate_limits.get(&module_id_resolved)?;
-        if limit <= 0 {
-            return None;
-        }
-        let now = std::time::Instant::now();
-        let mut entry = MODULE_RATE_LIMITS
-            .entry(module_id_resolved)
-            .or_insert((now, 0));
-        if now.duration_since(entry.0) > std::time::Duration::from_secs(60) {
-            entry.0 = now;
-            entry.1 = 0;
-        }
-        entry.1 += 1;
-        if entry.1 > limit as u32 {
-            tracing::warn!(
-                %node_id,
-                module_id = %module_id_resolved,
-                rate_limit = limit,
-                "Module rate limit exceeded"
-            );
-            Some(serde_json::json!({
-                "__error": true,
-                "error_message": format!("Module rate limit exceeded ({}/min)", limit),
-            }))
-        } else {
-            None
-        }
-    }
-
-    /// Kick off background fetches for direct successors of `node_idx`
-    /// when the current node opts in via `speculative_prefetch: true`
-    /// on its config. Safety caps: max 8 successors prefetched, 5-
-    /// second per-fetch timeout.
-    pub(crate) fn maybe_speculative_prefetch(&self, node_id: Uuid, node_idx: NodeIndex) {
-        if !self
-            .node_configs
-            .get(&node_id)
-            .and_then(|c| c.get("speculative_prefetch"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            return;
-        }
-        for succ_idx in self
-            .graph
-            .neighbors_directed(node_idx, Direction::Outgoing)
-            .take(MAX_PREFETCH_SUCCESSORS)
-        {
-            let succ_id = self.graph[succ_idx];
-            // Skip system nodes — they have no module in the registry
-            // (resolve_module_id returns the node UUID as a fallback).
-            // Fetching would waste a 5-second timeout and generate
-            // noisy debug log entries for every system successor.
-            let Some(succ_module_id) =
-                self.node_meta.get(&succ_id).and_then(|(mid, _, _)| *mid)
-            else {
-                continue;
-            };
-            let prefetch_cache = Arc::clone(&self.module_prefetch_cache);
-            let Some(fetcher) = self.module_fetcher.as_ref() else {
-                continue;
-            };
-            let fetcher = Arc::clone(fetcher);
-            let uid = self.user_id;
-            tokio::spawn(async move {
-                // Atomic duplicate suppression via vacant-entry check:
-                // only one spawn proceeds to fetch; others see the key
-                // already present and return immediately.
-                if prefetch_cache.contains_key(&succ_id) {
-                    return;
-                }
-                let Some(uid) = uid else {
-                    return;
-                };
-                // 5-second timeout: prevents hung prefetch tasks from
-                // leaking tokio task slots if the registry is
-                // unresponsive.
-                let fetch_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    fetcher.fetch(succ_module_id, uid),
-                )
-                .await;
-                match fetch_result {
-                    Ok(Ok(artifact)) => {
-                        // Use entry().or_insert to avoid overwriting a
-                        // result that another concurrent spawn already
-                        // stored.
-                        prefetch_cache.entry(succ_id).or_insert(artifact);
-                        tracing::debug!(
-                            %succ_id,
-                            "speculative prefetch: module cached"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::debug!(
-                            %succ_id,
-                            error = %e,
-                            "speculative prefetch: fetch failed (normal dispatch will retry)"
-                        );
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            %succ_id,
-                            "speculative prefetch: timed out (normal dispatch will fetch)"
-                        );
-                    }
-                }
-            });
-        }
-    }
-
-    /// Build and await the full single-node dispatch future.
-    ///
-    /// Runs the approval gate, merges module + node configs, emits an
-    /// input-preview event, records the `module_executions` start row,
-    /// resolves encrypted secrets, assembles a [`DispatchJob`], and
-    /// hands it to the [`NodeDispatcher`]. Returns the scheduler's
-    /// `(NodeIndex, Result<JsonValue, String>)` completion tuple.
-    ///
-    /// Extracted from the reactor loop so the scheduler body reads as
-    /// a sequence of handler dispatches rather than a 370-line inline
-    /// closure. Semantics are preserved verbatim.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_single_node_dispatch(
-        &self,
-        node_idx: NodeIndex,
-        node_id: Uuid,
-        execution_id: Uuid,
-        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
-        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
-        inputs: JsonValue,
-        accumulated_snapshot: Option<JsonValue>,
-        _execution_sandbox: Option<Arc<cap_std::fs::Dir>>,
-    ) -> (NodeIndex, Result<JsonValue, String>) {
-        let module_id_resolved = self.resolve_module_id(node_id);
-        let retry = self
-            .node_meta
-            .get(&node_id)
-            .and_then(|(_, rp, _)| rp.clone())
-            .unwrap_or_default();
-
-        let wasm_module = match self.fetch_module(node_id).await {
-            Ok(m) => m,
-            Err(e) => return (node_idx, Err(e)),
-        };
-
-        // Approval gate: verify an approved record exists when the
-        // module declares `requires_approval_for`.
-        if !wasm_module.requires_approval_for.is_empty() {
-            if let Some(ref gate) = self.approval_gate {
-                let approval_webhook = self
-                    .node_configs
-                    .get(&node_id)
-                    .and_then(|cfg| cfg.get("NOTIFICATION_WEBHOOK"))
-                    .and_then(|v| v.as_str());
-                match gate
-                    .check_or_request(
-                        execution_id,
-                        node_id,
-                        &wasm_module.requires_approval_for,
-                        approval_webhook,
-                    )
-                    .await
-                {
-                    Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {}
-                    Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
-                        return (
-                            node_idx,
-                            Err(format!(
-                                "Execution paused: module {} requires approval for {:?}. \
-                                 An approval request has been created.",
-                                node_id, wasm_module.requires_approval_for
-                            )),
-                        );
-                    }
-                    Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
-                        return (node_idx, Err(reason));
-                    }
-                    Err(e) => {
-                        tracing::error!(%node_id, "Approval gate check failed: {}", e);
-                        return (node_idx, Err(format!("Approval gate check failed: {e}")));
-                    }
-                }
-            }
-        }
-
-        if self.user_id.is_none() {
-            return (
-                node_idx,
-                Err("Module execution requires user context (user_id not set)".to_string()),
-            );
-        }
-
-        // Module-level config from the artifact, merged with any
-        // graph-JSON-level node config (graph JSON wins; reserved
-        // engine keys are filtered out before the merge lands on the
-        // worker).
-        let module_config = wasm_module
-            .config
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let module_config = if let Some(node_cfg) = self.node_configs.get(&node_id) {
-            if module_config.is_object() && node_cfg.is_object() {
-                let mut merged = module_config.as_object().cloned().unwrap_or_default();
-                if let Some(node_cfg_obj) = node_cfg.as_object() {
-                    for (k, v) in node_cfg_obj {
-                        if k == "__skip_condition"
-                            || k == "skip_condition"
-                            || k == "__continue_on_error"
-                            || k == "continue_on_error"
-                        {
-                            continue;
-                        }
-                        merged.insert(k.clone(), v.clone());
-                    }
-                }
-                serde_json::Value::Object(merged)
-            } else if module_config == serde_json::json!({}) {
-                node_cfg.clone()
-            } else {
-                module_config
-            }
-        } else {
-            module_config
-        };
-
-        // Merge config and input into a flat object so templates can
-        // find their fields at the top level (e.g., "text", "URL").
-        // Also include "config" and "input" sub-objects for templates
-        // that explicitly read from those keys.
-        let wrapped_input = {
-            let mut merged = serde_json::Map::new();
-            if let Some(obj) = module_config.as_object() {
-                for (k, v) in obj {
-                    merged.insert(k.clone(), v.clone());
-                }
-            }
-            if let Some(obj) = inputs.as_object() {
-                for (k, v) in obj {
-                    merged.insert(k.clone(), v.clone());
-                }
-            } else if !inputs.is_null() {
-                merged.insert("input".to_string(), inputs.clone());
-            }
-            if module_config != serde_json::json!({}) {
-                merged.insert("config".to_string(), module_config.clone());
-            }
-            let is_empty_object = inputs
-                .as_object()
-                .map(|m| m.is_empty())
-                .unwrap_or(false);
-            if !inputs.is_null() && !is_empty_object {
-                merged.insert("input".to_string(), inputs.clone());
-            }
-            if let Some(acc) = &accumulated_snapshot {
-                merged.insert("__accumulated__".to_string(), acc.clone());
-            }
-            if let Some(ref ctx) = self.actor_context {
-                merged.insert("__actor_context__".to_string(), ctx.clone());
-            }
-            serde_json::Value::Object(merged)
-        };
-
-        // Truncated input preview for the node-I/O inspector.
-        {
-            let input_preview = {
-                let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
-                if s.len() > 4096 {
-                    format!("{}...(truncated)", &s[..4096])
-                } else {
-                    s
-                }
-            };
-            emit_event_spawn(
-                &self.event_sink,
-                NodeEventWrite {
-                    execution_id,
-                    event_type: "node_input".to_string(),
-                    node_id: Some(node_id),
-                    status: "Input".to_string(),
-                    log_message: Some(input_preview),
-                    iteration_index: None,
-                },
-            );
-        }
-
-        let job_id = Uuid::new_v4();
-        if let Some(ref store) = self.module_execution_store {
-            // Resolve the actual wasm_modules.id for the FK.
-            // `module_id_resolved` may be a node_template UUID
-            // (Fallback 2 path) not present in wasm_modules; the
-            // store's resolver maps template → wasm_modules by
-            // most-recent compile.
-            let actual_module_id = store.resolve_module_id(module_id_resolved).await;
-            if let Err(db_err) = store
-                .record_started(ExecutionStartedContext {
-                    id: job_id,
-                    module_id: actual_module_id,
-                    user_id: self.user_id.unwrap_or_else(Uuid::new_v4),
-                    workflow_execution_id: execution_id,
-                    input: &inputs,
-                    trigger_type: "webhook",
-                    // Race-safe: if a sibling has already failed the
-                    // workflow, this row enters as 'cancelled' rather
-                    // than 'running', closing the race with the
-                    // failure-path UPDATE.
-                    race_safe_status: true,
-                })
-                .await
-            {
-                tracing::error!(
-                    "module_execution_store.record_started failed: {}",
-                    db_err
-                );
-            }
-        }
-
-        // Per-node fuel limit: config override > module default, capped at 50M.
-        let node_max_fuel = module_config
-            .get("max_fuel")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(wasm_module.max_fuel)
-            .min(50_000_000);
-
-        // Resolve encrypted secrets payload (opaque bytes at this layer).
-        let encrypted_secrets =
-            match (self.secrets_resolver.as_ref(), &worker_shared_key) {
-                (Some(resolver), Some(key)) => {
-                    let vault_paths = extract_vault_paths(&module_config);
-                    build_encrypted_secrets_for(
-                        resolver.as_ref(),
-                        self.secret_envelope.as_ref(),
-                        module_id_resolved,
-                        self.user_id,
-                        &vault_paths,
-                        &wasm_module.allowed_secrets,
-                        key.as_bytes(),
-                    )
-                    .await
-                }
-                _ => Default::default(),
-            };
-
-        // Wire-format WASM budget. The dispatcher internally adds its
-        // own Tokio-outer grace on top (see TOKIO_WRAP_GRACE_SECS).
-        let node_timeout_secs = self
-            .node_timeouts
-            .get(&node_id)
-            .copied()
-            .unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
-
-        let job = DispatchJob {
-            execution_id,
-            node_id,
-            module_id: module_id_resolved,
-            // Pre-INSERTed module_executions row is keyed by this id.
-            job_id: Some(job_id),
-            user_id: self.user_id,
-            actor_id: self.actor_id,
-            module_uri: wasm_module
-                .oci_url
-                .clone()
-                .unwrap_or_else(|| format!("redis:wasm:{module_id_resolved}")),
-            // Embed bytes directly so the worker doesn't depend on
-            // Redis pre-warm — bypasses the `wasm:{uid}:{id}` vs
-            // `wasm:{id}` key mismatch and template-UUID issues.
-            wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
-                None
-            } else {
-                Some(wasm_module.wasm_bytes.clone())
-            },
-            // OCI modules (empty wasm_bytes) commit the expected hash
-            // so the worker verifies fetched content matches what the
-            // engine compiled. Inline bytes don't need this — HMAC
-            // already covers sha256(inline_bytes).
-            expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
-                Some(wasm_module.content_hash.clone())
-            } else {
-                None
-            },
-            capability_world: Some(wasm_module.capability_world.clone()),
-            integration_name: wasm_module.integration_name.clone(),
-            input_payload: wrapped_input,
-            timeout: std::time::Duration::from_secs(node_timeout_secs),
-            max_fuel: node_max_fuel,
-            allowed_hosts: wasm_module.allowed_hosts.clone(),
-            allowed_methods: wasm_module.allowed_methods.clone(),
-            allowed_secrets: wasm_module.allowed_secrets.clone(),
-            allowed_sql_operations: vec![],
-            allow_tier2_exposure: false,
-            encrypted_secrets_ciphertext: encrypted_secrets.ciphertext,
-            encrypted_secrets_nonce: encrypted_secrets.nonce,
-            priority: 100,
-            dry_run: self.dry_run,
-            max_retries: retry.max_retries,
-            backoff_ms: retry.backoff_ms,
-            retry_condition: retry.retry_condition.clone(),
-            retry_delay_expr: retry.retry_delay_expression.clone(),
-            emit_retry_events: true,
-        };
-
-        match dispatcher.dispatch(job).await {
-            Ok(result) => {
-                tracing::info!(%node_id, "Node execution succeeded");
-                (node_idx, Ok(result.output))
-            }
-            Err(e) => (node_idx, Err(e.to_string())),
-        }
-    }
-
     /// Fire-and-forget emit of a `node_skipped` event. Used by the
     /// skip-condition pre-filter so the scheduler's standard dispatch
     /// branches don't each have to remember to log the skip.
@@ -4134,6 +3903,7 @@ impl ParallelWorkflowEngine {
                 status: "Skipped".to_string(),
                 log_message: None,
                 iteration_index: None,
+                error_class: None,
             },
         );
     }
@@ -4157,6 +3927,7 @@ impl ParallelWorkflowEngine {
                 status: "Running".to_string(),
                 log_message: Some(format!("Loop iteration {iteration}/{max_iters}")),
                 iteration_index: Some(iteration as i32),
+                error_class: None,
             },
         );
     }
@@ -4181,6 +3952,7 @@ impl ParallelWorkflowEngine {
                 status: "Running".to_string(),
                 log_message: None,
                 iteration_index: None,
+                error_class: None,
             })
             .await;
             sink.emit(NodeEventWrite {
@@ -4190,22 +3962,30 @@ impl ParallelWorkflowEngine {
                 status,
                 log_message: Some(log_message),
                 iteration_index: None,
+                error_class: None,
             })
             .await;
         });
     }
 
     /// Execute the graph in parallel using a caller-supplied
-    /// [`NodeDispatcher`].
+    /// [`NodeDispatcher`] — the engine's primary public API and the
+    /// **fresh-run** entry point.
+    ///
+    /// Use this for a workflow run that starts from scratch with no
+    /// prior state. For a run that picks up from a checkpoint or an
+    /// external-trigger payload, use
+    /// [`run_with_seed_with_transport`](Self::run_with_seed_with_transport).
     ///
     /// Linear chains (maximal sequences of nodes with in-degree=1 / out-degree=1)
-    /// are dispatched as a single `execute_pipeline()` call, eliminating per-node
-    /// dispatcher round-trips and intermediate result serialisation.
+    /// are batched through `NodeDispatcher::dispatch_chain` in a
+    /// single round-trip. Other nodes dispatch one-per-tokio-task with
+    /// `FuturesUnordered`-bounded concurrency.
     ///
-    /// This is the engine's primary public API. Callers using the
-    /// `talos-workflow-engine-nats` crate build a `NatsNodeDispatcher`;
-    /// consumers with a different transport supply their own
-    /// `NodeDispatcher` impl.
+    /// Callers using `talos-workflow-engine-nats` build a
+    /// `NatsNodeDispatcher`; other transports supply their own impl.
+    /// See [`docs/custom-dispatcher.md`](https://github.com/aegix-dev/talos-workflow-engine/blob/main/docs/custom-dispatcher.md)
+    /// for the integration walkthrough.
     ///
     /// # Errors
     ///
@@ -4217,16 +3997,22 @@ impl ParallelWorkflowEngine {
     ///   regression observed in a prior incident).
     /// * [`WorkflowEngineError::GraphCyclic`] when the loaded graph
     ///   has a cycle.
+    /// * [`WorkflowEngineError::Timeout`] when the workflow exceeded
+    ///   its configured wall-clock cap (see
+    ///   [`set_execution_timeout`](Self::set_execution_timeout)).
+    ///   Carries the configured `secs` so callers can produce
+    ///   diagnostic messages without parsing.
     /// * [`WorkflowEngineError::Execution`] for other run-time
     ///   failures the engine has not yet promoted to a typed variant
-    ///   (dispatch error, timeout, sub-workflow failure, etc.); the
-    ///   message body is human-readable but **not** stable for
+    ///   (dispatch error, sub-workflow failure, etc.); the message
+    ///   body is human-readable but **not** stable for
     ///   pattern-matching.
     ///
     /// [`NodeDispatcher`]: talos_workflow_engine_core::NodeDispatcher
     /// [`SecretsResolver`]: talos_workflow_engine_core::SecretsResolver
     /// [`WorkflowEngineError::SecretsResolverMissing`]: crate::WorkflowEngineError::SecretsResolverMissing
     /// [`WorkflowEngineError::GraphCyclic`]: crate::WorkflowEngineError::GraphCyclic
+    /// [`WorkflowEngineError::Timeout`]: crate::WorkflowEngineError::Timeout
     /// [`WorkflowEngineError::Execution`]: crate::WorkflowEngineError::Execution
     pub async fn run_with_transport(
         &self,
@@ -4234,35 +4020,91 @@ impl ParallelWorkflowEngine {
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         execution_id: Uuid,
     ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
-        // Abstract-entry guard: see `WorkflowEngineError::SecretsResolverMissing`
-        // for the rationale (every dispatch site requires a resolver
-        // to encrypt per-node secrets; an unset resolver would
-        // produce empty-ciphertext dispatches).
-        if self.secrets_resolver.is_none() {
-            return Err(crate::WorkflowEngineError::SecretsResolverMissing);
-        }
-        if petgraph::algo::is_cyclic_directed(&self.graph) {
-            return Err(crate::WorkflowEngineError::GraphCyclic);
-        }
-        self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id)
-            .await
-            .map_err(crate::WorkflowEngineError::execution)
+        self.precheck_runnable()?;
+        // Consult the engine-level cancellation token if one was
+        // wired via `set_cancellation_token`. Callers needing a
+        // one-off override use `run_with_transport_cancellable`
+        // instead, which takes a token as a parameter and ignores
+        // this field.
+        run_with_workflow_timeout(
+            self.execution_timeout_secs,
+            self.cancellation_token.clone(),
+            self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id),
+        )
+        .await
     }
 
-    /// Execute the graph with pre-seeded node results (e.g., from a webhook trigger).
+    /// Cancellable variant of [`run_with_transport`](Self::run_with_transport).
+    ///
+    /// Identical semantics except the caller can short-circuit the
+    /// reactor by cancelling `cancel`. The engine returns
+    /// [`crate::WorkflowEngineError::Cancelled`] as soon as the token
+    /// fires, bypassing whatever future the reactor was awaiting.
+    ///
+    /// # In-flight worker dispatches
+    ///
+    /// Cancellation only stops the engine's own scheduling. Workers
+    /// already executing a `DispatchJob` continue until they
+    /// complete on their own — the engine has no out-of-band channel
+    /// to abort them. If your transport supports mid-flight
+    /// cancellation (e.g. NATS request-reply with a side subject),
+    /// wire it through your `NodeDispatcher` impl using
+    /// the
+    /// [`DispatchJob`](talos_workflow_engine_core::DispatchJob)`::cancellation_token`
+    /// field.
+    ///
+    /// Use [`tokio_util::sync::CancellationToken::new`] to construct
+    /// a token; clone it as needed to share with the cancel-trigger
+    /// site.
+    pub async fn run_with_transport_cancellable(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        execution_id: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
+        self.precheck_runnable()?;
+        run_with_workflow_timeout(
+            self.execution_timeout_secs,
+            Some(cancel),
+            self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id),
+        )
+        .await
+    }
+
+    /// Execute the graph with pre-seeded node results — the resume
+    /// path complement to [`run_with_transport`](Self::run_with_transport).
     ///
     /// `initial_results` maps node UUIDs to their pre-computed output.
-    /// Nodes in this map are treated as already completed; only their
-    /// successors (and successors' successors) are executed.
+    /// Every node in this map is treated as **already completed**; the
+    /// engine skips them and only schedules their successors (and
+    /// their successors' successors). This is the engine's primary
+    /// resume primitive:
     ///
-    /// Uses single-node dispatch — the pipeline chain optimisation is
-    /// not applied when resuming from seed because the chain detector
-    /// would build chains spanning already-completed nodes and
-    /// re-dispatch them.
+    /// * **Resume from a checkpoint** — load a prior run's snapshot
+    ///   from your [`CheckpointStore`] impl and pass it in. Use the
+    ///   same `execution_id` so events / audit rows correlate.
+    /// * **Webhook / external-trigger continuation** — when a `Wait`
+    ///   or approval gate returns external input, seed the paused
+    ///   node with the resolved value and resume.
+    /// * **Re-running a single subtree** — seed every node *outside*
+    ///   the subtree with its prior output to force the engine to
+    ///   re-dispatch only what's downstream of your changes.
+    ///
+    /// The pipeline-chain optimisation is **disabled** on this path:
+    /// the chain detector would otherwise build chains spanning
+    /// already-completed seeded nodes and re-dispatch them. Per-node
+    /// dispatch throughput is unchanged; large linear graphs may pay
+    /// a few extra round-trips on resume.
+    ///
+    /// See [`docs/checkpoint-lifecycle.md`](https://github.com/aegix-dev/talos-workflow-engine/blob/main/docs/checkpoint-lifecycle.md)
+    /// for the full pause-and-resume walkthrough.
     ///
     /// # Errors
     ///
     /// Same error contract as [`Self::run_with_transport`].
+    ///
+    /// [`CheckpointStore`]: talos_workflow_engine_core::CheckpointStore
     pub fn run_with_seed_with_transport(
         &self,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
@@ -4270,22 +4112,166 @@ impl ParallelWorkflowEngine {
         initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
     ) -> Pin<
-        Box<
-            dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>>
-                + Send
-                + '_,
-        >,
+        Box<dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>> + Send + '_>,
     > {
-        // Abstract-entry guard: mirrors `run_with_transport`. See
-        // `WorkflowEngineError::SecretsResolverMissing` for rationale.
+        // Abstract-entry guard mirrors `run_with_transport`.
+        if let Err(e) = self.precheck_runnable() {
+            return Box::pin(async move { Err(e) });
+        }
+        let timeout_secs = self.execution_timeout_secs;
+        // Engine-level cancel propagation; see set_cancellation_token.
+        let cancel = self.cancellation_token.clone();
+        let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
+        Box::pin(async move { run_with_workflow_timeout(timeout_secs, cancel, inner).await })
+    }
+
+    /// Cancellable variant of
+    /// [`run_with_seed_with_transport`](Self::run_with_seed_with_transport).
+    /// See [`run_with_transport_cancellable`](Self::run_with_transport_cancellable)
+    /// for the cancellation contract — same semantics on the seeded
+    /// resume path.
+    pub fn run_with_seed_with_transport_cancellable(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        initial_results: HashMap<Uuid, JsonValue>,
+        execution_id: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>> + Send + '_>,
+    > {
+        if let Err(e) = self.precheck_runnable() {
+            return Box::pin(async move { Err(e) });
+        }
+        let timeout_secs = self.execution_timeout_secs;
+        let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
+        Box::pin(async move { run_with_workflow_timeout(timeout_secs, Some(cancel), inner).await })
+    }
+
+    /// Execute the graph with a caller-supplied **trigger input** —
+    /// the fresh-run entry point for workflows that expect an external
+    /// payload (webhook body, job arguments, upstream event, …) at
+    /// their root.
+    ///
+    /// Equivalent to [`run_with_transport`](Self::run_with_transport)
+    /// except the engine installs a synthetic root node that carries
+    /// `trigger_input` as its output, then wires it to every current
+    /// root so root-level modules execute with the trigger as their
+    /// input. Callers that previously hand-rolled this pattern —
+    /// adding a synthetic node, wiring it to roots, seeding
+    /// `initial_results`, and dispatching — collapse the dance into a
+    /// single call.
+    ///
+    /// The mechanism is internal. The synthetic node's identity, its
+    /// label, and how it's wired are implementation details: a future
+    /// release may seed root outputs natively without a fake parent
+    /// node, and callers using this method will see no breakage.
+    ///
+    /// # Mutation and idempotence
+    ///
+    /// Takes `&mut self` because installing the trigger adds a node
+    /// and edges to the engine's graph. Calling the method more than
+    /// once on the same engine is safe: the second call reuses the
+    /// synthetic trigger created by the first and only adds edges to
+    /// new roots that have appeared in the graph since.
+    ///
+    /// # Errors
+    ///
+    /// Same error contract as
+    /// [`run_with_transport`](Self::run_with_transport).
+    pub async fn run_with_trigger_input_transport(
+        &mut self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        trigger_input: JsonValue,
+        execution_id: Uuid,
+    ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
+        let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
+        let mut initial_results = HashMap::new();
+        initial_results.insert(trigger_node_id, trigger_input);
+        self.run_with_seed_with_transport(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+        )
+        .await
+    }
+
+    /// Cancellable variant of
+    /// [`run_with_trigger_input_transport`](Self::run_with_trigger_input_transport).
+    /// See [`run_with_transport_cancellable`](Self::run_with_transport_cancellable)
+    /// for the cancellation contract — same semantics on the
+    /// trigger-input path.
+    pub async fn run_with_trigger_input_transport_cancellable(
+        &mut self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        trigger_input: JsonValue,
+        execution_id: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
+        let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
+        let mut initial_results = HashMap::new();
+        initial_results.insert(trigger_node_id, trigger_input);
+        self.run_with_seed_with_transport_cancellable(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+            cancel,
+        )
+        .await
+    }
+
+    /// Pre-dispatch sanity checks shared by [`run_with_transport`] and
+    /// [`run_with_seed_with_transport`].
+    ///
+    /// Each check fails closed with a typed
+    /// [`crate::WorkflowEngineError`] variant rather than letting the
+    /// underlying configuration mistake surface as a per-node failure
+    /// deep inside the reactor. Documented in order of evaluation:
+    ///
+    /// 1. [`SecretsResolverMissing`](crate::WorkflowEngineError::SecretsResolverMissing)
+    ///    — every dispatch encrypts per-node secrets through the
+    ///    resolver; without one the engine would silently produce
+    ///    empty-ciphertext dispatches (a 2026-04 production
+    ///    regression).
+    /// 2. [`ModuleFetcherMissing`](crate::WorkflowEngineError::ModuleFetcherMissing)
+    ///    — only checked when the loaded graph references at least
+    ///    one module-backed node. Pure-system-node graphs are still
+    ///    runnable without a fetcher.
+    /// 3. [`UserContextRequired`](crate::WorkflowEngineError::UserContextRequired)
+    ///    — same scoping as the fetcher check: required only when a
+    ///    module-backed node exists, since module-artifact
+    ///    resolution is per-user (cross-tenant isolation).
+    /// 4. [`GraphCyclic`](crate::WorkflowEngineError::GraphCyclic)
+    ///    — cycle detection runs last because it's the most
+    ///    expensive check on a large graph and the cheaper config
+    ///    checks should short-circuit first.
+    ///
+    /// [`run_with_transport`]: Self::run_with_transport
+    /// [`run_with_seed_with_transport`]: Self::run_with_seed_with_transport
+    fn precheck_runnable(&self) -> Result<(), crate::WorkflowEngineError> {
         if self.secrets_resolver.is_none() {
-            return Box::pin(async move { Err(crate::WorkflowEngineError::SecretsResolverMissing) });
+            return Err(crate::WorkflowEngineError::SecretsResolverMissing);
+        }
+        let has_module_node = self
+            .node_meta
+            .values()
+            .any(|(module_id, _, _)| module_id.is_some());
+        if has_module_node {
+            if self.module_fetcher.is_none() {
+                return Err(crate::WorkflowEngineError::ModuleFetcherMissing);
+            }
+            if self.user_id.is_none() {
+                return Err(crate::WorkflowEngineError::UserContextRequired);
+            }
         }
         if petgraph::algo::is_cyclic_directed(&self.graph) {
-            return Box::pin(async move { Err(crate::WorkflowEngineError::GraphCyclic) });
+            return Err(crate::WorkflowEngineError::GraphCyclic);
         }
-        let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
-        Box::pin(async move { inner.await.map_err(crate::WorkflowEngineError::execution) })
+        Ok(())
     }
 
     /// Unified scheduler body shared by [`run_with_transport`] and
@@ -4352,30 +4338,14 @@ impl ParallelWorkflowEngine {
         initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
     ) -> Result<WorkflowContext, String> {
-        let timeout_secs = self.execution_timeout_secs;
-        let scheduler = self.run_scheduler_loop(
-            dispatcher,
-            worker_shared_key,
-            initial_results,
-            execution_id,
-        );
-        if timeout_secs == 0 {
-            // Explicitly opted out of workflow-level timeout —
-            // per-node timeouts are the only safety net.
-            scheduler.await
-        } else {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                scheduler,
-            )
+        // Workflow-level timeout enforcement was hoisted into the
+        // public wrappers (`run_with_transport` /
+        // `run_with_seed_with_transport`) so the typed
+        // `WorkflowEngineError::Timeout` variant can be constructed
+        // with the configured cap directly. Per-node timeouts and
+        // sub-workflow timeouts still live inside the reactor.
+        self.run_scheduler_loop(dispatcher, worker_shared_key, initial_results, execution_id)
             .await
-            {
-                Ok(inner) => inner,
-                Err(_) => Err(format!(
-                    "Workflow execution timed out after {timeout_secs} seconds"
-                )),
-            }
-        }
     }
 
     /// The actual reactor loop, lifted out of [`run_inner`] so the
@@ -4430,8 +4400,29 @@ impl ParallelWorkflowEngine {
         // Pipeline chain detection runs ONLY on fresh runs. On seeded
         // resume the detector would build chains spanning
         // already-completed nodes and re-dispatch them.
+        //
+        // After detection, drop any chain that touches a system node:
+        // pipeline dispatch tries to resolve a wasm artifact for every
+        // step, and `Wait` / `FanIn` / `Collect` / etc. have none. A
+        // chain spanning a `Wait` would also defeat the pause-on-Wait
+        // contract because the chain dispatch is atomic — there's no
+        // way to short-circuit mid-chain.
         let chains: Vec<Vec<NodeIndex>> = if is_fresh_run {
             detect_linear_chains(&self.graph)
+                .into_iter()
+                .filter(|chain| {
+                    chain.iter().all(|&idx| {
+                        let node_id = self.graph[idx];
+                        // Only module-backed nodes belong in a pipeline.
+                        // `node_meta` carries `(module_id, retry, kind)`;
+                        // a system kind disqualifies the node.
+                        self.node_meta
+                            .get(&node_id)
+                            .map(|(module_id, _, kind)| module_id.is_some() && kind.is_none())
+                            .unwrap_or(false)
+                    })
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -4516,10 +4507,7 @@ impl ParallelWorkflowEngine {
                     );
                     executing.push(Box::pin(fut)
                         as Pin<
-                            Box<
-                                dyn Future<Output = (NodeIndex, Result<JsonValue, String>)>
-                                    + Send,
-                            >,
+                            Box<dyn Future<Output = (NodeIndex, Result<JsonValue, String>)> + Send>,
                         >);
                     continue;
                 }
@@ -4564,6 +4552,35 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_verify(node_idx, node_id, execution_id, &results)
                 {
+                    results.insert(node_id, output);
+                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
+                }
+
+                // ── Wait dispatch (pause until external resume) ──────────────
+                //
+                // Always-on; not feature-gated. The handler returns a
+                // pause signal carrying the `__waiting__` envelope.
+                // Inserting it into `results` and returning early lets
+                // the caller's `CheckpointStore` snapshot the partial
+                // run; the resume path threads the external input
+                // through `run_with_seed_with_transport(seed = {wait_id
+                // → external_value})` so successors see the
+                // substituted value via gather_inputs.
+                if let Some(outcome) = self.try_dispatch_wait(node_id, execution_id) {
+                    use crate::scheduler_handlers::WaitOutcome;
+                    let WaitOutcome::Pause { waiting_output } = outcome;
+                    results.insert(node_id, waiting_output);
+                    return Ok(WorkflowContext {
+                        results,
+                        waiting: true,
+                        ..Default::default()
+                    });
+                }
+
+                // ── InlineJudge dispatch (sync expression-driven verdict) ────
+                #[cfg(feature = "llm-primitives")]
+                if let Some(output) = self.try_dispatch_inline_judge(node_idx, node_id, &results) {
                     results.insert(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
@@ -4757,9 +4774,7 @@ impl ParallelWorkflowEngine {
                                 error = %err_msg,
                                 "Capability dispatch failed — failing workflow"
                             );
-                            return Err(format!(
-                                "Capability dispatch node {node_id}: {err_msg}"
-                            ));
+                            return Err(format!("Capability dispatch node {node_id}: {err_msg}"));
                         }
                         tracing::info!(
                             %node_id,
@@ -4783,21 +4798,59 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
+                    // `run_loop_iterations` lifts `__error`/`error_message`
+                    // to the top level when the loop terminated from a
+                    // body failure (vs. condition-false / max-iterations).
+                    // Honor `continue_on_error` the same way the
+                    // capability-dispatch branch does.
+                    if output
+                        .get("__error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        let continue_on_error = self
+                            .node_configs
+                            .get(&node_id)
+                            .and_then(|c| c.get("__continue_on_error"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if !continue_on_error {
+                            let err_msg = output
+                                .get("error_message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("loop body failed")
+                                .to_string();
+                            let reason = output
+                                .get("termination_reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("body_error");
+                            tracing::error!(
+                                %node_id,
+                                termination_reason = %reason,
+                                error = %err_msg,
+                                "Loop terminated by body failure — failing workflow"
+                            );
+                            return Err(format!("Loop node {node_id}: {err_msg}"));
+                        }
+                        tracing::info!(
+                            %node_id,
+                            "Loop body failed but continue_on_error is set — continuing"
+                        );
+                    }
                     results.insert(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── ErrorHandler dispatch (pattern filtering) ───────────────
-                if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results)
-                {
+                if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results) {
                     results.insert(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
                 }
 
                 // ── Single-node dispatch ─────────────────────────────────────
-                if let Some(error_envelope) = self.check_rate_limit(node_id) {
+                if let Some(error_envelope) = self.check_rate_limit(node_id).await {
                     results.insert(node_id, error_envelope);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
                     continue;
@@ -4806,6 +4859,13 @@ impl ParallelWorkflowEngine {
                 let inputs = self.gather_inputs(node_idx, &results);
                 let accumulated_snapshot =
                     Self::build_accumulated_context(&self.node_labels, &results);
+                // `__trigger_input__` is synthesized once from the
+                // synthetic `__trigger__` node output (or unwrapped when
+                // the parent was itself a sub-workflow — see
+                // `extract_trigger_input`) and threaded into every
+                // node's envelope so the scaffold's "always preserved"
+                // contract is honored end to end.
+                let trigger_input_val = self.extract_trigger_input(&results);
                 let fut = self.run_single_node_dispatch(
                     node_idx,
                     node_id,
@@ -4814,6 +4874,7 @@ impl ParallelWorkflowEngine {
                     worker_shared_key.clone(),
                     inputs,
                     accumulated_snapshot,
+                    trigger_input_val,
                     execution_sandbox.clone(),
                 );
                 // Per-node timing + node_started event: always emitted
@@ -4829,6 +4890,7 @@ impl ParallelWorkflowEngine {
                         status: "Running".to_string(),
                         log_message: None,
                         iteration_index: None,
+                        error_class: None,
                     },
                 );
                 executing.push(Box::pin(fut)
@@ -4897,291 +4959,11 @@ impl ParallelWorkflowEngine {
 }
 
 // ============================================================================
-// Tests
+// Tests — extracted to engine_tests.rs to keep this file focused on
+// the impl. Mounted via #[path] so the test module is logically a
+// child of engine and use super::* resolves to engine items.
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use talos_workflow_engine_core::EdgeLogic;
-
-    fn make_graph(edges: &[(usize, usize)], num_nodes: usize) -> DiGraph<Uuid, EdgeLogic> {
-        let mut g: DiGraph<Uuid, EdgeLogic> = DiGraph::new();
-        let nodes: Vec<NodeIndex> = (0..num_nodes).map(|_| g.add_node(Uuid::new_v4())).collect();
-        for &(from, to) in edges {
-            g.add_edge(
-                nodes[from],
-                nodes[to],
-                EdgeLogic {
-                    source_handle: "output".to_string(),
-                    target_handle: "input".to_string(),
-                    mapping: None,
-                    condition: None,
-                    edge_type: Default::default(),
-                },
-            );
-        }
-        g
-    }
-
-    #[test]
-    fn linear_chain_simple_3_nodes() {
-        // A → B → C
-        let g = make_graph(&[(0, 1), (1, 2)], 3);
-        let chains = detect_linear_chains(&g);
-        assert_eq!(chains.len(), 1, "should detect exactly one chain");
-        assert_eq!(chains[0].len(), 3, "chain should include all 3 nodes");
-    }
-
-    #[test]
-    fn no_chain_for_fork() {
-        // A → B, A → C
-        let g = make_graph(&[(0, 1), (0, 2)], 3);
-        let chains = detect_linear_chains(&g);
-        assert!(
-            chains.is_empty(),
-            "Fork has no 2+ linear chain: {:?}",
-            chains
-        );
-    }
-
-    #[test]
-    fn no_chain_for_join() {
-        // A → C, B → C
-        let g = make_graph(&[(0, 2), (1, 2)], 3);
-        let chains = detect_linear_chains(&g);
-        assert!(chains.is_empty(), "Join has no 2+ linear chain");
-    }
-
-    #[test]
-    fn chain_with_single_edge() {
-        // A → B (trivial 2-node chain)
-        let g = make_graph(&[(0, 1)], 2);
-        let chains = detect_linear_chains(&g);
-        assert_eq!(chains.len(), 1);
-        assert_eq!(chains[0].len(), 2);
-    }
-
-    #[test]
-    fn single_node_no_chain() {
-        let g = make_graph(&[], 1);
-        let chains = detect_linear_chains(&g);
-        assert!(chains.is_empty(), "Single node produces no chain");
-    }
-
-    #[test]
-    fn diamond_graph_no_full_chain() {
-        // A → B → D, A → C → D
-        // B and C each have in-degree=1, out-degree=1 — but D has in-degree=2
-        let g = make_graph(&[(0, 1), (0, 2), (1, 3), (2, 3)], 4);
-        let chains = detect_linear_chains(&g);
-        // A→B could be a chain (A out-degree=2 breaks it), so no chain >= 2.
-        // Actually A has out-degree=2, so neither B nor C's predecessors qualify
-        // as chain starts... let's just verify no chain spans the diamond.
-        for chain in &chains {
-            assert!(chain.len() < 3, "No chain of length >=3 in diamond graph");
-        }
-    }
-
-    #[test]
-    fn parallel_chains() {
-        // A → B → C and D → E (two independent chains)
-        let g = make_graph(&[(0, 1), (1, 2), (3, 4)], 5);
-        let chains = detect_linear_chains(&g);
-        assert_eq!(chains.len(), 2, "should find exactly 2 chains");
-        let lengths: Vec<usize> = chains.iter().map(|c| c.len()).collect();
-        assert!(lengths.contains(&3), "one chain of length 3");
-        assert!(lengths.contains(&2), "one chain of length 2");
-    }
-
-    // ── collapse_subworkflow_output tests ───────────────────────────────────
-    // These tests pin the contract that judge/reflective-retry/ensemble rely on:
-    // a sub-workflow with exactly one terminal node returns that node's output
-    // directly; multiple terminals fall back to a label-keyed map.
-
-    /// Build an engine where nodes are laid out in index order, labels
-    /// are assigned by position, and edges are (src_label, dst_label) pairs.
-    /// Returns (engine, label -> uuid).
-    fn build_sub_engine(
-        labels: &[&str],
-        edges: &[(&str, &str)],
-    ) -> (ParallelWorkflowEngine, HashMap<String, Uuid>) {
-        let mut engine = ParallelWorkflowEngine::new();
-        let mut label_to_uuid: HashMap<String, Uuid> = HashMap::new();
-        let mut label_to_idx: HashMap<String, NodeIndex> = HashMap::new();
-        for label in labels {
-            let uuid = Uuid::new_v4();
-            let idx = engine.graph.add_node(uuid);
-            engine.node_labels.insert(uuid, label.to_string());
-            label_to_uuid.insert(label.to_string(), uuid);
-            label_to_idx.insert(label.to_string(), idx);
-        }
-        for (src, dst) in edges {
-            let s = label_to_idx[*src];
-            let d = label_to_idx[*dst];
-            engine.graph.add_edge(
-                s,
-                d,
-                EdgeLogic {
-                    source_handle: "output".to_string(),
-                    target_handle: "input".to_string(),
-                    mapping: None,
-                    condition: None,
-                    edge_type: Default::default(),
-                },
-            );
-        }
-        (engine, label_to_uuid)
-    }
-
-    #[test]
-    fn collapse_single_terminal_returns_unwrapped_output() {
-        // Canonical judge case: one node, returns record shape — caller sees fields directly.
-        let (engine, uuids) = build_sub_engine(&["judge"], &[]);
-        let mut results = HashMap::new();
-        results.insert(
-            uuids["judge"],
-            serde_json::json!({"score": 0.94, "passed": true, "reasoning": "ok", "feedback": "good"}),
-        );
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out.get("score").and_then(|v| v.as_f64()), Some(0.94));
-        assert_eq!(out.get("passed").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(out.get("reasoning").and_then(|v| v.as_str()), Some("ok"));
-        assert_eq!(out.get("feedback").and_then(|v| v.as_str()), Some("good"));
-    }
-
-    #[test]
-    fn collapse_linear_chain_returns_only_terminal() {
-        // A → B → C. Only C is terminal; its output is the sub-workflow output.
-        let (engine, uuids) = build_sub_engine(&["a", "b", "c"], &[("a", "b"), ("b", "c")]);
-        let mut results = HashMap::new();
-        results.insert(uuids["a"], serde_json::json!({"stage": "a", "n": 1}));
-        results.insert(uuids["b"], serde_json::json!({"stage": "b", "n": 2}));
-        results.insert(uuids["c"], serde_json::json!({"stage": "c", "n": 3}));
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out.get("stage").and_then(|v| v.as_str()), Some("c"));
-        assert_eq!(out.get("n").and_then(|v| v.as_i64()), Some(3));
-    }
-
-    #[test]
-    fn collapse_multiple_terminals_returns_label_keyed_map() {
-        // Two independent terminals: fallback to label-keyed map.
-        let (engine, uuids) = build_sub_engine(&["alpha", "beta"], &[]);
-        let mut results = HashMap::new();
-        results.insert(uuids["alpha"], serde_json::json!({"v": 1}));
-        results.insert(uuids["beta"], serde_json::json!({"v": 2}));
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(
-            out.get("alpha")
-                .and_then(|v| v.get("v"))
-                .and_then(|v| v.as_i64()),
-            Some(1)
-        );
-        assert_eq!(
-            out.get("beta")
-                .and_then(|v| v.get("v"))
-                .and_then(|v| v.as_i64()),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn collapse_skips_trigger_and_skipped_nodes() {
-        // Trigger + one skipped middle node + one real terminal.
-        let (engine, uuids) = build_sub_engine(
-            &["__trigger__", "skipped", "real"],
-            &[("__trigger__", "skipped"), ("skipped", "real")],
-        );
-        let mut results = HashMap::new();
-        results.insert(
-            uuids["__trigger__"],
-            serde_json::json!({"trigger": "ignored"}),
-        );
-        results.insert(
-            uuids["skipped"],
-            serde_json::json!({"__skipped": true, "noise": "x"}),
-        );
-        results.insert(uuids["real"], serde_json::json!({"answer": "42"}));
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out.get("answer").and_then(|v| v.as_str()), Some("42"));
-        assert!(out.get("trigger").is_none(), "trigger must not leak");
-        assert!(out.get("noise").is_none(), "skipped must not leak");
-    }
-
-    #[test]
-    fn collapse_strips_engine_envelope_on_terminal() {
-        // unwrap_output recognises {input: X, score: ..., passed: ...} as a wrapper
-        // when every inner key is also at the outer level. Terminal node output
-        // should pass through unwrap_output.
-        let (engine, uuids) = build_sub_engine(&["judge"], &[]);
-        let mut results = HashMap::new();
-        // Real-world shape: engine-wrapped output where inner fields are also hoisted.
-        results.insert(
-            uuids["judge"],
-            serde_json::json!({
-                "input": {"score": 0.7, "passed": true},
-                "score": 0.7,
-                "passed": true,
-            }),
-        );
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out.get("score").and_then(|v| v.as_f64()), Some(0.7));
-        assert_eq!(out.get("passed").and_then(|v| v.as_bool()), Some(true));
-    }
-
-    #[test]
-    fn collapse_empty_results_returns_empty_object() {
-        let (engine, _) = build_sub_engine(&["a"], &[]);
-        let results: HashMap<Uuid, JsonValue> = HashMap::new();
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out, serde_json::Value::Object(serde_json::Map::new()));
-    }
-
-    #[test]
-    fn collapse_fork_non_terminal_shadows_do_not_overwrite_terminal() {
-        // A → B (terminal). A is not a terminal. Both happen to emit a "score" field.
-        // Terminal's fields must win — but since only one terminal exists, the map
-        // is NOT the output shape; instead B's output is returned directly.
-        let (engine, uuids) = build_sub_engine(&["a", "b"], &[("a", "b")]);
-        let mut results = HashMap::new();
-        results.insert(uuids["a"], serde_json::json!({"score": 0.1}));
-        results.insert(uuids["b"], serde_json::json!({"score": 0.9}));
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        assert_eq!(out.get("score").and_then(|v| v.as_f64()), Some(0.9));
-    }
-
-    #[test]
-    fn collapse_diamond_two_terminals_returns_both_labels() {
-        // A → {B, C}. Both B and C are terminals (no aggregator).
-        let (engine, uuids) = build_sub_engine(&["a", "b", "c"], &[("a", "b"), ("a", "c")]);
-        let mut results = HashMap::new();
-        results.insert(uuids["a"], serde_json::json!({"stage": "a"}));
-        results.insert(uuids["b"], serde_json::json!({"stage": "b"}));
-        results.insert(uuids["c"], serde_json::json!({"stage": "c"}));
-        let out = ParallelWorkflowEngine::collapse_subworkflow_output(&results, &engine);
-        // Multiple terminals → label-keyed map including non-terminal a.
-        assert_eq!(
-            out.get("a")
-                .and_then(|v| v.get("stage"))
-                .and_then(|v| v.as_str()),
-            Some("a")
-        );
-        assert_eq!(
-            out.get("b")
-                .and_then(|v| v.get("stage"))
-                .and_then(|v| v.as_str()),
-            Some("b")
-        );
-        assert_eq!(
-            out.get("c")
-                .and_then(|v| v.get("stage"))
-                .and_then(|v| v.as_str()),
-            Some("c")
-        );
-    }
-
-    // Seal-output validation tests live in
-    // `talos-workflow-engine-core::secret_envelope` alongside the
-    // `validate_seal_output` pub fn, since the helper is a pure
-    // structural check that external dispatchers can also reuse.
-}
+#[path = "engine_tests.rs"]
+mod tests;

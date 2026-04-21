@@ -28,12 +28,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
-use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowGraphBuilder};
+use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowEngineError, WorkflowGraphBuilder};
 use talos_workflow_engine_core::{
     BoxError, ChainDispatchRequest, ChainDispatchResult, ChainStepResult, DispatchJob,
     DispatchResult, NodeDispatcher, StepStatus, WasmModuleArtifact,
 };
-use talos_workflow_engine_test_utils::{dispatch::ScriptedDispatcher, memory::InMemoryModuleFetcher, minimal_engine};
+use talos_workflow_engine_test_utils::{
+    dispatch::ScriptedDispatcher, memory::InMemoryModuleFetcher, minimal_engine,
+};
 use uuid::Uuid;
 
 /// Dispatcher that parks `dispatch` for `delay` before returning a
@@ -159,12 +161,13 @@ async fn run_with_transport_enforces_workflow_timeout() {
         .expect_err("workflow must time out");
     let elapsed = started.elapsed();
 
-    // The error is a catch-all `Execution` variant today; match on
-    // the message as a sanity check that we got the timeout path and
-    // not some other failure mode (e.g. secrets-resolver missing).
+    // The timeout failure mode is a typed `WorkflowEngineError::Timeout`
+    // variant — pattern-match it so we catch a regression to the
+    // catch-all `Execution(String)` form rather than only relying on
+    // a substring match.
     assert!(
-        err.to_string().contains("timed out"),
-        "expected a timeout error, got: {err}"
+        matches!(err, WorkflowEngineError::Timeout { secs: 1 }),
+        "expected Timeout {{ secs: 1 }}, got: {err:?}"
     );
     // Elapsed should be close to the 1-second cap — give generous
     // slack for CI scheduling but fail if it took as long as the
@@ -204,13 +207,37 @@ async fn run_with_seed_with_transport_enforces_workflow_timeout() {
         .expect_err("workflow must time out");
     let elapsed = started.elapsed();
     assert!(
-        err.to_string().contains("timed out"),
-        "expected a timeout error, got: {err}"
+        matches!(err, WorkflowEngineError::Timeout { secs: 1 }),
+        "expected Timeout {{ secs: 1 }}, got: {err:?}"
     );
     assert!(
         elapsed < Duration::from_secs(5),
         "timeout took {elapsed:?}, expected ~1s"
     );
+}
+
+#[tokio::test]
+async fn typed_execution_timeout_round_trips() {
+    // The Option<Duration> setter is the preferred form for new code.
+    // Verify both sides of the API agree on the disabled / enabled
+    // distinction so callers can mix them without surprises.
+    let mut engine = ParallelWorkflowEngine::new();
+
+    engine.set_execution_timeout(None);
+    assert_eq!(engine.execution_timeout(), None);
+    assert_eq!(engine.execution_timeout_secs(), 0);
+
+    engine.set_execution_timeout(Some(Duration::from_secs(120)));
+    assert_eq!(engine.execution_timeout(), Some(Duration::from_secs(120)));
+    assert_eq!(engine.execution_timeout_secs(), 120);
+
+    // Bridging through the legacy setter still produces a coherent
+    // typed read — `0` is the documented disable sentinel.
+    engine.set_execution_timeout_secs(0);
+    assert_eq!(engine.execution_timeout(), None);
+
+    engine.set_execution_timeout_secs(45);
+    assert_eq!(engine.execution_timeout(), Some(Duration::from_secs(45)));
 }
 
 #[tokio::test]

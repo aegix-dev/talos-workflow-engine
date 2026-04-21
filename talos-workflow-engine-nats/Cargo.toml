@@ -1,6 +1,6 @@
 [package]
 name = "talos-workflow-engine-nats"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "NATS-backed NodeDispatcher + JobTransport for the talos-workflow-engine crate. Implements a signed-NATS job protocol for dispatching workflow nodes to a pool of workers."
@@ -12,11 +12,11 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1", default-features = false }
-talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.1", default-features = false }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.2", default-features = false }
+talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.2", default-features = false }
 async-nats = "0.47"
 async-trait = "0.1"
-talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.1" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.2" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
@@ -36,7 +36,7 @@ unsafe_code = "forbid"
 # `missing_docs` deliberately not set during the initial port — the
 # moved code inherits the talos-workflow-engine crate's doc density; a
 # follow-up pass can enable it once the crate has stabilised.
-unreachable_pub = "warn"
+unreachable_pub = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -11,6 +11,19 @@ or new required fields bump the major version.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-20
+
+### Added
+
+- Wire-format snapshot tests in `tests/wire_format_snapshots.rs`.
+  Byte-level JSON snapshots for `EncryptedSecrets`, `JobRequest`,
+  `JobResult`, `PipelineJobRequest`, `PipelineJobResult` plus an
+  HMAC-SHA256 signature snapshot for `JobRequest`. Catches
+  accidental field reorders / renames / signing-payload format
+  drift before they ship to deployed workers. Update the literal
+  in the test file when the wire format intentionally changes —
+  the test docstring documents the failure-resolution workflow.
+
 ### Changed
 
 - **Breaking**: `load_worker_shared_key` now returns

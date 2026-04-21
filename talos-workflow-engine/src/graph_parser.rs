@@ -76,7 +76,7 @@ pub(crate) fn read_node_retry_policy_with_actor_cap(
     actor_id: Option<Uuid>,
 ) -> Option<RetryPolicy> {
     /// Max retries for workflows without an actor budget. A near-fuel-
-    /// exhausting module with retry_count=10 can otherwise saturate a
+    /// exhausting module with `retry_count=10` can otherwise saturate a
     /// worker for 15+ seconds per trigger.
     const MAX_RETRIES_UNBUDGETED: u32 = 3;
 
@@ -204,10 +204,7 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
     } else if k == "dispatch" {
         let data = node.get("data")?;
         Some(SystemNodeKind::DynamicDispatch {
-            dispatch_expression: data
-                .get("dispatch_expression")?
-                .as_str()?
-                .to_string(),
+            dispatch_expression: data.get("dispatch_expression")?.as_str()?.to_string(),
             timeout_secs: data
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
@@ -289,6 +286,23 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             rubric,
             pass_threshold,
             timeout_secs,
+        })
+    } else if k == "inline_judge" {
+        let data = node.get("data").unwrap_or(&JsonValue::Null);
+        let verdict_expr = data
+            .get("verdict_expr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Reject empty expressions at parse time so the dispatch
+        // handler doesn't have to special-case them later.
+        if verdict_expr.is_empty() {
+            return None;
+        }
+        let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
+        Some(SystemNodeKind::InlineJudge {
+            verdict_expr,
+            pass_threshold,
         })
     } else if k == "ensemble" {
         let data = node.get("data").unwrap_or(&JsonValue::Null);

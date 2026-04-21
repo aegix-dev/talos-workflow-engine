@@ -1,6 +1,6 @@
 [package]
 name = "talos-workflow-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Parallel DAG-based workflow executor built on the talos-workflow-engine-core trait boundaries."
@@ -12,13 +12,13 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.1", default-features = false }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.2", default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 cap-std = "3.4"
 dashmap = "6.1.0"
 futures = "0.3"
-talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.1" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.2" }
 petgraph = "0.6"
 regex = "1.12"
 rhai = { version = "1.19", features = ["serde"] }
@@ -27,18 +27,36 @@ serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# Cancellation primitive for `run_with_transport_cancellable`. The
+# engine doesn't take any other piece of `tokio-util`; keep the
+# default-features off and the surface narrow.
+tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 uuid = { version = "1.20", features = ["v4", "serde"] }
 
 [dev-dependencies]
 # `examples/` use the test-utils crate to wire the engine with
 # in-memory / no-op adapters so the runnable example stays self-contained.
-talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils", version = "0.1" }
+talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils", version = "0.2" }
+# Property-based tests for the chain detector (graph topology
+# invariants that hand-rolled tests can't realistically cover). Held
+# to dev-deps only — the engine itself is property-test-free.
+proptest = "1.5"
+# Microbenchmarks for the scheduler — see `benches/scheduler.rs`. Kept
+# in default features (no html_reports) so cargo bench stays minimal.
+criterion = { version = "0.5", default-features = false }
+# `tokio_util::sync::CancellationToken` re-exported here so the
+# integration tests can construct one without re-declaring the dep.
+tokio-util = { version = "0.7", default-features = false }
+
+[[bench]]
+name = "scheduler"
+harness = false
 
 [features]
 default = ["llm-primitives"]
 # Enables the engine-side dispatch for LLM/agent-specific sub-workflow
-# kinds (Judge, Ensemble, LlmDispatch, AgentLoop, ReActLoop,
+# kinds (Judge, InlineJudge, Ensemble, LlmDispatch, AgentLoop, ReActLoop,
 # ReflectiveRetry, ConfidenceGate). Propagates to `talos-workflow-engine-core`'s
 # `llm-primitives` feature so the variants are visible in the enum.
 # Drop the feature to compile a leaner binary for non-LLM use cases.
@@ -46,9 +64,10 @@ llm-primitives = ["talos-workflow-engine-core/llm-primitives"]
 
 [lints.rust]
 unsafe_code = "forbid"
-# `missing_docs` deliberately NOT set yet — enforcing on the moved code
-# is a separate pass.
-unreachable_pub = "warn"
+# `missing_docs` is enforced inline at `src/lib.rs` (`#![deny(missing_docs)]`)
+# so that test-only modules can opt out via inline `#![allow]` if a
+# test ever needs an undocumented helper.
+unreachable_pub = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -67,7 +86,6 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
 cast_possible_wrap = "allow"
-doc_markdown = "allow"
 redundant_closure_for_method_calls = "allow"
 uninlined_format_args = "allow"
 map_unwrap_or = "allow"

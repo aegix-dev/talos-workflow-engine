@@ -11,6 +11,21 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-20
+
+### Added
+
+- New `rate_limit` module with `CountingRateLimitStore` and
+  `AlwaysAllowRateLimitStore` — in-memory `RateLimitStore` impls
+  for downstream integration tests. `CountingRateLimitStore`
+  tracks per-module sliding-window counts plus a full call log so
+  tests can assert on the engine's metering behaviour without
+  rolling their own trait impl. Same lifecycle and failure-mode
+  contract as the engine's default. Companion to
+  `memory::InMemoryWorkflowGraphStore` for the
+  `RateLimitStore` trait added in
+  `talos-workflow-engine-core` 0.2.0.
+
 ## [0.1.0] — Initial release
 
 - `memory` — in-memory implementations of `WorkflowGraphStore`,

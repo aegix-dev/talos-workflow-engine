@@ -24,7 +24,13 @@ use uuid::Uuid;
 /// `event_type` and `status` are free-form strings because backing
 /// stores often evolve their taxonomy over time without a matching
 /// Rust enum — impls that want validation can do so at emit time.
-#[derive(Debug, Clone)]
+///
+/// Extending this struct is a breaking change for external
+/// constructors (typically custom dispatchers emitting events). A
+/// [`Default`] impl is provided so callers can use struct-update
+/// syntax (`NodeEventWrite { execution_id, event_type, ..Default::default() }`)
+/// and remain forward-compatible.
+#[derive(Debug, Clone, Default)]
 pub struct NodeEventWrite {
     /// Parent workflow execution id.
     pub execution_id: Uuid,
@@ -44,6 +50,17 @@ pub struct NodeEventWrite {
     /// (`AgentLoop`, `ReActLoop`, `WhileLoop`). `None` for one-shot
     /// events.
     pub iteration_index: Option<i32>,
+    /// Stable error-classification tag when the event describes a
+    /// classifier decision, `None` otherwise.
+    ///
+    /// Populated today on `retry_skipped` events with the tag the
+    /// [`RetryClassifier`](crate::RetryClassifier) produced (e.g.
+    /// `"auth"`, `"invalid_input"`, `"unknown"`) so downstream
+    /// analysis tooling can surface *why* an explicit `retry_count`
+    /// was short-circuited without string-parsing `log_message`.
+    /// Other event types currently leave this `None`; future variants
+    /// may populate it consistently with `event_type`.
+    pub error_class: Option<String>,
 }
 
 /// Persist or forward per-node execution events.

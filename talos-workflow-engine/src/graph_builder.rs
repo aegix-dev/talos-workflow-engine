@@ -263,11 +263,10 @@ impl WorkflowGraphBuilder {
         if let Some(obj) = self.find_node_obj_mut(id) {
             obj.insert("skip_condition".to_string(), JsonValue::String(condition));
         } else {
-            self.errors
-                .push(WorkflowGraphBuilderError::UnknownNodeId {
-                    id: id.to_string(),
-                    method: "with_skip_condition",
-                });
+            self.errors.push(WorkflowGraphBuilderError::UnknownNodeId {
+                id: id.to_string(),
+                method: "with_skip_condition",
+            });
         }
         self
     }
@@ -286,11 +285,10 @@ impl WorkflowGraphBuilder {
         if let Some(obj) = self.find_node_obj_mut(id) {
             obj.insert("continue_on_error".to_string(), JsonValue::Bool(true));
         } else {
-            self.errors
-                .push(WorkflowGraphBuilderError::UnknownNodeId {
-                    id: id.to_string(),
-                    method: "with_continue_on_error",
-                });
+            self.errors.push(WorkflowGraphBuilderError::UnknownNodeId {
+                id: id.to_string(),
+                method: "with_continue_on_error",
+            });
         }
         self
     }
@@ -327,11 +325,10 @@ impl WorkflowGraphBuilder {
                 obj.insert("retry_delay_expression".to_string(), JsonValue::String(d));
             }
         } else {
-            self.errors
-                .push(WorkflowGraphBuilderError::UnknownNodeId {
-                    id: id.to_string(),
-                    method: "with_retry",
-                });
+            self.errors.push(WorkflowGraphBuilderError::UnknownNodeId {
+                id: id.to_string(),
+                method: "with_retry",
+            });
         }
         self
     }
@@ -608,6 +605,17 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "rubric": rubric,
                 "pass_threshold": pass_threshold,
                 "timeout_secs": timeout_secs,
+            }),
+        ),
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::InlineJudge {
+            verdict_expr,
+            pass_threshold,
+        } => (
+            "inline_judge",
+            json!({
+                "verdict_expr": verdict_expr,
+                "pass_threshold": pass_threshold,
             }),
         ),
         #[cfg(feature = "llm-primitives")]
@@ -1154,10 +1162,7 @@ mod tests {
         let err = engine
             .load_from_graph_json(&graph)
             .expect_err("empty-nodes graph must be rejected");
-        // `LoadGraph` is the catch-all for graph-load rejections; the
-        // message body is informational only, variant check is what
-        // consumers should match on.
-        assert!(matches!(err, crate::WorkflowEngineError::LoadGraph(_)));
+        assert!(matches!(err, crate::WorkflowEngineError::EmptyGraph));
     }
 
     #[cfg(feature = "llm-primitives")]
@@ -1184,5 +1189,422 @@ mod tests {
         );
         assert_eq!(node["data"]["rubric"].as_str(), Some("rate 0-1"));
         assert_eq!(node["data"]["pass_threshold"].as_f64(), Some(0.8));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[test]
+    fn system_node_inline_judge_round_trips_through_builder() {
+        let g = WorkflowGraphBuilder::new()
+            .add_system_node(
+                "verify_score",
+                SystemNodeKind::InlineJudge {
+                    verdict_expr: "{score: input.confidence, passed: input.confidence > 0.5, reasoning: '', feedback: ''}".into(),
+                    pass_threshold: Some(0.5),
+                },
+            )
+            .build()
+            .unwrap();
+        let node = &g["nodes"][0];
+        assert_eq!(node["kind"].as_str(), Some("inline_judge"));
+        assert_eq!(node["type"].as_str(), Some("system:inline_judge"));
+        assert_eq!(
+            node["data"]["verdict_expr"].as_str().unwrap_or(""),
+            "{score: input.confidence, passed: input.confidence > 0.5, reasoning: '', feedback: ''}"
+        );
+        assert_eq!(node["data"]["pass_threshold"].as_f64(), Some(0.5));
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Exhaustive builder → parser round-trips.
+    //
+    // Each test below builds a node with a variant, serializes to
+    // JSON, and asserts that the engine's parser decodes it back to
+    // the same variant with the same field values. This is the form
+    // that catches drift between `serialize_system_node_kind` and
+    // `parse_system_node_kind` / `parse_llm_system_node_kind`.
+    // ───────────────────────────────────────────────────────────────
+
+    /// Round-trip `kind` through builder emit + engine parse, returning
+    /// the decoded `SystemNodeKind` for further assertions.
+    async fn round_trip_kind(label: &str, kind: SystemNodeKind) -> SystemNodeKind {
+        use crate::ParallelWorkflowEngine;
+
+        let graph = WorkflowGraphBuilder::new()
+            .add_system_node(label, kind)
+            .build()
+            .unwrap();
+        let json_str = serde_json::to_string(&graph).unwrap();
+
+        let mut engine = ParallelWorkflowEngine::new();
+        engine
+            .load_graph_from_json(&json_str)
+            .await
+            .expect("parser accepts builder output");
+
+        let uuid = engine
+            .node_labels()
+            .iter()
+            .find(|(_, l)| l.as_str() == label)
+            .map(|(u, _)| *u)
+            .unwrap_or_else(|| panic!("no node labeled {label} in engine graph"));
+        engine
+            .node_meta()
+            .get(&uuid)
+            .and_then(|(_, _, k)| k.clone())
+            .unwrap_or_else(|| panic!("no kind decoded for {label}"))
+    }
+
+    #[tokio::test]
+    async fn system_node_wait_round_trips() {
+        let with_msg = round_trip_kind(
+            "wait_msg",
+            SystemNodeKind::Wait {
+                message: Some("approval".into()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            with_msg,
+            SystemNodeKind::Wait { message: Some(ref m) } if m == "approval"
+        ));
+
+        let no_msg = round_trip_kind("wait_nomsg", SystemNodeKind::Wait { message: None }).await;
+        assert!(matches!(no_msg, SystemNodeKind::Wait { message: None }));
+    }
+
+    #[tokio::test]
+    async fn system_node_sub_workflow_round_trips() {
+        let wf_id = Uuid::new_v4();
+        let decoded = round_trip_kind(
+            "sub",
+            SystemNodeKind::SubWorkflow {
+                workflow_id: wf_id,
+                timeout_secs: 120,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::SubWorkflow { workflow_id, timeout_secs: 120 } if workflow_id == wf_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_loop_round_trips() {
+        let decoded = round_trip_kind(
+            "loop_node",
+            SystemNodeKind::Loop {
+                max_iterations: 7,
+                condition: "i < n".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::Loop { max_iterations: 7, condition: ref c } if c == "i < n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_collect_round_trips() {
+        let decoded = round_trip_kind("collect_node", SystemNodeKind::Collect).await;
+        assert!(matches!(decoded, SystemNodeKind::Collect));
+    }
+
+    #[tokio::test]
+    async fn system_node_synthesize_round_trips() {
+        let with_expr = round_trip_kind(
+            "synth_expr",
+            SystemNodeKind::Synthesize {
+                synthesis_expr: Some("items | avg".into()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            with_expr,
+            SystemNodeKind::Synthesize { synthesis_expr: Some(ref e) } if e == "items | avg"
+        ));
+
+        let no_expr = round_trip_kind(
+            "synth_none",
+            SystemNodeKind::Synthesize {
+                synthesis_expr: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            no_expr,
+            SystemNodeKind::Synthesize { synthesis_expr: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_verify_round_trips() {
+        let decoded = round_trip_kind(
+            "verify_node",
+            SystemNodeKind::Verify {
+                condition: "resp.status == 200".into(),
+                check_label: Some("http_ok".into()),
+                on_failure: "error".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::Verify {
+                condition: ref c,
+                check_label: Some(ref l),
+                on_failure: ref f,
+            } if c == "resp.status == 200" && l == "http_ok" && f == "error"
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_dynamic_dispatch_round_trips() {
+        let decoded = round_trip_kind(
+            "dispatch_node",
+            SystemNodeKind::DynamicDispatch {
+                dispatch_expression: "classifier.route".into(),
+                timeout_secs: 45,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::DynamicDispatch {
+                dispatch_expression: ref e,
+                timeout_secs: 45,
+            } if e == "classifier.route"
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_capability_dispatch_round_trips() {
+        let decoded = round_trip_kind(
+            "cap_node",
+            SystemNodeKind::CapabilityDispatch {
+                required_capabilities: vec!["llm".into(), "rag".into()],
+                timeout_secs: 30,
+            },
+        )
+        .await;
+        let SystemNodeKind::CapabilityDispatch {
+            required_capabilities,
+            timeout_secs,
+        } = decoded
+        else {
+            panic!("expected CapabilityDispatch");
+        };
+        assert_eq!(required_capabilities, vec!["llm".to_string(), "rag".into()]);
+        assert_eq!(timeout_secs, 30);
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_agent_loop_round_trips() {
+        let wf_id = Uuid::new_v4();
+        let decoded = round_trip_kind(
+            "agent",
+            SystemNodeKind::AgentLoop {
+                body_workflow_id: wf_id,
+                max_iterations: 12,
+                inject_history: false,
+                timeout_secs: 90,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::AgentLoop {
+                body_workflow_id: w,
+                max_iterations: 12,
+                inject_history: false,
+                timeout_secs: 90,
+            } if w == wf_id
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_judge_round_trips_through_parser() {
+        let wf_id = Uuid::new_v4();
+        let decoded = round_trip_kind(
+            "judge_node",
+            SystemNodeKind::Judge {
+                judge_workflow_id: wf_id,
+                rubric: "rate 0-1".into(),
+                pass_threshold: Some(0.8),
+                timeout_secs: 60,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::Judge {
+                judge_workflow_id: w,
+                rubric: ref r,
+                pass_threshold: Some(t),
+                timeout_secs: 60,
+            } if w == wf_id && r == "rate 0-1" && (t - 0.8).abs() < f64::EPSILON
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_inline_judge_round_trips_through_parser() {
+        let decoded = round_trip_kind(
+            "ij",
+            SystemNodeKind::InlineJudge {
+                verdict_expr: "{score: 1.0, passed: true, reasoning: '', feedback: ''}".into(),
+                pass_threshold: Some(0.5),
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::InlineJudge {
+                verdict_expr: ref e,
+                pass_threshold: Some(t),
+            } if e.contains("passed: true") && (t - 0.5).abs() < f64::EPSILON
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_ensemble_round_trips() {
+        let child = Uuid::new_v4();
+        let judge = Uuid::new_v4();
+        let decoded = round_trip_kind(
+            "ens",
+            SystemNodeKind::Ensemble {
+                child_workflow_id: child,
+                count: 5,
+                consensus: "majority_vote".into(),
+                judge_workflow_id: Some(judge),
+                timeout_secs: 90,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::Ensemble {
+                child_workflow_id: c,
+                count: 5,
+                consensus: ref k,
+                judge_workflow_id: Some(j),
+                timeout_secs: 90,
+            } if c == child && j == judge && k == "majority_vote"
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_confidence_gate_round_trips() {
+        let decoded = round_trip_kind(
+            "cg",
+            SystemNodeKind::ConfidenceGate {
+                threshold: 0.65,
+                confidence_path: "out.conf".into(),
+                on_low_confidence: "pause".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::ConfidenceGate {
+                threshold: t,
+                confidence_path: ref p,
+                on_low_confidence: ref a,
+            } if (t - 0.65).abs() < f64::EPSILON && p == "out.conf" && a == "pause"
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_react_loop_round_trips() {
+        let wf_id = Uuid::new_v4();
+        let decoded = round_trip_kind(
+            "react",
+            SystemNodeKind::ReActLoop {
+                body_workflow_id: wf_id,
+                max_iterations: 8,
+                inject_history: true,
+                timeout_secs: 120,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::ReActLoop {
+                body_workflow_id: w,
+                max_iterations: 8,
+                inject_history: true,
+                timeout_secs: 120,
+            } if w == wf_id
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_reflective_retry_round_trips() {
+        let child = Uuid::new_v4();
+        let reflection = Uuid::new_v4();
+        let decoded = round_trip_kind(
+            "rr",
+            SystemNodeKind::ReflectiveRetry {
+                child_workflow_id: child,
+                reflection_workflow_id: reflection,
+                max_retries: 3,
+                timeout_secs: 75,
+            },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::ReflectiveRetry {
+                child_workflow_id: c,
+                reflection_workflow_id: r,
+                max_retries: 3,
+                timeout_secs: 75,
+            } if c == child && r == reflection
+        ));
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[tokio::test]
+    async fn system_node_llm_dispatch_round_trips() {
+        let classifier = Uuid::new_v4();
+        let support = Uuid::new_v4();
+        let billing = Uuid::new_v4();
+        let fallback = Uuid::new_v4();
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("support".to_string(), support);
+        routes.insert("billing".to_string(), billing);
+
+        let decoded = round_trip_kind(
+            "lld",
+            SystemNodeKind::LlmDispatch {
+                classifier_workflow_id: classifier,
+                routes: routes.clone(),
+                fallback_workflow_id: Some(fallback),
+                timeout_secs: 60,
+            },
+        )
+        .await;
+        let SystemNodeKind::LlmDispatch {
+            classifier_workflow_id,
+            routes: decoded_routes,
+            fallback_workflow_id,
+            timeout_secs,
+        } = decoded
+        else {
+            panic!("expected LlmDispatch");
+        };
+        assert_eq!(classifier_workflow_id, classifier);
+        assert_eq!(fallback_workflow_id, Some(fallback));
+        assert_eq!(timeout_secs, 60);
+        assert_eq!(decoded_routes.get("support"), Some(&support));
+        assert_eq!(decoded_routes.get("billing"), Some(&billing));
+        assert_eq!(decoded_routes.len(), 2);
     }
 }

@@ -1,4 +1,4 @@
-//! Vault:// reference resolution utilities shared across MCP handlers and the engine.
+//! `vault://` reference resolution utilities shared across MCP handlers and the engine.
 //!
 //! This module centralizes the logic for:
 //! 1. Extracting `vault://<path>` references from a JSON config object.
@@ -7,8 +7,8 @@
 //!
 //! Why centralize? Previously, `run_sandbox`, `test_module`, and the engine
 //! each had their own inline extraction loops. Divergence between them caused
-//! modules to behave differently across execution paths (e.g., run_sandbox
-//! passing literal `"vault://..."` strings to the module, while test_module
+//! modules to behave differently across execution paths (e.g., `run_sandbox`
+//! passing literal `"vault://..."` strings to the module, while `test_module`
 //! and the engine injected plaintext). This module guarantees identical
 //! behavior everywhere.
 //!
@@ -17,6 +17,7 @@
 //! for fetching the permitted secrets and passing them to `replace_vault_values`.
 
 use std::collections::HashMap;
+use std::fmt;
 
 /// A detected `vault://` reference in a config object: `(config_key, vault_path)`.
 ///
@@ -24,6 +25,46 @@ use std::collections::HashMap;
 /// matching the form stored in the vault and accepted by
 /// `SecretsManager::get_secrets_by_paths`.
 pub type VaultRef = (String, String);
+
+/// Error returned from [`replace_vault_values`] when a referenced
+/// secret cannot be substituted.
+///
+/// Matching on the variant is stable across 0.x releases; display
+/// output is informational and may change. The enum is
+/// `#[non_exhaustive]` so future variants are additive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VaultResolverError {
+    /// A `vault://<path>` reference in `refs` was not present in the
+    /// `resolved` map. Typical causes: the secret hasn't been set,
+    /// the path is misspelled, or the caller forgot to include the
+    /// path in the allowlist passed to
+    /// `SecretsManager::get_secrets_by_paths`.
+    SecretNotResolved {
+        /// The config key whose value referenced the missing secret.
+        config_key: String,
+        /// The vault path (prefix stripped) that failed to resolve.
+        vault_path: String,
+    },
+}
+
+impl fmt::Display for VaultResolverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SecretNotResolved {
+                config_key,
+                vault_path,
+            } => write!(
+                f,
+                "Config key '{config_key}' references vault://{vault_path} but the secret \
+                 could not be resolved. Ensure the secret exists (set_secret) and the path \
+                 is correct."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VaultResolverError {}
 
 /// Extract every `vault://<path>` reference from the top-level string values
 /// of a JSON config object. Malformed refs (empty path after prefix) are skipped.
@@ -53,22 +94,22 @@ pub fn extract_vault_refs(config: &serde_json::Value) -> Vec<VaultRef> {
 ///   - `payload["config"]["AUTH_HEADER"]` (standard config sub-object)
 ///   - `payload["input"]["AUTH_HEADER"]` (upstream-output convention)
 ///
-/// Returns `Err(actionable_message)` if any `vault_path` in `refs` is absent
-/// from `resolved` — so the developer sees "secret not found" instead of
-/// a confusing downstream failure.
+/// Returns [`VaultResolverError::SecretNotResolved`] if any `vault_path`
+/// in `refs` is absent from `resolved` — so the developer sees
+/// "secret not found" instead of a confusing downstream failure.
 pub fn replace_vault_values(
     payload: &mut serde_json::Value,
     resolved: &HashMap<String, String>,
     refs: &[VaultRef],
-) -> Result<(), String> {
+) -> Result<(), VaultResolverError> {
     for (config_key, vault_path) in refs {
-        let plaintext = resolved.get(vault_path.as_str()).ok_or_else(|| {
-            format!(
-                "Config key '{}' references vault://{} but the secret could not be \
-                 resolved. Ensure the secret exists (set_secret) and the path is correct.",
-                config_key, vault_path
-            )
-        })?;
+        let plaintext =
+            resolved
+                .get(vault_path.as_str())
+                .ok_or_else(|| VaultResolverError::SecretNotResolved {
+                    config_key: config_key.clone(),
+                    vault_path: vault_path.clone(),
+                })?;
         let resolved_value = serde_json::Value::String(plaintext.clone());
 
         if let Some(obj) = payload.as_object_mut() {
@@ -211,11 +252,24 @@ mod tests {
         let refs = vec![("AUTH_HEADER".to_string(), "missing/path".to_string())];
         let resolved = HashMap::new();
 
-        let result = replace_vault_values(&mut payload, &resolved, &refs);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("AUTH_HEADER"));
-        assert!(err.contains("missing/path"));
+        let err = replace_vault_values(&mut payload, &resolved, &refs)
+            .expect_err("missing secret must error");
+        // The enum is `#[non_exhaustive]` and carries only `SecretNotResolved`
+        // today; the bare `match` still compiles if new variants land, at
+        // which point this test should expand.
+        match &err {
+            VaultResolverError::SecretNotResolved {
+                config_key,
+                vault_path,
+            } => {
+                assert_eq!(config_key, "AUTH_HEADER");
+                assert_eq!(vault_path, "missing/path");
+            }
+        }
+        // Display still carries both fields for human-readable logs.
+        let rendered = format!("{err}");
+        assert!(rendered.contains("AUTH_HEADER"));
+        assert!(rendered.contains("missing/path"));
     }
 
     #[test]

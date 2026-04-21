@@ -1,16 +1,48 @@
-# Configuration for cargo-deny (https://embarkstudios.github.io/cargo-deny/)
-# Run via the CI `deny` job or locally: `cargo install cargo-deny && cargo deny check`
+# cargo-deny configuration: dependency policy for the workspace.
+#
+# Wired into CI via .github/workflows/deny.yml — every PR runs
+# `cargo deny check`. Run locally with:
+#
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+# ─────────────────────────────────────────────────────────────────────
+# Resolution graph
+# ─────────────────────────────────────────────────────────────────────
 
 [graph]
+# Resolve every feature combination so a feature-gated dependency
+# (e.g. `llm-primitives`) doesn't slip a vulnerable / non-compliant
+# crate past the audit.
 all-features = true
+
+# ─────────────────────────────────────────────────────────────────────
+# Security advisories (RUSTSEC database)
+# ─────────────────────────────────────────────────────────────────────
 
 [advisories]
 version = 2
-yanked = "warn"
+# Yanked crates fail the build. A yanked dependency is by definition
+# not the right one to ship to production; if a transitive yank
+# happens upstream, take the failure as a cue to upgrade rather than
+# silently warn.
+yanked = "deny"
+# Per-advisory exceptions go here as RUSTSEC IDs (e.g. "RUSTSEC-2023-0071").
+# Each entry MUST be accompanied by a comment naming the upstream
+# tracking issue and the planned remediation date.
 ignore = []
+
+# ─────────────────────────────────────────────────────────────────────
+# License compatibility
+# ─────────────────────────────────────────────────────────────────────
 
 [licenses]
 version = 2
+# Permissive licenses compatible with the workspace's own
+# MIT-OR-Apache-2.0 dual licensing. Adding a license to this list is
+# a deliberate policy decision — flag it in the PR.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -30,16 +62,36 @@ allow = [
     # downstream distribution.
     "CDLA-Permissive-2.0",
 ]
+# Reject anything where cargo-deny's classifier isn't this confident.
+# Lower numbers ship faster but accept ambiguous license metadata;
+# 0.93 is the documented sweet spot.
 confidence-threshold = 0.93
 
+# ─────────────────────────────────────────────────────────────────────
+# Dependency bans
+# ─────────────────────────────────────────────────────────────────────
+
 [bans]
+# Duplicate versions warn (don't fail) — getting tokio-ecosystem
+# crates onto a single proc-macro2 / syn / quote version is hard in
+# practice and not worth blocking PRs over. Periodically audit and
+# `cargo update` to consolidate.
 multiple-versions = "warn"
+# Wildcard `*` version requirements break supply-chain reproducibility
+# and are an accidental SemVer escape hatch. Always pin a major.
 wildcards = "deny"
-# Explicit skip list for unavoidable duplicates goes here as issues arise.
+# Explicit skip list for unavoidable duplicates goes here as issues
+# arise. Each entry MUST have a comment explaining why it's needed.
 skip = []
 skip-tree = []
 
+# ─────────────────────────────────────────────────────────────────────
+# Source registries
+# ─────────────────────────────────────────────────────────────────────
+
 [sources]
+# Reject anything not from a known registry / git host. Prevents a
+# malicious dep from sneaking in via a typo'd registry override.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

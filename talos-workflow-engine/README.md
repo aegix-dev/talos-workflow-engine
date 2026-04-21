@@ -20,11 +20,12 @@ behind them.
   dispatch through `NodeDispatcher::dispatch_chain`, one transport
   round-trip per chain instead of per node.
 - **Speculative module prefetching** while the parent node still runs.
-- **Sub-workflow primitives**: Judge, Ensemble, ForEach, FanIn,
-  AgentLoop, ReActLoop, ReflectiveRetry, LlmDispatch, DynamicDispatch,
-  CapabilityDispatch, ConfidenceGate, WhileLoop, RepeatLoop, Wait,
-  ErrorHandler, Synthesize, Collect, Verify. Every kind from
-  `SystemNodeKind` has a dispatcher.
+- **Sub-workflow primitives**: ForEach, FanIn, Loop, WhileLoop,
+  RepeatLoop, Wait, ErrorHandler, Synthesize, Collect, Verify,
+  SubWorkflow, DynamicDispatch, CapabilityDispatch, and (behind the
+  default-on `llm-primitives` feature) Judge, InlineJudge, Ensemble,
+  ConfidenceGate, AgentLoop, ReActLoop, ReflectiveRetry, LlmDispatch.
+  Every kind from `SystemNodeKind` has a dispatcher.
 - **Checkpoint / resume**: pause on `Wait` nodes or cancellation,
   resume later with per-node outputs hydrated.
 - **Retry with classifier** → transient / permanent decisions and

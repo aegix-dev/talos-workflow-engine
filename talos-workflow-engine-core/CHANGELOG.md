@@ -12,6 +12,50 @@ surface stabilizes, the crate will move to 1.0 and normal semver applies.
 
 ### Changed
 
+- **Breaking**: `NodeEventWrite` gains an `error_class: Option<String>`
+  field and derives `Default`. Dispatchers that construct
+  `NodeEventWrite` directly must either set the field explicitly
+  (`error_class: None` for the common case) or switch to struct-update
+  syntax (`NodeEventWrite { ..., ..Default::default() }`) — the latter
+  remains forward-compatible across future additive field additions.
+  `EventSink` impls consume events and are unaffected.
+
+  Populated today on `retry_skipped` events with the
+  `RetryClassifier` tag that short-circuited the retry, so analytics
+  pipelines can correlate a classifier decision to the terminal
+  `node_failed` without string-parsing `log_message`.
+
+## [0.2.0] — 2026-04-20
+
+### Added
+
+- `RateLimitStore` trait for pluggable per-module rate-limit
+  counters. Default behaviour in the executor crate stays in-memory;
+  production deployments wire a Redis-backed (or other shared)
+  impl via `ParallelWorkflowEngine::set_rate_limit_store` so caps
+  hold across rolling deploys and replicas. The trait commits to a
+  fail-open contract — a transport error returns `Err` and the
+  engine logs + allows the dispatch rather than blocking legitimate
+  work because of an observability layer being down.
+- `DispatchJob::builder(execution_id, node_id, module_id, input)`
+  fluent constructor. The four required fields go in upfront so
+  `build()` is infallible; optional fields land via chained setters.
+  `encrypted_secrets(ciphertext, nonce)` is a single setter so the
+  pair can't desynchronise. The struct-literal `DispatchJob {
+  ..Default::default() }` form remains supported.
+- `WorkflowGraphStore::resolve_by_name` and
+  `resolve_by_capabilities` docstrings now name the exact
+  `SystemNodeKind` variants requiring each override
+  (`DynamicDispatch` and `CapabilityDispatch`) and document the
+  silent-no-op trap where the default-impl `None` return looks
+  identical to "no match." The executor crate now also emits a
+  `tracing::warn!` at the dispatch site when this happens.
+- `#![deny(missing_docs)]` on the crate. Every public item already
+  had a docstring; the deny prevents future regressions on the
+  trait surface every other crate in the family depends on.
+
+### Changed
+
 - **Breaking**: `DispatchJob::user_id` and `ChainDispatchRequest::user_id`
   are now `Option<Uuid>` instead of `Uuid`. Previously, `Uuid::nil()` was
   a documented sentinel for "no user context" — a typical footgun where a

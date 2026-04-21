@@ -80,6 +80,13 @@
 //! downstream crate that uses these traits.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Every public item in this crate is part of the trait surface that
+// the rest of the family depends on. `deny(missing_docs)` makes any
+// undocumented `pub` item a compile error, preventing future
+// regressions on the API contract. The crate is already fully
+// documented as of 2026-04 — the deny gates new additions, not
+// existing code.
+#![deny(missing_docs)]
 
 /// Compile-time witness for the `llm-primitives` feature on this crate.
 ///
@@ -115,6 +122,7 @@ mod module_artifact;
 mod module_execution_store;
 mod module_fetcher;
 mod node_hook;
+mod rate_limit;
 pub mod reserved_keys;
 mod retry;
 mod retry_classifier;
@@ -130,7 +138,8 @@ pub use checkpoint::CheckpointStore;
 pub use context::WorkflowContext;
 pub use dispatcher::{
     dispatch_chain_sequential, ChainDispatchRequest, ChainDispatchResult, ChainStepResult,
-    DispatchJob, DispatchResult, NodeDispatcher, StepStatus, DEFAULT_DISPATCH_TIMEOUT_SECS,
+    DispatchJob, DispatchJobBuilder, DispatchResult, NodeDispatcher, StepStatus,
+    DEFAULT_DISPATCH_TIMEOUT_SECS,
 };
 pub use edge::EdgeLogic;
 pub use event_sink::{EventSink, NodeEventWrite};
@@ -140,6 +149,7 @@ pub use module_artifact::WasmModuleArtifact;
 pub use module_execution_store::{ExecutionStartedContext, ModuleExecutionStore};
 pub use module_fetcher::ModuleFetcher;
 pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
+pub use rate_limit::RateLimitStore;
 pub use retry::RetryPolicy;
 pub use retry_classifier::RetryClassifier;
 pub use sanitizer::{ExecutionSanitizer, OutputSanitizer};

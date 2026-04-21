@@ -11,6 +11,16 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 
 ## [Unreleased]
 
+### Added
+
+- `retry_skipped` events now populate `NodeEventWrite::error_class`
+  with the `RetryClassifier` tag that short-circuited the retry
+  decision (`"auth"`, `"invalid_input"`, `"unknown"`, …). Downstream
+  analysis tools can correlate "why did the retry_count get ignored"
+  without substring-parsing `log_message`.
+
+## [0.2.0] — 2026-04-20
+
 ### Changed
 
 - **Breaking**: `NatsNodeDispatcher::new`, `run_with_nats`, and

@@ -11,16 +11,49 @@
 //! — useful on read-only filesystems, locked-down containers, or
 //! Windows environments without a writable `/tmp` equivalent.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use uuid::Uuid;
 
-/// Default sandbox root used when an engine has its sandbox-root
-/// configuration left at the out-of-box value.
+/// Subdirectory name appended to [`std::env::temp_dir`] when forming
+/// the default sandbox root. Public so consumers building their own
+/// path can match the engine's naming convention without re-deriving
+/// it from the platform's tmp dir.
+pub const DEFAULT_SANDBOX_DIR_NAME: &str = "workflow-engine-sandboxes";
+
+/// Resolve the platform-appropriate default sandbox root —
+/// `<std::env::temp_dir()>/workflow-engine-sandboxes`.
 ///
-/// The engine re-exports this as
-/// [`ParallelWorkflowEngine::DEFAULT_SANDBOX_ROOT`](crate::DEFAULT_SANDBOX_ROOT);
-/// prefer that path in public code.
+/// Per-platform examples:
+///
+/// * Linux / macOS → `/tmp/workflow-engine-sandboxes`
+/// * macOS sandboxed processes → `<NSTemporaryDirectory>/workflow-engine-sandboxes`
+/// * Windows → `%TEMP%\workflow-engine-sandboxes`
+///
+/// Resolves once via [`std::sync::LazyLock`] so callers can hold the
+/// returned reference cheaply and the temp-dir lookup never repeats.
+/// Override per-engine via
+/// [`ParallelWorkflowEngine::set_sandbox_root`](crate::ParallelWorkflowEngine::set_sandbox_root)
+/// when you need a different location (read-only filesystem, locked-
+/// down container, persistent scratch volume, etc.).
+#[must_use]
+pub fn default_sandbox_root() -> &'static std::path::Path {
+    use std::sync::LazyLock;
+    static DEFAULT: LazyLock<PathBuf> =
+        LazyLock::new(|| std::env::temp_dir().join(DEFAULT_SANDBOX_DIR_NAME));
+    &DEFAULT
+}
+
+/// Deprecated alias for [`default_sandbox_root`] kept as a `&str` so
+/// pre-`fn` call sites continue to compile. The string is the
+/// **Linux / macOS** path verbatim, which is wrong on Windows. Prefer
+/// the function form, which uses [`std::env::temp_dir`] and works
+/// cross-platform.
+#[deprecated(
+    since = "0.1.1",
+    note = "use `default_sandbox_root()` — this constant is Linux/macOS-only"
+)]
 pub const DEFAULT_SANDBOX_ROOT: &str = "/tmp/workflow-engine-sandboxes";
 
 /// Create a per-execution sandbox directory under `base`, rooted at

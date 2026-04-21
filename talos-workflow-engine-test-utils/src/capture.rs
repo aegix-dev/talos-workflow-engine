@@ -441,6 +441,7 @@ mod tests {
             status: "Running".to_string(),
             log_message: None,
             iteration_index: None,
+            error_class: None,
         })
         .await;
         sink.emit(NodeEventWrite {
@@ -450,6 +451,7 @@ mod tests {
             status: "Completed".to_string(),
             log_message: None,
             iteration_index: None,
+            error_class: None,
         })
         .await;
 

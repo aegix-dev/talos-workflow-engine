@@ -1,6 +1,6 @@
 [package]
 name = "talos-workflow-engine-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Core data model and traits for a portable workflow execution engine (DAG, edges, retry/join/system-node taxonomy)."
@@ -20,8 +20,8 @@ uuid = { version = "1", features = ["serde", "v4"] }
 [features]
 default = ["llm-primitives"]
 # Enables LLM/agent-specific `SystemNodeKind` variants:
-# `Judge`, `Ensemble`, `LlmDispatch`, `AgentLoop`, `ReActLoop`,
-# `ReflectiveRetry`, `ConfidenceGate`.
+# `Judge`, `InlineJudge`, `Ensemble`, `LlmDispatch`, `AgentLoop`,
+# `ReActLoop`, `ReflectiveRetry`, `ConfidenceGate`.
 #
 # Disabling this leaves the taxonomy at generic workflow primitives
 # (loops, fan-in/out, waits, sub-workflows, verification, dynamic
@@ -32,7 +32,7 @@ llm-primitives = []
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
-unreachable_pub = "warn"
+unreachable_pub = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

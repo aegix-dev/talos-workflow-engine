@@ -19,9 +19,14 @@ use std::sync::Arc;
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
 use serde_json::{json, Value as JsonValue};
-use talos_workflow_engine_core::{DispatchJob, EdgeLogic, NodeDispatcher, SystemNodeKind, WorkerSharedKey};
+use talos_workflow_engine_core::{
+    DispatchJob, EdgeLogic, NodeDispatcher, SystemNodeKind, WorkerSharedKey,
+};
 
-use crate::engine::AGENT_LOOP_MAX_HISTORY;
+// AGENT_LOOP_MAX_HISTORY is now an engine field — see
+// `ParallelWorkflowEngine::agent_loop_max_history`. We read through
+// `self.agent_loop_max_history()` below so each engine can configure
+// the window size independently.
 use uuid::Uuid;
 
 use crate::engine::ParallelWorkflowEngine;
@@ -47,6 +52,27 @@ pub(crate) enum ConfidenceGateOutcome {
     /// Low-confidence branch requested a pause. Caller inserts the
     /// output into its accumulated `results` map, then returns early
     /// with a [`WorkflowContext`] built from that map.
+    Pause { waiting_output: JsonValue },
+}
+
+/// Outcome of [`ParallelWorkflowEngine::try_dispatch_wait`].
+///
+/// Wait shares the pause-the-reactor shape with `ConfidenceGate` but
+/// isn't gated behind `llm-primitives`. The caller treats the
+/// `waiting_output` as the Wait node's transient "output" — it lands
+/// in the returned `WorkflowContext.results` so the consumer's
+/// [`CheckpointStore`](talos_workflow_engine_core::CheckpointStore)
+/// can persist it alongside every other completed node, and the
+/// scheduler bails before unblocking successors.
+///
+/// Resume semantics: the caller invokes
+/// [`run_with_seed_with_transport`](crate::ParallelWorkflowEngine::run_with_seed_with_transport)
+/// with the Wait node's id mapped to the external input that should
+/// stand in as the Wait node's actual output. The reactor treats it
+/// as already-completed and successors see the substituted value via
+/// their gathered inputs.
+pub(crate) enum WaitOutcome {
+    /// Fresh run reached a `Wait` node — pause and snapshot.
     Pause { waiting_output: JsonValue },
 }
 
@@ -175,6 +201,52 @@ impl ParallelWorkflowEngine {
         Some(verify_result)
     }
 
+    /// [`SystemNodeKind::Wait`] — pause the workflow until an external
+    /// signal resumes it.
+    ///
+    /// Returns `None` when the node is not a `Wait`; otherwise a
+    /// [`WaitOutcome::Pause`] carrying a `__waiting__: true` envelope
+    /// the caller stores in `results` before returning a
+    /// `WorkflowContext { waiting: true, .. }`.
+    ///
+    /// Resume contract: the caller invokes
+    /// [`run_with_seed_with_transport`](crate::ParallelWorkflowEngine::run_with_seed_with_transport)
+    /// with `seed[wait_node_id]` set to whatever value should stand
+    /// in as the Wait node's "output" for downstream consumers.
+    /// Common shapes: the webhook payload that triggered the resume,
+    /// the human approver's verdict, a timer-fired sentinel, etc.
+    /// The engine never inspects this value — it just routes it to
+    /// the Wait node's successors via their gathered inputs.
+    pub(crate) fn try_dispatch_wait(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+    ) -> Option<WaitOutcome> {
+        let (_, _, Some(SystemNodeKind::Wait { message })) = self.node_meta.get(&node_id)? else {
+            return None;
+        };
+        let waiting_output = if let Some(m) = message {
+            json!({
+                "__waiting__": true,
+                "node_id": node_id.to_string(),
+                "execution_id": execution_id.to_string(),
+                "message": m,
+            })
+        } else {
+            json!({
+                "__waiting__": true,
+                "node_id": node_id.to_string(),
+                "execution_id": execution_id.to_string(),
+            })
+        };
+        tracing::info!(
+            %node_id,
+            %execution_id,
+            "Wait node reached — pausing workflow"
+        );
+        Some(WaitOutcome::Pause { waiting_output })
+    }
+
     /// [`SystemNodeKind::WhileLoop`] — run the body *locally* (no
     /// module dispatch), re-evaluating the condition after each pass.
     /// Output records the final iteration count and last wrapped value.
@@ -241,6 +313,37 @@ impl ParallelWorkflowEngine {
             "iterations": count,
             "input": inputs,
         }))
+    }
+
+    /// [`SystemNodeKind::InlineJudge`] — evaluate a verdict expression
+    /// directly via the engine's `ExpressionEvaluator` instead of
+    /// dispatching a separate sub-workflow.
+    ///
+    /// Returns `None` when the node is not an `InlineJudge`; otherwise
+    /// the verdict envelope (same shape as
+    /// [`Self::dispatch_judge`](ParallelWorkflowEngine::dispatch_judge)).
+    #[cfg(feature = "llm-primitives")]
+    pub(crate) fn try_dispatch_inline_judge(
+        &self,
+        node_idx: NodeIndex,
+        node_id: Uuid,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        let (
+            _,
+            _,
+            Some(SystemNodeKind::InlineJudge {
+                verdict_expr,
+                pass_threshold,
+            }),
+        ) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let verdict_expr = verdict_expr.clone();
+        let pass_threshold = *pass_threshold;
+        let parent_inputs = self.gather_inputs(node_idx, results);
+        Some(self.dispatch_inline_judge(parent_inputs, &verdict_expr, pass_threshold))
     }
 
     /// [`SystemNodeKind::Judge`] — run an LLM-as-judge sub-workflow.
@@ -329,6 +432,12 @@ impl ParallelWorkflowEngine {
     /// [`SystemNodeKind::LlmDispatch`] — route to one of several child
     /// workflows based on a classifier's output.
     #[cfg(feature = "llm-primitives")]
+    #[tracing::instrument(
+        level = "info",
+        name = "llm_dispatch",
+        skip_all,
+        fields(node_id = %node_id),
+    )]
     pub(crate) async fn try_dispatch_llm_dispatch(
         &self,
         node_idx: NodeIndex,
@@ -391,6 +500,39 @@ impl ParallelWorkflowEngine {
         };
         let sub_wf_id = *sub_wf_id;
         let inputs = self.gather_inputs(node_idx, results);
+        // Propagate the parent's `__trigger_input__` into the child's
+        // trigger envelope so the scaffold's "always preserved" contract
+        // survives sub-workflow composition. Without this, a chained
+        // pipeline like `orchestrator → pr-triage → ask-my-memory` loses
+        // the user's original question at the first hop — the child
+        // sees only its direct upstream's output and has no way to
+        // reach the outer trigger.
+        //
+        // The child's `extract_trigger_input` helper unwraps the
+        // `__trigger_input__` key, so downstream nodes see the *root*
+        // user trigger no matter how deep the composition. When the
+        // upstream output is itself a map, we merge rather than
+        // replace — upstream fields still reach the child, plus the
+        // preserved outer trigger as a reserved key.
+        let parent_trigger = self.extract_trigger_input(results);
+        let child_trigger = match (parent_trigger, &inputs) {
+            (Some(pti), JsonValue::Object(existing)) => {
+                let mut merged = existing.clone();
+                merged.insert("__trigger_input__".to_string(), pti);
+                JsonValue::Object(merged)
+            }
+            (Some(pti), _) => {
+                // Non-object upstream (scalar or null): build an envelope
+                // so the __trigger_input__ key has somewhere to live.
+                let mut m = serde_json::Map::new();
+                if !inputs.is_null() {
+                    m.insert("input".to_string(), inputs.clone());
+                }
+                m.insert("__trigger_input__".to_string(), pti);
+                JsonValue::Object(m)
+            }
+            (None, _) => inputs,
+        };
         tracing::info!(
             %node_id,
             sub_workflow_id = %sub_wf_id,
@@ -398,7 +540,7 @@ impl ParallelWorkflowEngine {
         );
         Some(
             self.dispatch_subworkflow(
-                inputs,
+                child_trigger,
                 sub_wf_id,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
@@ -565,31 +707,50 @@ impl ParallelWorkflowEngine {
         let dispatch_result = match dispatch_target {
             Err(e) => serde_json::json!({ "__error": true, "error_message": e }),
             Ok(target_id_or_name) => {
-                let target_wf_id: Option<Uuid> =
-                    if let Ok(id) = Uuid::parse_str(&target_id_or_name) {
-                        Some(id)
-                    } else if let Some(store) = self.graph_store_arc() {
-                        store
-                            .resolve_by_name(
-                                &target_id_or_name,
-                                self.user_id().unwrap_or_else(Uuid::nil),
-                            )
-                            .await
-                            .map_err(|e| {
-                                tracing::warn!(error = %e, "DB query failed during execution");
-                                e
-                            })
-                            .ok()
-                            .flatten()
-                    } else {
-                        None
-                    };
+                let target_wf_id: Option<Uuid> = if let Ok(id) = Uuid::parse_str(&target_id_or_name)
+                {
+                    Some(id)
+                } else if let Some(store) = self.graph_store_arc() {
+                    store
+                        .resolve_by_name(
+                            &target_id_or_name,
+                            self.user_id().unwrap_or_else(Uuid::nil),
+                        )
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(error = %e, "DB query failed during execution");
+                            e
+                        })
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
 
                 match target_wf_id {
-                    None => serde_json::json!({
-                        "__error": true,
-                        "error_message": format!("Could not resolve dispatch target: {target_id_or_name}"),
-                    }),
+                    None => {
+                        // Loud signal: a `DynamicDispatch` target that
+                        // can't be resolved is almost always a missing
+                        // `WorkflowGraphStore::resolve_by_name`
+                        // override. The default-impl returns `None`
+                        // for everything; without this warning the
+                        // failure surfaces only as the per-node error
+                        // envelope, which is easy to miss in logs.
+                        let store_wired = self.graph_store_arc().is_some();
+                        tracing::warn!(
+                            %node_id,
+                            target = %target_id_or_name,
+                            graph_store_wired = store_wired,
+                            "DynamicDispatch could not resolve target. \
+                             If `target` is a name (not a UUID), make sure your \
+                             WorkflowGraphStore impl overrides `resolve_by_name` — \
+                             the default trait impl returns None for every name."
+                        );
+                        serde_json::json!({
+                            "__error": true,
+                            "error_message": format!("Could not resolve dispatch target: {target_id_or_name}"),
+                        })
+                    }
                     Some(sub_wf_id) => {
                         tracing::info!(
                             %node_id,
@@ -660,6 +821,21 @@ impl ParallelWorkflowEngine {
             .flatten();
 
         let Some((sub_wf_id, sub_wf_name)) = matching_row else {
+            // Loud signal: same shape as DynamicDispatch's
+            // unresolved-target warning. The default
+            // `WorkflowGraphStore::resolve_by_capabilities` impl
+            // returns None for every input, so a missing override
+            // looks identical to "no workflow matches" without
+            // this warning.
+            tracing::warn!(
+                %node_id,
+                required_capabilities = ?caps,
+                "CapabilityDispatch could not resolve a workflow. \
+                 If you have workflows declaring these capabilities, \
+                 make sure your WorkflowGraphStore impl overrides \
+                 `resolve_by_capabilities` — the default trait impl \
+                 returns None for every input."
+            );
             return Some(serde_json::json!({
                 "__error": true,
                 "error_message": format!("No workflow found matching capabilities: {caps:?}"),
@@ -807,6 +983,12 @@ impl ParallelWorkflowEngine {
     /// pre-conditions aren't met: no user context, missing body
     /// workflow, etc.).
     #[cfg(feature = "llm-primitives")]
+    #[tracing::instrument(
+        level = "info",
+        name = "agent_loop",
+        skip_all,
+        fields(node_id = %node_id),
+    )]
     pub(crate) async fn try_dispatch_agent_loop(
         &self,
         node_idx: NodeIndex,
@@ -864,16 +1046,20 @@ impl ParallelWorkflowEngine {
         let worker_shared_key_al = worker_shared_key.clone();
         let adapter_set_al = self.adapter_set();
         let inputs_al = inputs.clone();
-        let agent_result = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            async move {
+        // Capture before the async move so each iteration sees the
+        // engine-configured cap rather than the (now-removed) global
+        // const. `0` is the documented disable sentinel — see
+        // `set_agent_loop_max_history`.
+        let max_history = self.agent_loop_max_history();
+        let agent_result =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async move {
                 let mut history: Vec<JsonValue> = Vec::new();
                 let mut last_output = serde_json::json!({});
                 let mut finished = false;
                 // Track total iterations separately from history.len() —
-                // history is capped at AGENT_LOOP_MAX_HISTORY entries
-                // (sliding window), so history.len() would under-report
-                // when max_iters > AGENT_LOOP_MAX_HISTORY.
+                // history is capped at max_history entries (sliding
+                // window), so history.len() would under-report when
+                // max_iters > max_history.
                 let mut iterations_run: u32 = 0;
 
                 for iteration in 1..=max_iters {
@@ -891,7 +1077,7 @@ impl ParallelWorkflowEngine {
                         serde_json::json!(iteration),
                     );
 
-                    if do_inject_history && !history.is_empty() {
+                    if do_inject_history && max_history > 0 && !history.is_empty() {
                         iter_input.insert(
                             "__agent_history__".to_string(),
                             serde_json::Value::Array(history.clone()),
@@ -900,100 +1086,99 @@ impl ParallelWorkflowEngine {
 
                     let iter_input_value = serde_json::Value::Object(iter_input);
 
-                    let iter_result = match adapter_set_al
-                        .clone()
-                        .into_engine_with_graph(&graph_json)
-                    {
-                        Ok(mut sub_engine) => {
-                            let sub_execution_id = Uuid::new_v4();
-                            let trigger_node_id = Uuid::new_v4();
-                            sub_engine.add_node(trigger_node_id, None, None, None);
-                            sub_engine
-                                .node_labels
-                                .insert(trigger_node_id, "__trigger__".to_string());
+                    let iter_result =
+                        match adapter_set_al.clone().into_engine_with_graph(&graph_json) {
+                            Ok(mut sub_engine) => {
+                                let sub_execution_id = Uuid::new_v4();
+                                let trigger_node_id = Uuid::new_v4();
+                                sub_engine.add_node(trigger_node_id, None, None, None);
+                                sub_engine
+                                    .node_labels
+                                    .insert(trigger_node_id, "__trigger__".to_string());
 
-                            let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
-                                .graph
-                                .node_indices()
-                                .filter(|&idx| {
-                                    sub_engine.graph[idx] != trigger_node_id
-                                        && sub_engine
-                                            .graph
-                                            .neighbors_directed(idx, Direction::Incoming)
-                                            .count()
-                                            == 0
-                                })
-                                .collect();
-                            for root_idx in &root_indices {
-                                let root_id = sub_engine.graph[*root_idx];
-                                let _ = sub_engine.add_edge(
-                                    trigger_node_id,
-                                    root_id,
-                                    EdgeLogic {
-                                        source_handle: "output".to_string(),
-                                        target_handle: "input".to_string(),
-                                        mapping: None,
-                                        condition: None,
-                                        edge_type: "default".to_string(),
-                                    },
-                                );
-                            }
-
-                            let mut initial_results = HashMap::new();
-                            initial_results.insert(trigger_node_id, iter_input_value);
-
-                            let sub_labels = sub_engine.node_labels.clone();
-                            match sub_engine
-                                .run_with_seed_with_transport(
-                                    dispatcher_al.clone(),
-                                    worker_shared_key_al.clone(),
-                                    initial_results,
-                                    sub_execution_id,
-                                )
-                                .await
-                            {
-                                Ok(ctx) => {
-                                    let mut sub_outputs = serde_json::Map::new();
-                                    for (nid, output) in &ctx.results {
-                                        if output
-                                            .get("__skipped")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false)
-                                        {
-                                            continue;
-                                        }
-                                        let key = sub_labels
-                                            .get(nid)
-                                            .cloned()
-                                            .unwrap_or_else(|| nid.to_string());
-                                        if key == "__trigger__" {
-                                            continue;
-                                        }
-                                        sub_outputs.insert(
-                                            key,
-                                            ParallelWorkflowEngine::unwrap_output(output).clone(),
-                                        );
-                                    }
-                                    serde_json::Value::Object(sub_outputs)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        iteration,
-                                        error = %e,
-                                        "AgentLoop body workflow failed on iteration"
-                                    );
-                                    serde_json::json!({
-                                        "__error": true,
-                                        "error_message": e.to_string(),
+                                let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
+                                    .graph
+                                    .node_indices()
+                                    .filter(|&idx| {
+                                        sub_engine.graph[idx] != trigger_node_id
+                                            && sub_engine
+                                                .graph
+                                                .neighbors_directed(idx, Direction::Incoming)
+                                                .count()
+                                                == 0
                                     })
+                                    .collect();
+                                for root_idx in &root_indices {
+                                    let root_id = sub_engine.graph[*root_idx];
+                                    let _ = sub_engine.add_edge(
+                                        trigger_node_id,
+                                        root_id,
+                                        EdgeLogic {
+                                            source_handle: "output".to_string(),
+                                            target_handle: "input".to_string(),
+                                            mapping: None,
+                                            condition: None,
+                                            edge_type: "default".to_string(),
+                                        },
+                                    );
+                                }
+
+                                let mut initial_results = HashMap::new();
+                                initial_results.insert(trigger_node_id, iter_input_value);
+
+                                let sub_labels = sub_engine.node_labels.clone();
+                                match sub_engine
+                                    .run_with_seed_with_transport(
+                                        dispatcher_al.clone(),
+                                        worker_shared_key_al.clone(),
+                                        initial_results,
+                                        sub_execution_id,
+                                    )
+                                    .await
+                                {
+                                    Ok(ctx) => {
+                                        let mut sub_outputs = serde_json::Map::new();
+                                        for (nid, output) in &ctx.results {
+                                            if output
+                                                .get("__skipped")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false)
+                                            {
+                                                continue;
+                                            }
+                                            let key = sub_labels
+                                                .get(nid)
+                                                .cloned()
+                                                .unwrap_or_else(|| nid.to_string());
+                                            if key == "__trigger__" {
+                                                continue;
+                                            }
+                                            sub_outputs.insert(
+                                                key,
+                                                ParallelWorkflowEngine::unwrap_output(output)
+                                                    .clone(),
+                                            );
+                                        }
+                                        serde_json::Value::Object(sub_outputs)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            iteration,
+                                            error = %e,
+                                            "AgentLoop body workflow failed on iteration"
+                                        );
+                                        serde_json::json!({
+                                            "__error": true,
+                                            "error_message": e.to_string(),
+                                        })
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => serde_json::json!({
-                            "__error": true,
-                            "error_message": format!("Failed to build agent body: {e}"),
-                        }),
-                    };
+                            Err(e) => serde_json::json!({
+                                "__error": true,
+                                "error_message": format!("Failed to build agent body: {e}"),
+                            }),
+                        };
 
                     // Check for finish signals in the iteration output.
                     let iter_finished = iter_result
@@ -1008,14 +1193,16 @@ impl ParallelWorkflowEngine {
 
                     // Cap history entries to prevent unbounded memory
                     // growth when inject_history is true and iterations
-                    // produce large outputs. Keep the last
-                    // AGENT_LOOP_MAX_HISTORY entries (sufficient for
-                    // ReAct reasoning chains).
+                    // produce large outputs. `max_history == 0` opts
+                    // out of history accumulation entirely (matches
+                    // `inject_history: false` semantics on the loop).
                     iterations_run += 1;
-                    if history.len() >= AGENT_LOOP_MAX_HISTORY {
-                        history.remove(0);
+                    if max_history > 0 {
+                        if history.len() >= max_history {
+                            history.remove(0);
+                        }
+                        history.push(iter_result.clone());
                     }
-                    history.push(iter_result.clone());
                     last_output = iter_result;
 
                     if iter_finished {
@@ -1037,23 +1224,22 @@ impl ParallelWorkflowEngine {
                     "history": history,
                     "final_output": last_output,
                 })
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::warn!(
-                    %node_id,
-                    timeout_secs,
-                    "AgentLoop timed out"
-                );
-                serde_json::json!({
-                    "__error": true,
-                    "error_message": format!("AgentLoop timed out after {timeout_secs}s"),
-                })
-            }
-        };
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        %node_id,
+                        timeout_secs,
+                        "AgentLoop timed out"
+                    );
+                    serde_json::json!({
+                        "__error": true,
+                        "error_message": format!("AgentLoop timed out after {timeout_secs}s"),
+                    })
+                }
+            };
 
         Some(agent_result)
     }
@@ -1102,6 +1288,7 @@ impl ParallelWorkflowEngine {
             None => serde_json::json!({
                 "__error": true,
                 "error_message": "Loop node missing body_node_id in config",
+                "termination_reason": "no_body_node",
             }),
             Some(body_rf_id) => {
                 let body_uuid = self
@@ -1117,10 +1304,12 @@ impl ParallelWorkflowEngine {
                     (None, _) => serde_json::json!({
                         "__error": true,
                         "error_message": format!("Body node '{}' not found in workflow", body_rf_id),
+                        "termination_reason": "body_not_found",
                     }),
                     (Some(_), None) => serde_json::json!({
                         "__error": true,
                         "error_message": format!("Body node '{}' has no module_id", body_rf_id),
+                        "termination_reason": "body_missing_module",
                     }),
                     (Some(body_uuid), Some(body_module_id)) => {
                         self.run_loop_iterations(
@@ -1166,6 +1355,14 @@ impl ParallelWorkflowEngine {
         let mut current_input = inputs.clone();
         let mut iteration = 0u32;
         let mut last_output = current_input.clone();
+        // Distinguishes how the loop exited so the outer scheduler
+        // (and downstream consumers) can tell "condition stopped it"
+        // from "body failed silently". Initialized to `condition_false`
+        // — the fallthrough path once the condition evaluates false.
+        // Rewritten below for the max-iterations / body-error /
+        // module-fetch-error paths.
+        let mut termination_reason: &'static str = "condition_false";
+        let mut terminating_error: Option<String> = None;
 
         // Extract `__trigger_input__` to inject into every loop iteration.
         // Source: (1) gathered inputs, (2) the `__trigger__` node's
@@ -1220,10 +1417,13 @@ impl ParallelWorkflowEngine {
             let wasm_module = match fetch_result {
                 Ok(m) => m,
                 Err(e) => {
+                    let msg = format!("Module fetch failed: {e}");
                     last_output = serde_json::json!({
                         "__error": true,
-                        "error_message": format!("Module fetch failed: {e}"),
+                        "error_message": msg.clone(),
                     });
+                    termination_reason = "module_fetch_error";
+                    terminating_error = Some(msg);
                     break;
                 }
             };
@@ -1236,15 +1436,11 @@ impl ParallelWorkflowEngine {
                 }
             }
             if let Some(cfg) = self.node_configs.get(&body_uuid) {
-                if cfg.is_object()
-                    && !cfg.as_object().map(|m| m.is_empty()).unwrap_or(true)
-                {
+                if cfg.is_object() && !cfg.as_object().map(|m| m.is_empty()).unwrap_or(true) {
                     merged_input.insert("config".to_string(), cfg.clone());
                     if let Some(obj) = cfg.as_object() {
                         for (k, v) in obj {
-                            merged_input
-                                .entry(k.clone())
-                                .or_insert(v.clone());
+                            merged_input.entry(k.clone()).or_insert(v.clone());
                         }
                     }
                 }
@@ -1265,9 +1461,7 @@ impl ParallelWorkflowEngine {
                 .or_insert(serde_json::json!(iteration));
             let job_input = serde_json::Value::Object(merged_input);
 
-            let body_timeout_secs = self
-                .node_timeout_for(body_uuid)
-                .unwrap_or(30);
+            let body_timeout_secs = self.node_timeout_for(body_uuid).unwrap_or(30);
             let encrypted_secrets = self
                 .build_encrypted_secrets(body_module_id, worker_shared_key)
                 .await;
@@ -1285,13 +1479,33 @@ impl ParallelWorkflowEngine {
                     .oci_url
                     .clone()
                     .unwrap_or_else(|| format!("redis:wasm:{body_module_id}")),
-                wasm_bytes: None,
-                expected_wasm_hash: Some(wasm_module.content_hash.clone()),
+                // Embed bytes directly so the worker doesn't depend on
+                // a Redis pre-warm under a key the engine doesn't
+                // control — bypasses the `wasm:{uid}:{id}` vs
+                // `wasm:{id}` mismatch that broke loop iteration > 0.
+                // Matches the single-node dispatch pattern in
+                // `engine_dispatch_single.rs`.
+                wasm_bytes: if wasm_module.wasm_bytes.is_empty() {
+                    None
+                } else {
+                    Some(wasm_module.wasm_bytes.clone())
+                },
+                // Hash is load-bearing only when the worker has to
+                // fetch bytes by URI; inline bytes are already covered
+                // by the job-envelope HMAC.
+                expected_wasm_hash: if wasm_module.wasm_bytes.is_empty() {
+                    Some(wasm_module.content_hash.clone())
+                } else {
+                    None
+                },
                 capability_world: Some(wasm_module.capability_world.clone()),
                 integration_name: wasm_module.integration_name.clone(),
                 input_payload: job_input,
                 timeout: std::time::Duration::from_secs(body_timeout_secs),
-                max_fuel: wasm_module.max_fuel.min(50_000_000),
+                // Clamp to the engine-configured per-node fuel ceiling
+                // — `set_max_fuel_per_node` on the parent engine
+                // propagates here via `AdapterSet`.
+                max_fuel: wasm_module.max_fuel.min(self.max_fuel_per_node()),
                 allowed_hosts: wasm_module.allowed_hosts.clone(),
                 allowed_methods: wasm_module.allowed_methods.clone(),
                 allowed_secrets: wasm_module.allowed_secrets.clone(),
@@ -1315,31 +1529,67 @@ impl ParallelWorkflowEngine {
                     // Unwrap the engine envelope so the next iteration
                     // receives clean output, not double-wrapped input.
                     let clean = Self::unwrap_output(&result.output).clone();
+                    // Body returned an `__error` envelope — treat as a
+                    // body failure so the termination reason reflects
+                    // reality instead of silently rolling up "looks like
+                    // we ran N iterations" to the caller.
+                    if clean
+                        .get("__error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        let msg = clean
+                            .get("error_message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("loop body returned an error envelope")
+                            .to_string();
+                        last_output = clean;
+                        termination_reason = "body_error";
+                        terminating_error = Some(msg);
+                        break;
+                    }
                     last_output = clean.clone();
                     current_input = clean;
                 }
                 Err(e) => {
+                    let msg = e.to_string();
                     last_output = serde_json::json!({
                         "__error": true,
-                        "error_message": e.to_string(),
+                        "error_message": msg.clone(),
                     });
+                    termination_reason = "body_error";
+                    terminating_error = Some(msg);
                     break;
                 }
             }
         }
 
-        if iteration >= max_iters {
+        if iteration >= max_iters && terminating_error.is_none() {
             tracing::warn!(
                 %node_id,
                 max_iterations = max_iters,
                 "Loop reached maximum iterations"
             );
+            termination_reason = "max_iterations";
         }
 
-        serde_json::json!({
-            "iterations": iteration,
-            "output": last_output,
-        })
+        let mut out = serde_json::Map::with_capacity(5);
+        out.insert("iterations".to_string(), serde_json::json!(iteration));
+        out.insert("output".to_string(), last_output);
+        out.insert(
+            "termination_reason".to_string(),
+            serde_json::Value::String(termination_reason.to_string()),
+        );
+        if let Some(msg) = terminating_error {
+            // Lift the error to the top level so the outer scheduler's
+            // `__error` check (honoring `continue_on_error`) fires on
+            // the loop node itself. Previously the error was nested
+            // under `output`, which the scheduler didn't inspect — a
+            // failed iteration silently produced a "completed" workflow.
+            out.insert("__error".to_string(), serde_json::Value::Bool(true));
+            out.insert("error_message".to_string(), serde_json::Value::String(msg));
+        }
+        serde_json::Value::Object(out)
     }
 
     /// [`SystemNodeKind::ConfidenceGate`] — evaluate the confidence
@@ -1390,6 +1640,12 @@ impl ParallelWorkflowEngine {
     /// [`SystemNodeKind::Ensemble`] — run N copies of a child
     /// workflow and consolidate the outputs via a consensus strategy.
     #[cfg(feature = "llm-primitives")]
+    #[tracing::instrument(
+        level = "info",
+        name = "ensemble",
+        skip_all,
+        fields(node_id = %node_id),
+    )]
     pub(crate) async fn try_dispatch_ensemble(
         &self,
         node_idx: NodeIndex,
@@ -1526,10 +1782,7 @@ impl DispatchedOrigin {
 /// The Rhai engine is configured with a 10,000-operation cap, `eval`
 /// disabled, and a dummy module resolver to bound runtime and
 /// dependency surface.
-fn evaluate_dispatch_expression(
-    expression: &str,
-    inputs: &JsonValue,
-) -> Result<String, String> {
+fn evaluate_dispatch_expression(expression: &str, inputs: &JsonValue) -> Result<String, String> {
     let mut rhai_engine = rhai::Engine::new();
     rhai_engine.set_max_operations(10_000);
     rhai_engine.disable_symbol("eval");

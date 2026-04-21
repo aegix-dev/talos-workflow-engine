@@ -77,32 +77,48 @@ pub trait WorkflowGraphStore: Send + Sync {
     }
 
     /// Resolve a workflow by its display name, scoped to `user_id`.
-    /// Used by the engine's `DynamicDispatch` system node when the
-    /// target is specified as a string rather than a UUID.
+    ///
+    /// **Required for `SystemNodeKind::DynamicDispatch`** when the
+    /// target expression resolves to a string instead of a UUID. If
+    /// your graphs only ever use UUID targets, the default impl
+    /// (always returns `None`) is fine.
     ///
     /// Returns the first matching workflow's id (impls may order
     /// however they like — a typical impl takes the most recent by
     /// update time). Returns `Ok(None)` when no workflow matches.
     ///
-    /// Default impl returns `None` (out-of-tree consumers that don't
-    /// support name-based dispatch can leave this unimplemented; the
-    /// engine's `DynamicDispatch` then only resolves UUID targets).
+    /// # The silent-no-op trap
+    ///
+    /// The default impl returns `None` for every input. If your
+    /// graphs use name-based `DynamicDispatch` and you forgot to
+    /// override this method, every dispatch surfaces only as a
+    /// per-node `__error` envelope reading "Could not resolve
+    /// dispatch target: ..." — easy to miss in logs. The engine
+    /// emits a `tracing::warn!` at the dispatch site naming this
+    /// override as the likely cause; check your log pipeline for
+    /// it before assuming the workflow data is wrong.
     async fn resolve_by_name(&self, _name: &str, _user_id: Uuid) -> Result<Option<Uuid>, BoxError> {
         Ok(None)
     }
 
     /// Resolve a workflow whose declared capabilities are a superset
-    /// of `required_capabilities`, scoped to `user_id`. Used by the
-    /// engine's `CapabilityDispatch` system node — "find a workflow
-    /// that can do these things."
+    /// of `required_capabilities`, scoped to `user_id`.
+    ///
+    /// **Required for `SystemNodeKind::CapabilityDispatch`** —
+    /// "find a workflow that can do these things." If your graphs
+    /// don't use capability dispatch, the default impl (always
+    /// returns `None`) is fine.
     ///
     /// Returns the first matching workflow's `(id, name)` — impls may
     /// order however they like (a typical impl takes the most recent
     /// by update time). `Ok(None)` means no workflow satisfies the
     /// capability set.
     ///
-    /// Default impl returns `None` for the same reason as
-    /// [`resolve_by_name`](Self::resolve_by_name).
+    /// Same silent-no-op trap as
+    /// [`resolve_by_name`](Self::resolve_by_name): the engine emits
+    /// a `tracing::warn!` at the dispatch site when an unresolved
+    /// `CapabilityDispatch` could plausibly be a missing override
+    /// rather than a genuine no-match.
     async fn resolve_by_capabilities(
         &self,
         _required_capabilities: &[String],

@@ -1,3 +1,7 @@
+// Every public item in this crate is part of the consumer-facing
+// engine API. `deny(missing_docs)` makes any new undocumented `pub`
+// item a compile error, gating future regressions.
+#![deny(missing_docs)]
 //! Parallel workflow executor built on `talos-workflow-engine-core` traits.
 //!
 //! The engine runs a graph of system-node-typed workflow steps,
@@ -37,6 +41,10 @@ const _LLM_PRIMITIVES_FEATURE_COHERENCE_CHECK: () = assert!(
 
 mod chain_detect;
 mod engine;
+pub mod engine_builder;
+mod engine_completion;
+mod engine_dispatch_pipeline;
+mod engine_dispatch_single;
 pub mod error;
 mod event_spawn;
 pub mod graph_builder;
@@ -49,15 +57,22 @@ mod validation;
 pub mod vault_resolver;
 
 pub use chain_detect::detect_linear_chains;
+#[allow(deprecated)]
+pub use engine::DEFAULT_SANDBOX_ROOT;
 pub use engine::{
-    AdapterSet, JudgeVerdict, ParallelWorkflowEngine, SubflowError, DEFAULT_NODE_TIMEOUT_SECS,
-    DEFAULT_SANDBOX_ROOT,
+    default_sandbox_root, global_rate_limit_entry_count, reset_global_rate_limits, AdapterSet,
+    JudgeVerdict, ParallelWorkflowEngine, SubflowError, DEFAULT_AGENT_LOOP_MAX_HISTORY,
+    DEFAULT_MAX_FUEL_PER_NODE, DEFAULT_MAX_NODE_OUTPUT_BYTES, DEFAULT_MAX_PREFETCH_SUCCESSORS,
+    DEFAULT_MAX_SUBFLOW_DEPTH, DEFAULT_MAX_WORKFLOW_NODES, DEFAULT_NODE_TIMEOUT_SECS,
+    DEFAULT_SANDBOX_DIR_NAME,
 };
-pub use validation::validate_config_patterns;
+pub use engine_builder::ParallelWorkflowEngineBuilder;
 pub use error::WorkflowEngineError;
 pub use event_spawn::emit_event_spawn;
 pub use graph_builder::{BuildError, WorkflowGraphBuilder, WorkflowGraphBuilderError};
 pub use graph_json::{validate as validate_graph_json, GraphJsonError, GraphSummary, SCHEMA_DOC};
+pub use validation::validate_config_patterns;
 pub use vault_resolver::{
     extract_vault_refs, merge_vault_refs_into_allowlist, replace_vault_values, VaultRef,
+    VaultResolverError,
 };

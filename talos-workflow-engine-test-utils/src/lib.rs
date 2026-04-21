@@ -77,6 +77,7 @@ pub mod memory;
 #[cfg(feature = "minimal")]
 pub mod minimal;
 pub mod noop;
+pub mod rate_limit;
 
 #[cfg(feature = "minimal")]
 pub use minimal::minimal_engine;

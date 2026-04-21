@@ -47,10 +47,10 @@ Pre-1.0, the shape is **additive-only**: new optional fields land in
 0.x minor bumps; removing or re-typing an existing field bumps the
 major version.
 
-[load-fn]: https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.ParallelWorkflowEngine.html#method.load_from_graph_json
-[load-async-fn]: https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.ParallelWorkflowEngine.html#method.load_graph_from_json
-[store-trait]: https://docs.rs/talos-workflow-engine-core/0.1/talos_workflow_engine_core/trait.WorkflowGraphStore.html
-[builder]: https://docs.rs/talos-workflow-engine/0.1/talos_workflow_engine/struct.WorkflowGraphBuilder.html
+[load-fn]: https://docs.rs/talos-workflow-engine/0.2/talos_workflow_engine/struct.ParallelWorkflowEngine.html#method.load_from_graph_json
+[load-async-fn]: https://docs.rs/talos-workflow-engine/0.2/talos_workflow_engine/struct.ParallelWorkflowEngine.html#method.load_graph_from_json
+[store-trait]: https://docs.rs/talos-workflow-engine-core/0.2/talos_workflow_engine_core/trait.WorkflowGraphStore.html
+[builder]: https://docs.rs/talos-workflow-engine/0.2/talos_workflow_engine/struct.WorkflowGraphBuilder.html
 
 ## Top-level shape
 
@@ -92,8 +92,8 @@ Unknown top-level keys are ignored.
   // default):
   //
   //   "agent_loop"    | "react_loop"      | "judge"          |
-  //   "ensemble"     | "confidence_gate" | "reflective_retry"|
-  //   "llm_dispatch"
+  //   "inline_judge"  | "ensemble"        | "confidence_gate"|
+  //   "reflective_retry" | "llm_dispatch"
   //
   // Consumers with `llm-primitives` disabled see these kinds parsed
   // to `None` and the node is rejected at dispatch time.
@@ -216,6 +216,24 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 { "error_pattern": "timeout|rate_limited" }
 ```
 
+### `collect`
+```jsonc
+// Gathers every upstream branch's output into a single list on the
+// node's output payload. No configuration — the `data` object is empty
+// (or omitted). Pair with `synthesize` if you want to transform the
+// collected list before downstream consumption.
+{}
+```
+
+### `synthesize`
+```jsonc
+// Transforms a list of gathered outputs (typically produced by an
+// upstream `collect` or fan-in) using an optional expression. When
+// `synthesis_expr` is omitted the node forwards the list unchanged —
+// useful as a labeled join point in the graph.
+{ "synthesis_expr": "items | map(.score) | avg" }
+```
+
 ### `verify`
 ```jsonc
 { "condition": "response.status == 200",
@@ -229,6 +247,21 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
   "rubric": "rate helpfulness 0-1",
   "pass_threshold": 0.7,
   "timeout_secs": 60 }
+```
+
+### `inline_judge` *(llm-primitives)*
+```jsonc
+// Evaluates a verdict expression in-process — no sub-workflow dispatch.
+// The expression must return a verdict object (`{score, passed, reasoning,
+// feedback}`); `pass_threshold`, when present, overrides the expression's
+// own `passed` field for gating. Reach for `inline_judge` when the rubric
+// is a one-line scoring expression; promote to `judge` once it grows its
+// own prompt or model call.
+//
+// `verdict_expr` is required and must be non-empty; parsing rejects
+// missing/empty expressions at load time.
+{ "verdict_expr": "{score: input.confidence, passed: input.confidence > 0.5}",
+  "pass_threshold": 0.5 }
 ```
 
 ### `ensemble` *(llm-primitives)*
@@ -263,8 +296,22 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
   "timeout_secs": 60 }
 ```
 
-### `agent_loop` / `react_loop` *(llm-primitives)*
+### `agent_loop` *(llm-primitives)*
 ```jsonc
+// ReAct-style loop that re-dispatches `body_workflow_id` with the
+// accumulated history on each iteration. Stops on an explicit terminal
+// output or when `max_iterations` is hit (hard cap: 50).
+{ "body_workflow_id": "uuid",
+  "max_iterations": 10,
+  "inject_history": true,
+  "timeout_secs": 60 }
+```
+
+### `react_loop` *(llm-primitives)*
+```jsonc
+// Reasoning + acting variant. Shape is identical to `agent_loop` — the
+// distinction is handler behavior, which may diverge in future releases.
+// Use `agent_loop` unless you specifically want the ReAct variant.
 { "body_workflow_id": "uuid",
   "max_iterations": 10,
   "inject_history": true,
@@ -286,7 +333,7 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 
 The engine reads and writes a set of reserved keys on node input and
 output payloads. See
-[`talos_workflow_engine_core::reserved_keys`](https://docs.rs/talos-workflow-engine-core/0.1/talos_workflow_engine_core/reserved_keys/index.html)
+[`talos_workflow_engine_core::reserved_keys`](https://docs.rs/talos-workflow-engine-core/0.2/talos_workflow_engine_core/reserved_keys/index.html)
 for the authoritative list. Consumer-authored module output must
 not shadow these — the engine strips them from user-visible output
 where documented, and reading them back has undefined results.

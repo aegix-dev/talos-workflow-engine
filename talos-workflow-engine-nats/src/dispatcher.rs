@@ -272,6 +272,7 @@ pub(crate) async fn execute_job_with_retry(
                                         classification
                                     )),
                                     iteration_index: None,
+                                    error_class: Some(classification.clone()),
                                 },
                             );
                             return Err(format!(
@@ -352,6 +353,7 @@ pub(crate) async fn execute_job_with_retry(
                             status: "Running".to_string(),
                             log_message: Some(format!("Retry attempt {}", retry_num)),
                             iteration_index: Some(retry_num),
+                            error_class: None,
                         },
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -546,7 +548,9 @@ impl NodeDispatcher for NatsNodeDispatcher {
             job.timeout.as_secs() + TOKIO_WRAP_GRACE_SECS,
             job.max_retries,
             job.backoff_ms,
-            self.worker_shared_key.as_ref().map(WorkerSharedKey::as_bytes),
+            self.worker_shared_key
+                .as_ref()
+                .map(WorkerSharedKey::as_bytes),
             job.retry_condition.as_deref(),
             job.retry_delay_expr.as_deref(),
             event_sink,
@@ -655,9 +659,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
             .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
         if let Some(key) = self.worker_shared_key.as_ref() {
-            result.verify(key.as_bytes(), 300).map_err(|e| -> BoxError {
-                format!("Pipeline result signature verification failed: {e}").into()
-            })?;
+            result
+                .verify(key.as_bytes(), 300)
+                .map_err(|e| -> BoxError {
+                    format!("Pipeline result signature verification failed: {e}").into()
+                })?;
         }
 
         // 8. Map per-step results back into the abstract shape.

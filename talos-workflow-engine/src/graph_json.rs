@@ -40,12 +40,19 @@ pub const SCHEMA_DOC: &str = include_str!("../../docs/graph-json-schema.md");
 
 /// System-node `kind` strings the engine accepts in `graph_json` input,
 /// excluding the LLM-gated set. Keep in sync with the parser branches in
-/// [`crate::ParallelWorkflowEngine::load_graph_from_json`].
+/// [`crate::graph_parser::parse_system_node_kind`] and the serializer in
+/// [`crate::graph_builder`]; `all_kinds_classified_as_known` in this
+/// module's tests round-trips every builder-emitted kind through
+/// [`known_system_kind`] so drift surfaces immediately.
 const KNOWN_SYSTEM_KINDS_BASE: &[&str] = &[
     "foreach",
     "wait",
     "sub_workflow",
     "loop",
+    "while_loop",
+    "repeat_loop",
+    "fan_in",
+    "error_handler",
     "collect",
     "synthesize",
     "verify",
@@ -59,6 +66,7 @@ const KNOWN_SYSTEM_KINDS_LLM: &[&str] = &[
     "agent_loop",
     "react_loop",
     "judge",
+    "inline_judge",
     "ensemble",
     "confidence_gate",
     "reflective_retry",
@@ -432,6 +440,47 @@ mod tests {
     }
 
     #[test]
+    fn all_base_kinds_classified_as_known() {
+        // Drift guard: every base `kind` string the builder / parser
+        // handles must round-trip as "known" through the validator.
+        // If a new variant is added to `SystemNodeKind` without a
+        // corresponding entry in `KNOWN_SYSTEM_KINDS_BASE`, the
+        // validator will warn "unknown system kind" on valid graphs
+        // — this test catches that drift before release.
+        let nodes: Vec<_> = KNOWN_SYSTEM_KINDS_BASE
+            .iter()
+            .enumerate()
+            .map(|(i, k)| json!({ "id": format!("n{i}"), "kind": k }))
+            .collect();
+        let g = json!({ "nodes": nodes });
+        let s = validate_value(&g).unwrap();
+        assert_eq!(s.system_node_count, KNOWN_SYSTEM_KINDS_BASE.len());
+        assert!(
+            s.warnings.is_empty(),
+            "expected no warnings for builder-emitted kinds, got: {:?}",
+            s.warnings
+        );
+    }
+
+    #[cfg(feature = "llm-primitives")]
+    #[test]
+    fn all_llm_kinds_classified_as_known_when_feature_on() {
+        let nodes: Vec<_> = KNOWN_SYSTEM_KINDS_LLM
+            .iter()
+            .enumerate()
+            .map(|(i, k)| json!({ "id": format!("n{i}"), "kind": k }))
+            .collect();
+        let g = json!({ "nodes": nodes });
+        let s = validate_value(&g).unwrap();
+        assert_eq!(s.system_node_count, KNOWN_SYSTEM_KINDS_LLM.len());
+        assert!(
+            s.warnings.is_empty(),
+            "expected no warnings for LLM kinds with feature on, got: {:?}",
+            s.warnings
+        );
+    }
+
+    #[test]
     fn unknown_kind_warns_and_counts_as_annotation() {
         let g = json!({
             "nodes": [{ "id": "x", "kind": "bogus" }],
@@ -471,7 +520,10 @@ mod tests {
     fn missing_node_id_warns() {
         let g = json!({ "nodes": [{ "type": uuid::Uuid::new_v4().to_string() }] });
         let s = validate_value(&g).unwrap();
-        assert!(s.warnings.iter().any(|w| w.contains("missing or empty `id`")));
+        assert!(s
+            .warnings
+            .iter()
+            .any(|w| w.contains("missing or empty `id`")));
     }
 
     #[test]

@@ -1,0 +1,50 @@
+# Prevent BuildKit from shipping multi-GB of local build artifacts into every
+# image that consumes this tree via `additional_contexts.workflow_engine`.
+#
+# Without this file, `target/` (can be 7+ GB) was transferred into the controller,
+# worker, and migrate builds on every `docker compose up --build`, blowing out
+# Docker Desktop's VM disk and causing `No space left on device` failures.
+#
+# Keep this tight: only source + manifests + licenses. Artifacts are rebuilt inside
+# the image from the shared Cargo cache mounts.
+
+# Rust build output
+target/
+**/target/
+
+# Git history — not needed for compilation
+.git/
+.gitignore
+.github/
+
+# IDE / editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Node tooling (if any docs/tools grow a package.json)
+node_modules/
+
+# Local env + secrets
+.env
+.env.*
+!.env.example
+
+# Pre-existing tarballs / archives
+*.tar
+*.tar.gz
+*.zip
+
+# Coverage / benchmark output
+coverage/
+tarpaulin-report.html
+criterion/
+
+# Cargo local overrides (not meant for the image)
+.cargo/config.toml.local
+
+# Test output and logs
+*.log
+tmp/

@@ -28,17 +28,17 @@ use uuid::Uuid;
            \n\
            | Group | Variants | Use when |\n\
            |---|---|---|\n\
-           | **LLM judging** | [`Judge`], [`Ensemble`], [`ConfidenceGate`] | You're scoring or gating LLM output and need verdict / consensus / confidence semantics. |\n\
+           | **LLM judging** | [`Judge`], [`InlineJudge`], [`Ensemble`], [`ConfidenceGate`] | You're scoring or gating LLM output and need verdict / consensus / confidence semantics. Reach for `InlineJudge` when the rubric is a one-line scoring expression; promote to `Judge` once it grows its own prompt / model call. |\n\
            | **LLM agent loops** | [`AgentLoop`], [`ReActLoop`], [`ReflectiveRetry`] | You're running a tool-using agent body with iteration / retry on failure. |\n\
            | **LLM dispatch** | [`LlmDispatch`] | A classifier picks which downstream workflow handles the input. |\n"
 )]
 #[cfg_attr(
     not(feature = "llm-primitives"),
-    doc = "An additional 7 LLM/agent-flavored variants — `Judge`, `Ensemble`, \
-           `ConfidenceGate`, `AgentLoop`, `ReActLoop`, `ReflectiveRetry`, \
-           `LlmDispatch` — are gated behind the `llm-primitives` feature \
-           (default on). They are absent from this enum when the feature is \
-           disabled; the engine rejects equivalent JSON kinds at parse time."
+    doc = "An additional 8 LLM/agent-flavored variants — `Judge`, `InlineJudge`, \
+           `Ensemble`, `ConfidenceGate`, `AgentLoop`, `ReActLoop`, \
+           `ReflectiveRetry`, `LlmDispatch` — are gated behind the `llm-primitives` \
+           feature (default on). They are absent from this enum when the feature \
+           is disabled; the engine rejects equivalent JSON kinds at parse time."
 )]
 ///
 /// # Stability
@@ -71,6 +71,7 @@ use uuid::Uuid;
 #[cfg_attr(
     feature = "llm-primitives",
     doc = "\n[`Judge`]: SystemNodeKind::Judge\n\
+           [`InlineJudge`]: SystemNodeKind::InlineJudge\n\
            [`Ensemble`]: SystemNodeKind::Ensemble\n\
            [`ConfidenceGate`]: SystemNodeKind::ConfidenceGate\n\
            [`AgentLoop`]: SystemNodeKind::AgentLoop\n\
@@ -175,6 +176,25 @@ pub enum SystemNodeKind {
         pass_threshold: Option<f64>,
         /// Hard timeout for the judge invocation in seconds.
         timeout_secs: u64,
+    },
+
+    /// Inline-expression judge: evaluate `verdict_expr` against the
+    /// parent's gathered inputs and parse the result as a verdict
+    /// (same `{score, passed, reasoning, feedback}` shape as
+    /// [`Judge`](Self::Judge)). Use when the verdict is a one-line
+    /// scoring function — no sub-workflow, no LLM round-trip, no
+    /// `graph_store` lookup. Heavier judges with their own prompts /
+    /// model calls / branching belong in [`Judge`](Self::Judge).
+    ///
+    /// Gated behind the `llm-primitives` feature (on by default).
+    #[cfg(feature = "llm-primitives")]
+    InlineJudge {
+        /// Expression returning a JSON object with the verdict shape.
+        /// Evaluated against the gathered parent inputs by the
+        /// configured `ExpressionEvaluator`.
+        verdict_expr: String,
+        /// Optional score threshold the verdict must meet to pass.
+        pass_threshold: Option<f64>,
     },
     /// Run N copies of a child workflow and consolidate their outputs.
     ///

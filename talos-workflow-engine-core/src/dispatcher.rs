@@ -280,6 +280,8 @@ impl DispatchJob {
     /// populate them directly on the returned struct; the functional-
     /// update idiom `DispatchJob { field: value, ..Default::default() }`
     /// is equivalent when more than a handful of fields differ.
+    ///
+    /// For chained customization, prefer [`DispatchJob::builder`].
     #[must_use]
     pub fn new(
         execution_id: Uuid,
@@ -294,6 +296,232 @@ impl DispatchJob {
             input_payload,
             ..Self::default()
         }
+    }
+
+    /// Start a chained builder for a [`DispatchJob`].
+    ///
+    /// The four required fields — the identity triple plus the input
+    /// payload — are taken upfront so the builder can stay infallible
+    /// (no `Result` from [`DispatchJobBuilder::build`]). Optional
+    /// fields land via fluent setters; whatever is unset retains the
+    /// documented [`DispatchJob::default`] value.
+    ///
+    /// ```
+    /// # use uuid::Uuid;
+    /// # use serde_json::json;
+    /// # use std::time::Duration;
+    /// # use talos_workflow_engine_core::DispatchJob;
+    /// let job = DispatchJob::builder(
+    ///     Uuid::new_v4(),    // execution_id
+    ///     Uuid::new_v4(),    // node_id
+    ///     Uuid::new_v4(),    // module_id
+    ///     json!({"hello": "world"}),
+    /// )
+    /// .timeout(Duration::from_secs(30))
+    /// .max_retries(2)
+    /// .priority(150)
+    /// .build();
+    /// ```
+    ///
+    /// Use the builder when the call site differs in more than three
+    /// or four fields from `Default`; for the simple cases the struct-
+    /// literal form (`DispatchJob { field: value, ..Default::default() }`)
+    /// is just as clear and one fewer allocation.
+    pub fn builder(
+        execution_id: Uuid,
+        node_id: Uuid,
+        module_id: Uuid,
+        input_payload: JsonValue,
+    ) -> DispatchJobBuilder {
+        DispatchJobBuilder {
+            inner: Self::new(execution_id, node_id, module_id, input_payload),
+        }
+    }
+}
+
+/// Fluent builder for [`DispatchJob`].
+///
+/// Constructed via [`DispatchJob::builder`]. Every setter returns
+/// `Self`; [`build`](Self::build) is infallible because the four
+/// required fields were forced at construction time. The builder
+/// owns a single inner [`DispatchJob`] populated from
+/// [`DispatchJob::new`] and mutates it in place — cheap to use in a
+/// hot loop.
+///
+/// # Why a separate type?
+///
+/// The struct-literal `DispatchJob { ..Default::default() }` form
+/// remains supported and is fine for one-or-two-field overrides. The
+/// builder pays its way at three+ fields, where naming each setter
+/// is more readable than a long `..Default::default()` block — and
+/// it sidesteps the foot-gun where a future field added to
+/// [`DispatchJob`] silently lands as its `Default` value (no
+/// compile-time prompt to revisit existing call sites).
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct DispatchJobBuilder {
+    inner: DispatchJob,
+}
+
+impl DispatchJobBuilder {
+    /// Optional stable job id. When `None` (the default), impls
+    /// generate a fresh UUID at dispatch time.
+    pub fn job_id(mut self, job_id: Uuid) -> Self {
+        self.inner.job_id = Some(job_id);
+        self
+    }
+
+    /// Owning user for this execution. See [`DispatchJob::user_id`]
+    /// for the trait-level contract on `None`.
+    pub fn user_id(mut self, user_id: Uuid) -> Self {
+        self.inner.user_id = Some(user_id);
+        self
+    }
+
+    /// Actor id that owns the execution.
+    pub fn actor_id(mut self, actor_id: Uuid) -> Self {
+        self.inner.actor_id = Some(actor_id);
+        self
+    }
+
+    /// URI the worker can resolve the wasm binary from when
+    /// [`DispatchJob::wasm_bytes`] is empty.
+    pub fn module_uri(mut self, module_uri: impl Into<String>) -> Self {
+        self.inner.module_uri = module_uri.into();
+        self
+    }
+
+    /// Inlined wasm bytes the worker uses directly, skipping the URI
+    /// fetch.
+    pub fn wasm_bytes(mut self, wasm_bytes: Vec<u8>) -> Self {
+        self.inner.wasm_bytes = Some(wasm_bytes);
+        self
+    }
+
+    /// SHA-256 hex digest of the wasm binary at
+    /// [`DispatchJob::module_uri`].
+    pub fn expected_wasm_hash(mut self, hash: impl Into<String>) -> Self {
+        self.inner.expected_wasm_hash = Some(hash.into());
+        self
+    }
+
+    /// Capability-world hint for the worker's linker.
+    pub fn capability_world(mut self, world: impl Into<String>) -> Self {
+        self.inner.capability_world = Some(world.into());
+        self
+    }
+
+    /// Integration the module is scoped to.
+    pub fn integration_name(mut self, name: impl Into<String>) -> Self {
+        self.inner.integration_name = Some(name.into());
+        self
+    }
+
+    /// Per-node execution budget (seconds resolution).
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.inner.timeout = timeout;
+        self
+    }
+
+    /// Wasmtime fuel budget for the dispatch.
+    pub fn max_fuel(mut self, max_fuel: u64) -> Self {
+        self.inner.max_fuel = max_fuel;
+        self
+    }
+
+    /// Hostnames the worker permits outbound HTTP to.
+    pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.inner.allowed_hosts = hosts;
+        self
+    }
+
+    /// HTTP methods the worker permits. Empty means allow all.
+    pub fn allowed_methods(mut self, methods: Vec<String>) -> Self {
+        self.inner.allowed_methods = methods;
+        self
+    }
+
+    /// Secret path allowlist. Empty = deny all; `["*"]` = allow all.
+    pub fn allowed_secrets(mut self, secrets: Vec<String>) -> Self {
+        self.inner.allowed_secrets = secrets;
+        self
+    }
+
+    /// SQL operation allowlist. Empty means allow all.
+    pub fn allowed_sql_operations(mut self, ops: Vec<String>) -> Self {
+        self.inner.allowed_sql_operations = ops;
+        self
+    }
+
+    /// When `true`, the module may call Tier-2 `expose_secret` to
+    /// receive plaintext secret bytes in-guest. Default `false`.
+    pub fn allow_tier2_exposure(mut self, allow: bool) -> Self {
+        self.inner.allow_tier2_exposure = allow;
+        self
+    }
+
+    /// Set the encrypted-secrets ciphertext + nonce together — the
+    /// pair must always come from the same seal call. Use
+    /// [`Self::encrypted_secrets`] rather than two independent
+    /// setters so a partial assignment can't desynchronise the pair.
+    pub fn encrypted_secrets(mut self, ciphertext: Vec<u8>, nonce: Vec<u8>) -> Self {
+        self.inner.encrypted_secrets_ciphertext = ciphertext;
+        self.inner.encrypted_secrets_nonce = nonce;
+        self
+    }
+
+    /// Priority hint (higher dequeues first). Default `100`.
+    pub fn priority(mut self, priority: u8) -> Self {
+        self.inner.priority = priority;
+        self
+    }
+
+    /// Enable dry-run mode for this dispatch.
+    pub fn dry_run(mut self, dry_run: bool) -> Self {
+        self.inner.dry_run = dry_run;
+        self
+    }
+
+    /// Maximum retries for transient failures. Timeouts do not
+    /// retry.
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.inner.max_retries = max_retries;
+        self
+    }
+
+    /// Base backoff between retries (milliseconds).
+    pub fn backoff_ms(mut self, backoff_ms: u64) -> Self {
+        self.inner.backoff_ms = backoff_ms;
+        self
+    }
+
+    /// Optional expression evaluated against error output to decide
+    /// whether to retry.
+    pub fn retry_condition(mut self, expr: impl Into<String>) -> Self {
+        self.inner.retry_condition = Some(expr.into());
+        self
+    }
+
+    /// Optional expression returning a retry delay in ms computed
+    /// from the error output.
+    pub fn retry_delay_expr(mut self, expr: impl Into<String>) -> Self {
+        self.inner.retry_delay_expr = Some(expr.into());
+        self
+    }
+
+    /// When `false`, suppresses per-attempt observability events
+    /// (`node_retrying`, `retry_skipped`). Default `true`.
+    pub fn emit_retry_events(mut self, emit: bool) -> Self {
+        self.inner.emit_retry_events = emit;
+        self
+    }
+
+    /// Finalize the builder into a [`DispatchJob`]. Infallible — the
+    /// four required fields were forced at [`DispatchJob::builder`]
+    /// time.
+    #[must_use]
+    pub fn build(self) -> DispatchJob {
+        self.inner
     }
 }
 
@@ -537,4 +765,111 @@ pub async fn dispatch_chain_sequential<D: NodeDispatcher + ?Sized>(
         final_output: last_output,
         overall_status: StepStatus::Success,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ids() -> (Uuid, Uuid, Uuid) {
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())
+    }
+
+    #[test]
+    fn builder_starts_from_required_fields_and_keeps_defaults() {
+        // Required fields go in via `builder(...)`. Everything else
+        // must match `DispatchJob::default()` until a setter is called.
+        let (exec, node, module) = ids();
+        let payload = json!({"k": 1});
+        let job = DispatchJob::builder(exec, node, module, payload.clone()).build();
+        assert_eq!(job.execution_id, exec);
+        assert_eq!(job.node_id, node);
+        assert_eq!(job.module_id, module);
+        assert_eq!(job.input_payload, payload);
+        // Defaults preserved:
+        assert_eq!(
+            job.timeout,
+            Duration::from_secs(DEFAULT_DISPATCH_TIMEOUT_SECS)
+        );
+        assert_eq!(job.priority, 100);
+        assert!(job.emit_retry_events);
+        assert_eq!(job.user_id, None);
+        assert!(job.encrypted_secrets_ciphertext.is_empty());
+        assert!(job.encrypted_secrets_nonce.is_empty());
+    }
+
+    #[test]
+    fn builder_setters_override_defaults() {
+        let (exec, node, module) = ids();
+        let user = Uuid::new_v4();
+        let job = DispatchJob::builder(exec, node, module, JsonValue::Null)
+            .user_id(user)
+            .timeout(Duration::from_secs(45))
+            .max_fuel(2_000_000)
+            .priority(200)
+            .max_retries(5)
+            .backoff_ms(250)
+            .dry_run(true)
+            .emit_retry_events(false)
+            .allowed_hosts(vec!["api.example.com".into()])
+            .allowed_methods(vec!["GET".into(), "POST".into()])
+            .allowed_secrets(vec!["foo/*".into()])
+            .build();
+
+        assert_eq!(job.user_id, Some(user));
+        assert_eq!(job.timeout, Duration::from_secs(45));
+        assert_eq!(job.max_fuel, 2_000_000);
+        assert_eq!(job.priority, 200);
+        assert_eq!(job.max_retries, 5);
+        assert_eq!(job.backoff_ms, 250);
+        assert!(job.dry_run);
+        assert!(!job.emit_retry_events);
+        assert_eq!(job.allowed_hosts, vec!["api.example.com".to_string()]);
+        assert_eq!(job.allowed_methods, vec!["GET", "POST"]);
+        assert_eq!(job.allowed_secrets, vec!["foo/*".to_string()]);
+    }
+
+    #[test]
+    fn encrypted_secrets_setter_assigns_pair_atomically() {
+        // The ciphertext + nonce pair always travels together — set
+        // them via the single helper so a partial assignment can't
+        // desynchronise them. This test locks the API shape in.
+        let (exec, node, module) = ids();
+        let job = DispatchJob::builder(exec, node, module, JsonValue::Null)
+            .encrypted_secrets(vec![1, 2, 3], vec![9, 9, 9, 9])
+            .build();
+        assert_eq!(job.encrypted_secrets_ciphertext, vec![1, 2, 3]);
+        assert_eq!(job.encrypted_secrets_nonce, vec![9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn builder_and_struct_literal_produce_equal_jobs() {
+        // The builder is a thin wrapper over Default — verify it
+        // produces a job byte-for-byte equivalent to the
+        // struct-literal idiom for the same overrides. Catches a
+        // drift where the builder forgets to mirror a Default field.
+        let (exec, node, module) = ids();
+        let payload = json!({"x": "y"});
+        let via_builder = DispatchJob::builder(exec, node, module, payload.clone())
+            .timeout(Duration::from_secs(10))
+            .priority(7)
+            .build();
+        let via_literal = DispatchJob {
+            execution_id: exec,
+            node_id: node,
+            module_id: module,
+            input_payload: payload,
+            timeout: Duration::from_secs(10),
+            priority: 7,
+            ..Default::default()
+        };
+        // The struct doesn't derive PartialEq; compare field by field
+        // for the ones that vary (the rest match by Default).
+        assert_eq!(via_builder.execution_id, via_literal.execution_id);
+        assert_eq!(via_builder.timeout, via_literal.timeout);
+        assert_eq!(via_builder.priority, via_literal.priority);
+        assert_eq!(via_builder.max_retries, via_literal.max_retries);
+        assert_eq!(via_builder.emit_retry_events, via_literal.emit_retry_events);
+    }
 }

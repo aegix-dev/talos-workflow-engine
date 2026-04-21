@@ -90,7 +90,10 @@ async fn main() -> Result<(), WorkflowEngineError> {
     let dispatcher = Arc::new(
         ScriptedDispatcher::new()
             .with_response(fetch_module, json!({ "output": "page contents" }))
-            .with_response(summarize_module, json!({ "output": "two-sentence summary" }))
+            .with_response(
+                summarize_module,
+                json!({ "output": "two-sentence summary" }),
+            )
             .with_response(classify_module, json!({ "output": "category: news" })),
     );
 
@@ -110,13 +113,20 @@ async fn main() -> Result<(), WorkflowEngineError> {
     engine.load_graph_from_json(&graph_json).await?;
 
     let context = engine
-        .run_with_transport(dispatcher, /* worker_shared_key */ None, Uuid::new_v4())
+        .run_with_transport(
+            dispatcher,
+            /* worker_shared_key */ None,
+            Uuid::new_v4(),
+        )
         .await?;
 
     // 7. Print per-node outputs. `node_labels` maps the engine's
     //    internal UUIDs back to the human-readable ids we assigned in
     //    the builder ("fetch" / "summarize").
-    println!("workflow finished — {} node outputs:", context.results.len());
+    println!(
+        "workflow finished — {} node outputs:",
+        context.results.len()
+    );
     for (node_id, output) in &context.results {
         let label = engine
             .node_labels()

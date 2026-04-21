@@ -103,9 +103,7 @@ pub(crate) async fn build_encrypted_secrets_for(
             // wire. Fail closed (empty ciphertext → node dispatches
             // with no secrets → node fails cleanly) rather than
             // forwarding the bad output.
-            if let Err(e) =
-                talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce)
-            {
+            if let Err(e) = talos_workflow_engine_core::validate_seal_output(&ciphertext, &nonce) {
                 tracing::error!(
                     %node_id,
                     error = %e,
