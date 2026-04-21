@@ -2440,7 +2440,10 @@ impl ParallelWorkflowEngine {
     /// Gather and collect parent outputs for a Collect node.
     ///
     /// Strips engine-internal metadata (`__`-prefixed keys) from each branch
-    /// output and wraps them in `{"items": [...], "count": N}`.
+    /// output — EXCEPT error markers (`__error`, `__continued`), which are
+    /// preserved so downstream handlers have a reliable signal when a
+    /// `continue_on_error` parent errored. `error_message` is already a
+    /// non-prefixed field and passes through unconditionally.
     pub(crate) fn collect_parent_outputs_for_node(
         &self,
         node_idx: NodeIndex,
@@ -2453,7 +2456,9 @@ impl ParallelWorkflowEngine {
             .filter_map(|p| results.get(&self.graph[p]).cloned())
             .map(|v| {
                 if let JsonValue::Object(mut obj) = v {
-                    obj.retain(|k, _| !k.starts_with("__"));
+                    obj.retain(|k, _| {
+                        !k.starts_with("__") || k == "__error" || k == "__continued"
+                    });
                     JsonValue::Object(obj)
                 } else {
                     v
@@ -2518,9 +2523,11 @@ impl ParallelWorkflowEngine {
 
     /// Compute the Synthesize node output.
     ///
-    /// Collects parent outputs (stripping `__`-prefixed metadata), optionally
-    /// evaluates a Rhai `synthesis_expr`, and returns the synthesized value.
-    /// Array size is capped at 500 to match Rhai limits.
+    /// Collects parent outputs (stripping `__`-prefixed metadata EXCEPT error
+    /// markers `__error` / `__continued`, so downstream synthesis can detect
+    /// errored branches), optionally evaluates a Rhai `synthesis_expr`, and
+    /// returns the synthesized value. Array size is capped at 500 to match
+    /// Rhai limits.
     pub(crate) fn synthesize_parent_outputs(
         &self,
         node_idx: NodeIndex,
@@ -2534,7 +2541,9 @@ impl ParallelWorkflowEngine {
             .filter_map(|p| results.get(&self.graph[p]).cloned())
             .map(|v| {
                 if let JsonValue::Object(mut obj) = v {
-                    obj.retain(|k, _| !k.starts_with("__"));
+                    obj.retain(|k, _| {
+                        !k.starts_with("__") || k == "__error" || k == "__continued"
+                    });
                     JsonValue::Object(obj)
                 } else {
                     v
