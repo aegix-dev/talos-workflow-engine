@@ -4674,6 +4674,31 @@ impl ParallelWorkflowEngine {
                                 ..Default::default()
                             });
                         }
+                        ConfidenceGateOutcome::Halt(error_msg) => {
+                            // Mirror the verify-node fix: route the
+                            // error mode through the standard
+                            // completion-failure path so the workflow
+                            // actually fails (and continue_on_error /
+                            // error edges still get to participate).
+                            let chains_ctx = if is_fresh_run {
+                                Some((chains.as_slice(), &node_to_chain))
+                            } else {
+                                None
+                            };
+                            self.handle_completed_future(
+                                node_idx,
+                                Err(error_msg),
+                                execution_id,
+                                0,
+                                chains_ctx,
+                                &exec_ctx,
+                                &mut results,
+                                &mut pending,
+                                &mut ready,
+                            )
+                            .await?;
+                            continue;
+                        }
                     }
                 }
 

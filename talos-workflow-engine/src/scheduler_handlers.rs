@@ -53,6 +53,13 @@ pub(crate) enum ConfidenceGateOutcome {
     /// output into its accumulated `results` map, then returns early
     /// with a [`WorkflowContext`] built from that map.
     Pause { waiting_output: JsonValue },
+    /// `on_low_confidence: "error"` fired — caller should route this
+    /// as a node failure through `handle_completed_future` so the
+    /// workflow actually fails, matching the tool's documented
+    /// contract. Prior versions stored the error envelope and let
+    /// the workflow return `completed` despite the gate rejecting
+    /// its input — same class of bug as the verify-node fix (b69aad5).
+    Halt(String),
 }
 
 /// Outcome of [`ParallelWorkflowEngine::try_dispatch_wait`].
@@ -1665,7 +1672,33 @@ impl ParallelWorkflowEngine {
             )
             .await
         {
-            Ok(gate_result) => Some(ConfidenceGateOutcome::Proceed(gate_result)),
+            Ok(gate_result) => {
+                // The error mode of the gate synthesizes an
+                // `{__error: true, error_message: ..., __confidence_used__: ...}`
+                // envelope and returns it via `Ok`. That looks like a
+                // "proceed with this value" result to the scheduler,
+                // which then continues the workflow — silently
+                // contradicting the documented contract that
+                // `on_low_confidence: "error"` halts execution.
+                //
+                // Detect the marker and convert to `Halt` so the caller
+                // can route through the normal failure path (where
+                // continue_on_error + error edges still work).
+                let is_error_envelope = gate_result
+                    .get("__error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_error_envelope {
+                    let msg = gate_result
+                        .get("error_message")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| "Confidence gate rejected input".to_string());
+                    Some(ConfidenceGateOutcome::Halt(msg))
+                } else {
+                    Some(ConfidenceGateOutcome::Proceed(gate_result))
+                }
+            }
             Err(waiting_json) => Some(ConfidenceGateOutcome::Pause {
                 waiting_output: waiting_json,
             }),
