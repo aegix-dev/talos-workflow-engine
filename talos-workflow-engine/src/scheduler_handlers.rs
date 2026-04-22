@@ -862,6 +862,7 @@ impl ParallelWorkflowEngine {
             _,
             Some(SystemNodeKind::CapabilityDispatch {
                 required_capabilities,
+                fallback_workflow_id,
                 timeout_secs: _,
             }),
         ) = self.node_meta.get(&node_id)?
@@ -869,6 +870,7 @@ impl ParallelWorkflowEngine {
             return None;
         };
         let caps = required_capabilities.clone();
+        let fallback = *fallback_workflow_id;
         let inputs = self.gather_inputs(node_idx, results);
 
         tracing::info!(
@@ -894,31 +896,47 @@ impl ParallelWorkflowEngine {
             .ok()
             .flatten();
 
-        let Some((sub_wf_id, sub_wf_name)) = matching_row else {
-            // Loud signal: same shape as DynamicDispatch's
-            // unresolved-target warning. The default
-            // `WorkflowGraphStore::resolve_by_capabilities` impl
-            // returns None for every input, so a missing override
-            // looks identical to "no workflow matches" without
-            // this warning.
-            tracing::warn!(
-                %node_id,
-                required_capabilities = ?caps,
-                "CapabilityDispatch could not resolve a workflow. \
-                 If you have workflows declaring these capabilities, \
-                 make sure your WorkflowGraphStore impl overrides \
-                 `resolve_by_capabilities` — the default trait impl \
-                 returns None for every input."
-            );
-            return Some(serde_json::json!({
-                "__error": true,
-                "error_message": format!("No workflow found matching capabilities: {caps:?}"),
-            }));
+        let (sub_wf_id, sub_wf_name, is_fallback) = match matching_row {
+            Some((id, name)) => (id, name, false),
+            None => match fallback {
+                Some(fb_id) => {
+                    tracing::info!(
+                        %node_id,
+                        fallback_workflow_id = %fb_id,
+                        required_capabilities = ?caps,
+                        "CapabilityDispatch: no capability match — invoking fallback workflow"
+                    );
+                    (fb_id, "<fallback>".to_string(), true)
+                }
+                None => {
+                    // Loud signal: same shape as DynamicDispatch's
+                    // unresolved-target warning. The default
+                    // `WorkflowGraphStore::resolve_by_capabilities` impl
+                    // returns None for every input, so a missing override
+                    // looks identical to "no workflow matches" without
+                    // this warning.
+                    tracing::warn!(
+                        %node_id,
+                        required_capabilities = ?caps,
+                        "CapabilityDispatch could not resolve a workflow and no \
+                         fallback_workflow_id is set. If you have workflows \
+                         declaring these capabilities, make sure your \
+                         WorkflowGraphStore impl overrides \
+                         `resolve_by_capabilities` — the default trait impl \
+                         returns None for every input."
+                    );
+                    return Some(serde_json::json!({
+                        "__error": true,
+                        "error_message": format!("No workflow found matching capabilities: {caps:?}"),
+                    }));
+                }
+            },
         };
         tracing::info!(
             %node_id,
             dispatched_workflow_id = %sub_wf_id,
             dispatched_workflow_name = %sub_wf_name,
+            is_fallback,
             "CapabilityDispatch resolved to workflow"
         );
 
@@ -931,6 +949,7 @@ impl ParallelWorkflowEngine {
                 DispatchedOrigin::CapabilityDispatch {
                     workflow_name: sub_wf_name,
                     matched_capabilities: caps,
+                    is_fallback,
                 },
             )
             .await,
@@ -1813,6 +1832,10 @@ enum DispatchedOrigin {
     CapabilityDispatch {
         workflow_name: String,
         matched_capabilities: Vec<String>,
+        /// True when the capability lookup returned no match and the
+        /// node's `fallback_workflow_id` was invoked instead. Stamped
+        /// on the output as `__capability_dispatch_fallback`.
+        is_fallback: bool,
     },
 }
 
@@ -1872,6 +1895,7 @@ impl DispatchedOrigin {
         if let Self::CapabilityDispatch {
             workflow_name,
             matched_capabilities,
+            is_fallback,
         } = self
         {
             out.insert(
@@ -1886,6 +1910,12 @@ impl DispatchedOrigin {
                 "__matched_capabilities".to_string(),
                 serde_json::json!(matched_capabilities),
             );
+            if *is_fallback {
+                out.insert(
+                    "__capability_dispatch_fallback".to_string(),
+                    serde_json::json!(true),
+                );
+            }
         }
     }
 }

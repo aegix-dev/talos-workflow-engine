@@ -569,11 +569,13 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         ),
         SystemNodeKind::CapabilityDispatch {
             required_capabilities,
+            fallback_workflow_id,
             timeout_secs,
         } => (
             "capability_dispatch",
             json!({
                 "required_capabilities": required_capabilities,
+                "fallback_workflow_id": fallback_workflow_id.map(|u| u.to_string()),
                 "timeout_secs": timeout_secs,
             }),
         ),
@@ -972,6 +974,7 @@ mod tests {
                 "cap",
                 SystemNodeKind::CapabilityDispatch {
                     required_capabilities: vec!["llm".into(), "rag".into()],
+                    fallback_workflow_id: None,
                     timeout_secs: 30,
                 },
             )
@@ -1384,18 +1387,21 @@ mod tests {
             "cap_node",
             SystemNodeKind::CapabilityDispatch {
                 required_capabilities: vec!["llm".into(), "rag".into()],
+                fallback_workflow_id: Some(uuid::Uuid::from_u128(0x1234)),
                 timeout_secs: 30,
             },
         )
         .await;
         let SystemNodeKind::CapabilityDispatch {
             required_capabilities,
+            fallback_workflow_id,
             timeout_secs,
         } = decoded
         else {
             panic!("expected CapabilityDispatch");
         };
         assert_eq!(required_capabilities, vec!["llm".to_string(), "rag".into()]);
+        assert_eq!(fallback_workflow_id, Some(uuid::Uuid::from_u128(0x1234)));
         assert_eq!(timeout_secs, 30);
     }
 

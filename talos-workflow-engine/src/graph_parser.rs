@@ -221,8 +221,13 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
         if caps.is_empty() {
             return None;
         }
+        let fallback_workflow_id = data
+            .get("fallback_workflow_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok());
         Some(SystemNodeKind::CapabilityDispatch {
             required_capabilities: caps,
+            fallback_workflow_id,
             timeout_secs: data
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())

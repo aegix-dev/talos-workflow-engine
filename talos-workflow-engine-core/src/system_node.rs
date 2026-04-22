@@ -235,6 +235,11 @@ pub enum SystemNodeKind {
     CapabilityDispatch {
         /// Capability labels the target must all advertise.
         required_capabilities: Vec<String>,
+        /// Optional fallback workflow id dispatched when
+        /// [`WorkflowGraphStore::resolve_by_capabilities`] returns
+        /// `None`. Without this, an unmatched capability dispatch
+        /// fails hard.
+        fallback_workflow_id: Option<Uuid>,
         /// Hard timeout for the dispatched target in seconds.
         timeout_secs: u64,
     },
