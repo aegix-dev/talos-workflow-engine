@@ -4549,11 +4549,44 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── Verify dispatch (step-level output verification) ─────────
-                if let Some(output) =
+                //
+                // `try_dispatch_verify` returns:
+                //   None                  — not a Verify node, skip
+                //   Some(Ok(value))       — pass OR on_failure="passthrough":
+                //                           store and continue
+                //   Some(Err(msg))        — on_failure="error" fired:
+                //                           route through the normal
+                //                           completion-failure path so the
+                //                           workflow actually fails (matches
+                //                           the tool's documented contract).
+                if let Some(verify_outcome) =
                     self.try_dispatch_verify(node_idx, node_id, execution_id, &results)
                 {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    match verify_outcome {
+                        Ok(output) => {
+                            results.insert(node_id, output);
+                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                        }
+                        Err(error_msg) => {
+                            let chains_ctx = if is_fresh_run {
+                                Some((chains.as_slice(), &node_to_chain))
+                            } else {
+                                None
+                            };
+                            self.handle_completed_future(
+                                node_idx,
+                                Err(error_msg),
+                                execution_id,
+                                0, // no wall_time for synchronous system-node eval
+                                chains_ctx,
+                                &exec_ctx,
+                                &mut results,
+                                &mut pending,
+                                &mut ready,
+                            )
+                            .await?;
+                        }
+                    }
                     continue;
                 }
 

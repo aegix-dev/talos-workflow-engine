@@ -164,13 +164,27 @@ impl ParallelWorkflowEngine {
 
     /// [`SystemNodeKind::Verify`] — evaluate a condition against the
     /// node's gathered input and emit a pass/fail outcome.
+    ///
+    /// Returns `None` when the node is not a Verify system node.
+    /// Returns `Some(Ok(value))` when the caller should store `value`
+    /// as the node's output and continue (pass, or `on_failure:
+    /// "passthrough"`).
+    /// Returns `Some(Err(message))` when `on_failure: "error"` fired
+    /// and the caller should route this as a node failure through the
+    /// normal completion path (which halts the workflow unless the
+    /// node has `continue_on_error` set or an error edge catches it).
+    ///
+    /// The previous signature returned `Option<JsonValue>`
+    /// unconditionally — the error envelope was stored but the workflow
+    /// completed anyway, silently contradicting the tool documentation
+    /// that promised "workflow fails with verification error".
     pub(crate) fn try_dispatch_verify(
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
         execution_id: Uuid,
         results: &HashMap<Uuid, JsonValue>,
-    ) -> Option<JsonValue> {
+    ) -> Option<Result<JsonValue, String>> {
         let (
             _,
             _,
@@ -186,6 +200,7 @@ impl ParallelWorkflowEngine {
         let check_label = check_label
             .clone()
             .unwrap_or_else(|| "output quality".to_string());
+        let on_failure_owned = on_failure.clone();
         let (verify_result, passed) =
             self.evaluate_verify_node(node_idx, results, condition, &check_label, on_failure);
 
@@ -198,7 +213,27 @@ impl ParallelWorkflowEngine {
                 if passed { "PASSED" } else { "FAILED" }
             ),
         );
-        Some(verify_result)
+
+        // Pass OR on_failure="passthrough": forward the result and
+        // continue. Only the explicit "error" mode converts into a
+        // workflow-level failure so the documented contract holds.
+        if passed || on_failure_owned == "passthrough" {
+            Some(Ok(verify_result))
+        } else {
+            // Extract a concise error message from the synthesized
+            // envelope so the completion-handler failure-path sees
+            // the same text the envelope carries.
+            let err_msg = verify_result
+                .get("error_message")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Verification '{check_label}' failed (condition: {condition})"
+                    )
+                });
+            Some(Err(err_msg))
+        }
     }
 
     /// [`SystemNodeKind::Wait`] — pause the workflow until an external
