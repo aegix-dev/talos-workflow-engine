@@ -68,7 +68,22 @@ use talos_workflow_engine_core::SystemNodeKind;
 pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
     match kind {
         // ── Always-available variants ────────────────────────────
-        SystemNodeKind::ForEach { .. } => "try_dispatch_for_each",
+        // ForEach is DEFINED in the core enum and PARSED by
+        // graph_parser.rs but has NO dispatcher in scheduler_handlers.rs
+        // or engine.rs. A hand-authored `kind: "foreach"` node in graph
+        // JSON falls through to the module loader at runtime and fails
+        // with "Module not found" — same drift pattern as the historic
+        // ReActLoop bug (fixed in commit 33eed2c). No MCP tool currently
+        // authors ForEach nodes, so the surface-area impact is low, but
+        // the gap should be closed by either (a) implementing
+        // `try_dispatch_for_each` with proper fan-out-per-element
+        // semantics, or (b) removing the variant from the core enum +
+        // parser + builder. Flagged as `<unimplemented>` so the
+        // classifications_match_known_dispatcher_names test accepts it
+        // and the _compile_time_dispatcher_method_references tripwire
+        // skips it. Surfaced by the tripwire itself — exactly the bug
+        // class this module exists to catch.
+        SystemNodeKind::ForEach { .. } => "<unimplemented:for_each>",
         SystemNodeKind::Wait { .. } => "try_dispatch_wait",
         SystemNodeKind::WhileLoop { .. } => "try_dispatch_while_loop",
         SystemNodeKind::RepeatLoop { .. } => "try_dispatch_repeat_loop",
@@ -231,10 +246,14 @@ mod tests {
                 "missing dispatcher classification for variant {:?}",
                 variant
             );
+            // Accept either the try_dispatch_* naming convention or the
+            // explicit <unimplemented:*> marker for variants that are
+            // parsed but not yet wired to a dispatcher (see ForEach).
             assert!(
-                branch.starts_with("try_dispatch_"),
+                branch.starts_with("try_dispatch_") || branch.starts_with("<unimplemented:"),
                 "classification {:?} for variant {:?} should follow the \
-                 try_dispatch_* function naming convention",
+                 try_dispatch_* convention OR be explicitly marked \
+                 <unimplemented:*>",
                 branch,
                 variant
             );
@@ -283,7 +302,9 @@ mod tests {
     #[test]
     fn classifications_match_known_dispatcher_names() {
         let known: &[&str] = &[
-            "try_dispatch_for_each",
+            // Unimplemented placeholder for ForEach — see
+            // `dispatcher_branch_for` for the full gap explanation.
+            "<unimplemented:for_each>",
             "try_dispatch_wait",
             "try_dispatch_while_loop",
             "try_dispatch_repeat_loop",
@@ -314,6 +335,60 @@ mod tests {
                 branch,
                 variant
             );
+        }
+    }
+
+    /// Compile-time tripwire: every dispatcher function named in
+    /// `dispatcher_branch_for` and listed in
+    /// `classifications_match_known_dispatcher_names` MUST actually
+    /// resolve to a method on [`ParallelWorkflowEngine`]. Rust's
+    /// type system is the check — referencing
+    /// `ParallelWorkflowEngine::try_dispatch_X` as a function item is
+    /// a compile error if the method doesn't exist.
+    ///
+    /// This closes the remaining drift gap beyond the runtime string
+    /// check above: if a contributor renames a dispatcher method
+    /// (e.g. `try_dispatch_fan_in` → `try_dispatch_join`) but forgets
+    /// to update both `dispatcher_branch_for` and the `known` array,
+    /// the runtime test would still pass (name is still in `known`)
+    /// — but THIS function fails to compile because the old name no
+    /// longer resolves.
+    ///
+    /// The function is never called. The compile error is the test.
+    /// `#[allow(dead_code)]` silences the unused-function warning.
+    #[allow(dead_code)]
+    fn _compile_time_dispatcher_method_references() {
+        use crate::ParallelWorkflowEngine;
+
+        // Reference each dispatcher as a function item. Casting to
+        // () via a helper erases the differing signatures so we can
+        // assert "this identifier resolves" uniformly without
+        // writing 20 different fn-pointer type annotations.
+        fn exists<T>(_: T) {}
+
+        exists(ParallelWorkflowEngine::try_dispatch_collect);
+        exists(ParallelWorkflowEngine::try_dispatch_wait);
+        exists(ParallelWorkflowEngine::try_dispatch_while_loop);
+        exists(ParallelWorkflowEngine::try_dispatch_repeat_loop);
+        exists(ParallelWorkflowEngine::try_dispatch_error_handler);
+        exists(ParallelWorkflowEngine::try_dispatch_fan_in);
+        exists(ParallelWorkflowEngine::try_dispatch_sub_workflow);
+        exists(ParallelWorkflowEngine::try_dispatch_loop);
+        exists(ParallelWorkflowEngine::try_dispatch_synthesize);
+        exists(ParallelWorkflowEngine::try_dispatch_verify);
+        exists(ParallelWorkflowEngine::try_dispatch_dynamic_dispatch);
+        exists(ParallelWorkflowEngine::try_dispatch_capability_dispatch);
+        // ForEach is intentionally absent — the dispatcher doesn't
+        // exist yet. See dispatcher_branch_for for the gap explanation.
+        #[cfg(feature = "llm-primitives")]
+        {
+            exists(ParallelWorkflowEngine::try_dispatch_agent_loop);
+            exists(ParallelWorkflowEngine::try_dispatch_judge);
+            exists(ParallelWorkflowEngine::try_dispatch_inline_judge);
+            exists(ParallelWorkflowEngine::try_dispatch_ensemble);
+            exists(ParallelWorkflowEngine::try_dispatch_confidence_gate);
+            exists(ParallelWorkflowEngine::try_dispatch_reflective_retry);
+            exists(ParallelWorkflowEngine::try_dispatch_llm_dispatch);
         }
     }
 }
