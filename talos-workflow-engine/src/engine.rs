@@ -2856,6 +2856,7 @@ impl ParallelWorkflowEngine {
         judge_wf_id: Uuid,
         rubric: String,
         pass_threshold: Option<f64>,
+        on_failure: &str,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
     ) -> JsonValue {
@@ -2900,6 +2901,29 @@ impl ParallelWorkflowEngine {
                     };
                     out.insert("__judge_score__".to_string(), serde_json::json!(score));
                     out.insert("__judge_passed__".to_string(), serde_json::json!(true));
+                    out.insert(
+                        "__judge_reasoning__".to_string(),
+                        serde_json::json!(reasoning),
+                    );
+                    out.insert(
+                        "__judge_feedback__".to_string(),
+                        serde_json::json!(feedback),
+                    );
+                    serde_json::Value::Object(out)
+                } else if on_failure == "passthrough" {
+                    // Forward the parent output enriched with the rejection
+                    // envelope. Downstream edges can conditional-route on
+                    // `__judge_passed__ == false` without tripping the error
+                    // path — same semantics as `verify` with
+                    // `on_failure: passthrough`.
+                    let mut out = if let Some(obj) = parent_inputs.as_object() {
+                        obj.clone()
+                    } else {
+                        serde_json::Map::new()
+                    };
+                    out.insert("__judge_score__".to_string(), serde_json::json!(score));
+                    out.insert("__judge_passed__".to_string(), serde_json::json!(false));
+                    out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
                     out.insert(
                         "__judge_reasoning__".to_string(),
                         serde_json::json!(reasoning),
@@ -2968,6 +2992,7 @@ impl ParallelWorkflowEngine {
         parent_inputs: JsonValue,
         verdict_expr: &str,
         pass_threshold: Option<f64>,
+        on_failure: &str,
     ) -> JsonValue {
         let raw_verdict = match self.eval_json(verdict_expr, &parent_inputs) {
             Ok(v) => v,
@@ -3014,6 +3039,24 @@ impl ParallelWorkflowEngine {
             };
             out.insert("__judge_score__".to_string(), serde_json::json!(score));
             out.insert("__judge_passed__".to_string(), serde_json::json!(true));
+            out.insert(
+                "__judge_reasoning__".to_string(),
+                serde_json::json!(reasoning),
+            );
+            out.insert(
+                "__judge_feedback__".to_string(),
+                serde_json::json!(feedback),
+            );
+            serde_json::Value::Object(out)
+        } else if on_failure == "passthrough" {
+            let mut out = if let Some(obj) = parent_inputs.as_object() {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            out.insert("__judge_score__".to_string(), serde_json::json!(score));
+            out.insert("__judge_passed__".to_string(), serde_json::json!(false));
+            out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
             out.insert(
                 "__judge_reasoning__".to_string(),
                 serde_json::json!(reasoning),

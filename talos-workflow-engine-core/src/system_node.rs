@@ -174,6 +174,15 @@ pub enum SystemNodeKind {
         rubric: String,
         /// Optional score threshold the verdict must meet to pass.
         pass_threshold: Option<f64>,
+        /// Behavior on verdict rejection. `"error"` (default) emits
+        /// an `__error: true` envelope that fails the node unless
+        /// `continue_on_error` is set. `"passthrough"` forwards the
+        /// parent output enriched with `__judge_passed__: false`
+        /// (plus score / reasoning / feedback) so downstream edges
+        /// can conditional-route without tripping the error path.
+        /// Mirrors the `on_failure` field on
+        /// [`SystemNodeKind::Verify`].
+        on_failure: String,
         /// Hard timeout for the judge invocation in seconds.
         timeout_secs: u64,
     },
@@ -195,6 +204,9 @@ pub enum SystemNodeKind {
         verdict_expr: String,
         /// Optional score threshold the verdict must meet to pass.
         pass_threshold: Option<f64>,
+        /// Behavior on verdict rejection. See
+        /// [`Judge::on_failure`](Self::Judge) — same contract.
+        on_failure: String,
     },
     /// Run N copies of a child workflow and consolidate their outputs.
     ///

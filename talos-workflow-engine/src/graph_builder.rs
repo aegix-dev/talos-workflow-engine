@@ -599,6 +599,7 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
             judge_workflow_id,
             rubric,
             pass_threshold,
+            on_failure,
             timeout_secs,
         } => (
             "judge",
@@ -606,6 +607,7 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "judge_workflow_id": judge_workflow_id.to_string(),
                 "rubric": rubric,
                 "pass_threshold": pass_threshold,
+                "on_failure": on_failure,
                 "timeout_secs": timeout_secs,
             }),
         ),
@@ -613,11 +615,13 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::InlineJudge {
             verdict_expr,
             pass_threshold,
+            on_failure,
         } => (
             "inline_judge",
             json!({
                 "verdict_expr": verdict_expr,
                 "pass_threshold": pass_threshold,
+                "on_failure": on_failure,
             }),
         ),
         #[cfg(feature = "llm-primitives")]
@@ -1179,6 +1183,7 @@ mod tests {
                     judge_workflow_id: judge_wf,
                     rubric: "rate 0-1".into(),
                     pass_threshold: Some(0.8),
+                    on_failure: "error".into(),
                     timeout_secs: 60,
                 },
             )
@@ -1203,6 +1208,7 @@ mod tests {
                 SystemNodeKind::InlineJudge {
                     verdict_expr: "{score: input.confidence, passed: input.confidence > 0.5, reasoning: '', feedback: ''}".into(),
                     pass_threshold: Some(0.5),
+                    on_failure: "error".into(),
                 },
             )
             .build()
@@ -1440,6 +1446,7 @@ mod tests {
                 judge_workflow_id: wf_id,
                 rubric: "rate 0-1".into(),
                 pass_threshold: Some(0.8),
+                on_failure: "passthrough".into(),
                 timeout_secs: 60,
             },
         )
@@ -1450,8 +1457,9 @@ mod tests {
                 judge_workflow_id: w,
                 rubric: ref r,
                 pass_threshold: Some(t),
+                on_failure: ref onf,
                 timeout_secs: 60,
-            } if w == wf_id && r == "rate 0-1" && (t - 0.8).abs() < f64::EPSILON
+            } if w == wf_id && r == "rate 0-1" && (t - 0.8).abs() < f64::EPSILON && onf == "passthrough"
         ));
     }
 
@@ -1463,6 +1471,7 @@ mod tests {
             SystemNodeKind::InlineJudge {
                 verdict_expr: "{score: 1.0, passed: true, reasoning: '', feedback: ''}".into(),
                 pass_threshold: Some(0.5),
+                on_failure: "passthrough".into(),
             },
         )
         .await;
@@ -1471,7 +1480,8 @@ mod tests {
             SystemNodeKind::InlineJudge {
                 verdict_expr: ref e,
                 pass_threshold: Some(t),
-            } if e.contains("passed: true") && (t - 0.5).abs() < f64::EPSILON
+                on_failure: ref onf,
+            } if e.contains("passed: true") && (t - 0.5).abs() < f64::EPSILON && onf == "passthrough"
         ));
     }
 

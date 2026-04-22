@@ -286,10 +286,16 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(60);
+        let on_failure = data
+            .get("on_failure")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error")
+            .to_string();
         Some(SystemNodeKind::Judge {
             judge_workflow_id,
             rubric,
             pass_threshold,
+            on_failure,
             timeout_secs,
         })
     } else if k == "inline_judge" {
@@ -305,9 +311,15 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             return None;
         }
         let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
+        let on_failure = data
+            .get("on_failure")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error")
+            .to_string();
         Some(SystemNodeKind::InlineJudge {
             verdict_expr,
             pass_threshold,
+            on_failure,
         })
     } else if k == "ensemble" {
         let data = node.get("data").unwrap_or(&JsonValue::Null);

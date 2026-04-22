@@ -436,7 +436,7 @@ fn inline_judge_passes_when_score_meets_threshold() {
     )));
 
     let parent = serde_json::json!({ "answer": "yes" });
-    let out = engine.dispatch_inline_judge(parent.clone(), "score(answer)", Some(0.5));
+    let out = engine.dispatch_inline_judge(parent.clone(), "score(answer)", Some(0.5), "error");
 
     assert_eq!(
         out.get("__judge_passed__").and_then(|v| v.as_bool()),
@@ -467,7 +467,7 @@ fn inline_judge_rejects_when_score_below_threshold() {
     )));
 
     let parent = serde_json::json!({ "answer": "maybe" });
-    let out = engine.dispatch_inline_judge(parent, "score(answer)", Some(0.7));
+    let out = engine.dispatch_inline_judge(parent, "score(answer)", Some(0.7), "error");
 
     assert_eq!(out.get("__error").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
@@ -487,7 +487,7 @@ fn inline_judge_emits_error_envelope_when_no_evaluator_wired() {
     // Important contract: the engine doesn't panic when the
     // evaluator is missing, even on the inline path.
     let engine = ParallelWorkflowEngine::new();
-    let out = engine.dispatch_inline_judge(serde_json::json!({}), "anything", None);
+    let out = engine.dispatch_inline_judge(serde_json::json!({}), "anything", None, "error");
     assert_eq!(out.get("__error").and_then(|v| v.as_bool()), Some(true));
     assert!(
         out.get("error_message")

@@ -377,6 +377,7 @@ impl ParallelWorkflowEngine {
             Some(SystemNodeKind::InlineJudge {
                 verdict_expr,
                 pass_threshold,
+                on_failure,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
@@ -384,8 +385,9 @@ impl ParallelWorkflowEngine {
         };
         let verdict_expr = verdict_expr.clone();
         let pass_threshold = *pass_threshold;
+        let on_failure = on_failure.clone();
         let parent_inputs = self.gather_inputs(node_idx, results);
-        Some(self.dispatch_inline_judge(parent_inputs, &verdict_expr, pass_threshold))
+        Some(self.dispatch_inline_judge(parent_inputs, &verdict_expr, pass_threshold, &on_failure))
     }
 
     /// [`SystemNodeKind::Judge`] — run an LLM-as-judge sub-workflow.
@@ -405,6 +407,7 @@ impl ParallelWorkflowEngine {
                 judge_workflow_id,
                 rubric,
                 pass_threshold,
+                on_failure,
                 timeout_secs: _,
             }),
         ) = self.node_meta.get(&node_id)?
@@ -414,6 +417,7 @@ impl ParallelWorkflowEngine {
         let judge_wf_id = *judge_workflow_id;
         let rubric = rubric.clone();
         let pass_threshold = *pass_threshold;
+        let on_failure = on_failure.clone();
         let parent_inputs = self.gather_inputs(node_idx, results);
 
         Some(
@@ -422,6 +426,7 @@ impl ParallelWorkflowEngine {
                 judge_wf_id,
                 rubric,
                 pass_threshold,
+                &on_failure,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
             )
