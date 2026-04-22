@@ -1903,24 +1903,24 @@ fn evaluate_dispatch_expression(expression: &str, inputs: &JsonValue) -> Result<
     rhai_engine.disable_symbol("eval");
     rhai_engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
     let mut scope = rhai::Scope::new();
+    // Push top-level input keys as bare scope variables (so `route == "A"` works),
+    // using serde conversion so nested objects/arrays stay structured rather than
+    // being stringified. Mirrors the edge-condition evaluator in
+    // controller::engine::rhai_helpers::evaluate_condition.
     if let Some(obj) = inputs.as_object() {
         for (k, v) in obj {
-            let dyn_val: rhai::Dynamic = match v {
-                serde_json::Value::String(s) => rhai::Dynamic::from(s.clone()),
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        rhai::Dynamic::from(i)
-                    } else if let Some(f) = n.as_f64() {
-                        rhai::Dynamic::from(f)
-                    } else {
-                        rhai::Dynamic::from(n.to_string())
-                    }
-                }
-                serde_json::Value::Bool(b) => rhai::Dynamic::from(*b),
-                _ => rhai::Dynamic::from(v.to_string()),
-            };
-            scope.push(k.clone(), dyn_val);
+            if let Ok(dyn_val) = rhai::serde::to_dynamic(v) {
+                scope.push_dynamic(k.clone(), dyn_val);
+            }
         }
+    }
+    // Also expose the full input payload as `input`, `ctx`, and `inputs` so
+    // expressions can use `input.route`, `ctx.route`, or `inputs.route` —
+    // matches the access patterns documented for edge conditions.
+    if let Ok(whole) = rhai::serde::to_dynamic(inputs) {
+        scope.push_dynamic("input", whole.clone());
+        scope.push_dynamic("ctx", whole.clone());
+        scope.push_dynamic("inputs", whole);
     }
     match rhai_engine.eval_with_scope::<rhai::Dynamic>(&mut scope, expression) {
         Ok(result) => {
