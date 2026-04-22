@@ -4784,7 +4784,17 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── DynamicDispatch (Rhai expression → target sub-workflow) ──
-                if let Some(output) = self
+                //
+                // Matches the verify-node (b69aad5) and confidence_gate
+                // (a7dd2b3) pattern: handler returns
+                // `Option<Result<JsonValue, String>>`, Err routes through
+                // `handle_completed_future` so `continue_on_error` +
+                // error edges get a chance. Prior behaviour stored the
+                // `{__error: true, error_message: ...}` envelope directly
+                // and let the workflow return `completed` despite the
+                // dispatch failing — misleading output with no path for
+                // downstream recovery.
+                if let Some(outcome) = self
                     .try_dispatch_dynamic_dispatch(
                         node_idx,
                         node_id,
@@ -4794,8 +4804,31 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    match outcome {
+                        Ok(output) => {
+                            results.insert(node_id, output);
+                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                        }
+                        Err(error_msg) => {
+                            let chains_ctx = if is_fresh_run {
+                                Some((chains.as_slice(), &node_to_chain))
+                            } else {
+                                None
+                            };
+                            self.handle_completed_future(
+                                node_idx,
+                                Err(error_msg),
+                                execution_id,
+                                0,
+                                chains_ctx,
+                                &exec_ctx,
+                                &mut results,
+                                &mut pending,
+                                &mut ready,
+                            )
+                            .await?;
+                        }
+                    }
                     continue;
                 }
 

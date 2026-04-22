@@ -716,6 +716,17 @@ impl ParallelWorkflowEngine {
     /// expression against the gathered input to select a target
     /// workflow (by UUID or name), then run it via the adapter set's
     /// sub-engine path.
+    ///
+    /// Returns:
+    ///   - `None` — not a DynamicDispatch node
+    ///   - `Some(Ok(value))` — dispatch succeeded; caller stores and continues
+    ///   - `Some(Err(message))` — dispatch target unresolved or sub-workflow
+    ///     failed; caller should route through the normal completion-failure
+    ///     path so the workflow actually fails (respecting continue_on_error
+    ///     + error edges). Prior versions stored the error envelope and let
+    ///     the workflow return `completed` despite the dispatch failing —
+    ///     same class of bug as verify-node (b69aad5) and confidence_gate
+    ///     (a7dd2b3); this commit is the third instance of the same fix.
     pub(crate) async fn try_dispatch_dynamic_dispatch(
         &self,
         node_idx: NodeIndex,
@@ -723,7 +734,7 @@ impl ParallelWorkflowEngine {
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
-    ) -> Option<JsonValue> {
+    ) -> Option<Result<JsonValue, String>> {
         let (
             _,
             _,
@@ -746,8 +757,12 @@ impl ParallelWorkflowEngine {
 
         let dispatch_target = evaluate_dispatch_expression(&expression, &inputs);
 
-        let dispatch_result = match dispatch_target {
-            Err(e) => serde_json::json!({ "__error": true, "error_message": e }),
+        // Resolve the target + run the sub-workflow, building either
+        // the success envelope or an error message. The error message
+        // flows through `handle_completed_future` at the reactor's
+        // caller so continue_on_error + error edges still work.
+        let outcome: Result<JsonValue, String> = match dispatch_target {
+            Err(e) => Err(e),
             Ok(target_id_or_name) => {
                 let target_wf_id: Option<Uuid> = if let Ok(id) = Uuid::parse_str(&target_id_or_name)
                 {
@@ -788,10 +803,7 @@ impl ParallelWorkflowEngine {
                              WorkflowGraphStore impl overrides `resolve_by_name` — \
                              the default trait impl returns None for every name."
                         );
-                        serde_json::json!({
-                            "__error": true,
-                            "error_message": format!("Could not resolve dispatch target: {target_id_or_name}"),
-                        })
+                        Err(format!("Could not resolve dispatch target: {target_id_or_name}"))
                     }
                     Some(sub_wf_id) => {
                         tracing::info!(
@@ -799,20 +811,40 @@ impl ParallelWorkflowEngine {
                             dispatched_workflow_id = %sub_wf_id,
                             "DynamicDispatch resolved to workflow"
                         );
-                        self.run_dispatched_subworkflow(
-                            sub_wf_id,
-                            &inputs,
-                            dispatcher,
-                            worker_shared_key,
-                            DispatchedOrigin::DynamicDispatch,
-                        )
-                        .await
+                        let sub_result = self
+                            .run_dispatched_subworkflow(
+                                sub_wf_id,
+                                &inputs,
+                                dispatcher,
+                                worker_shared_key,
+                                DispatchedOrigin::DynamicDispatch,
+                            )
+                            .await;
+                        // `run_dispatched_subworkflow` returns a JsonValue that
+                        // may itself carry `__error: true` when the child
+                        // failed. Promote that into the Err variant so the
+                        // workflow-level failure path engages — matches the
+                        // capability_dispatch caller's detection.
+                        let is_error = sub_result
+                            .get("__error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if is_error {
+                            let msg = sub_result
+                                .get("error_message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("DynamicDispatch sub-workflow failed")
+                                .to_string();
+                            Err(msg)
+                        } else {
+                            Ok(sub_result)
+                        }
                     }
                 }
             }
         };
 
-        Some(dispatch_result)
+        Some(outcome)
     }
 
     /// [`SystemNodeKind::CapabilityDispatch`] — find the best-matching
