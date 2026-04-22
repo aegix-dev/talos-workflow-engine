@@ -1071,15 +1071,21 @@ impl ParallelWorkflowEngine {
         }
     }
 
-    /// [`SystemNodeKind::AgentLoop`] — ReAct-style iteration that
-    /// re-invokes a sub-workflow body with per-iteration history
-    /// injection, stopping when the body emits a `finished: true`
-    /// signal or `max_iterations` is reached.
+    /// [`SystemNodeKind::AgentLoop`] and [`SystemNodeKind::ReActLoop`]
+    /// — ReAct-style iteration that re-invokes a sub-workflow body
+    /// with per-iteration history injection, stopping when the body
+    /// emits a `finished: true` signal or `max_iterations` is reached.
     ///
-    /// Returns `None` when the node is not an `AgentLoop`; otherwise
-    /// the loop's aggregated output (or an error envelope when the
-    /// pre-conditions aren't met: no user context, missing body
-    /// workflow, etc.).
+    /// Both variants share the same field shape
+    /// (`body_workflow_id`, `max_iterations`, `inject_history`,
+    /// `timeout_secs`) and identical runtime semantics — the variants
+    /// differ only in authoring provenance (AgentLoop is the general
+    /// shape, ReActLoop is the explicit ReAct annotation). This one
+    /// dispatcher handles both so they cannot diverge at runtime.
+    ///
+    /// Returns `None` when the node is neither; otherwise the loop's
+    /// aggregated output (or an error envelope when the pre-conditions
+    /// aren't met: no user context, missing body workflow, etc.).
     #[cfg(feature = "llm-primitives")]
     #[tracing::instrument(
         level = "info",
@@ -1095,23 +1101,35 @@ impl ParallelWorkflowEngine {
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
     ) -> Option<JsonValue> {
-        let (
-            _,
-            _,
-            Some(SystemNodeKind::AgentLoop {
-                body_workflow_id,
-                max_iterations,
-                inject_history,
-                timeout_secs,
-            }),
-        ) = self.node_meta.get(&node_id)?
-        else {
-            return None;
-        };
-        let body_wf_id = *body_workflow_id;
-        let max_iters = *max_iterations;
-        let do_inject_history = *inject_history;
-        let timeout_secs = *timeout_secs;
+        let (body_wf_id, max_iters, do_inject_history, timeout_secs) =
+            match self.node_meta.get(&node_id)? {
+                (
+                    _,
+                    _,
+                    Some(SystemNodeKind::AgentLoop {
+                        body_workflow_id,
+                        max_iterations,
+                        inject_history,
+                        timeout_secs,
+                    }),
+                )
+                | (
+                    _,
+                    _,
+                    Some(SystemNodeKind::ReActLoop {
+                        body_workflow_id,
+                        max_iterations,
+                        inject_history,
+                        timeout_secs,
+                    }),
+                ) => (
+                    *body_workflow_id,
+                    *max_iterations,
+                    *inject_history,
+                    *timeout_secs,
+                ),
+                _ => return None,
+            };
         let inputs = self.gather_inputs(node_idx, results);
 
         tracing::info!(
