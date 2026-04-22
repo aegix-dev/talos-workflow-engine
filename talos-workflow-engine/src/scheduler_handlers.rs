@@ -1246,11 +1246,25 @@ impl ParallelWorkflowEngine {
                                             if key == "__trigger__" {
                                                 continue;
                                             }
-                                            sub_outputs.insert(
-                                                key,
+                                            // Strip reserved `__*` metadata keys (e.g.
+                                            // `__fuel_consumed__`, `__dispatched_by`) from
+                                            // the per-node body output. These are worker
+                                            // / engine annotations, not user payload —
+                                            // and when inject_history=true, the full
+                                            // iter_result is fed back into the NEXT
+                                            // iteration's module input. Leaving `__*`
+                                            // keys in place balloons the input JSON the
+                                            // body must re-parse, causing `__fuel_consumed__`
+                                            // to appear to accumulate across iterations
+                                            // (21k → 54k → 79k). Mirrors the iter_input
+                                            // cleanup at the top of the loop body.
+                                            let mut cleaned =
                                                 ParallelWorkflowEngine::unwrap_output(output)
-                                                    .clone(),
-                                            );
+                                                    .clone();
+                                            if let Some(obj) = cleaned.as_object_mut() {
+                                                obj.retain(|k, _| !k.starts_with("__"));
+                                            }
+                                            sub_outputs.insert(key, cleaned);
                                         }
                                         // Single-terminal collapse — matches the convention
                                         // used by `collapse_subworkflow_output` for judge /
