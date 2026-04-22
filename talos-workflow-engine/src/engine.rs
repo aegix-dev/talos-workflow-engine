@@ -4614,8 +4614,16 @@ impl ParallelWorkflowEngine {
                 // ── InlineJudge dispatch (sync expression-driven verdict) ────
                 #[cfg(feature = "llm-primitives")]
                 if let Some(output) = self.try_dispatch_inline_judge(node_idx, node_id, &results) {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
+                        &mut results, &mut pending, &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -4631,8 +4639,16 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
+                        &mut results, &mut pending, &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -4648,8 +4664,16 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
+                        &mut results, &mut pending, &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -4714,8 +4738,16 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
+                        &mut results, &mut pending, &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -4731,8 +4763,16 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
+                        &mut results, &mut pending, &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 

@@ -52,6 +52,72 @@ fn extract_non_transient_class(error_msg: &str) -> Option<String> {
 }
 
 impl ParallelWorkflowEngine {
+    /// Route a system-node output envelope through the reactor's
+    /// normal success/failure paths based on the `__error: true`
+    /// marker on synthesized rejection envelopes.
+    ///
+    /// System nodes (judge / ensemble / reflective_retry / llm_dispatch
+    /// / inline_judge / verify / confidence_gate / expression_dispatch)
+    /// synthesize their "rejected" output as `{__error: true,
+    /// error_message: "..."}` rather than bubbling a Rust `Err`. The
+    /// reactor used to store these envelopes as "successful" node
+    /// outputs and mark the workflow `completed`, silently
+    /// contradicting every one of those tools' documented contracts
+    /// ("workflow fails", "blocks downstream", "halts execution",
+    /// etc.).
+    ///
+    /// This helper closes the loop: the marker triggers
+    /// `handle_completed_future` with `Err(message)`, which respects
+    /// `continue_on_error` and error-edge routing identically to
+    /// regular module failures. Without the marker, we fall through
+    /// to the normal insert-and-unblock-successors path.
+    ///
+    /// Consolidates the fix pattern from three earlier single-site
+    /// commits (verify-node: b69aad5, confidence_gate: a7dd2b3,
+    /// expression_dispatch: a941df4) so every system-node caller in
+    /// the reactor body uses one consistent mechanism.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn route_system_node_output(
+        &self,
+        node_idx: NodeIndex,
+        output: JsonValue,
+        execution_id: Uuid,
+        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
+        exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
+        results: &mut HashMap<Uuid, JsonValue>,
+        pending: &mut HashMap<NodeIndex, usize>,
+        ready: &mut VecDeque<NodeIndex>,
+    ) -> Result<(), String> {
+        let is_error = output
+            .get("__error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_error {
+            let msg = output
+                .get("error_message")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| "system node rejected output".to_string());
+            self.handle_completed_future(
+                node_idx,
+                Err(msg),
+                execution_id,
+                0,
+                chains_ctx,
+                exec_ctx,
+                results,
+                pending,
+                ready,
+            )
+            .await
+        } else {
+            let node_id = self.graph[node_idx];
+            results.insert(node_id, output);
+            self.unblock_successors(node_idx, pending, ready);
+            Ok(())
+        }
+    }
+
     /// Post-completion processing for a node whose dispatch future
     /// just returned from `executing.next().await`.
     ///
