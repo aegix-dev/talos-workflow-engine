@@ -1233,7 +1233,22 @@ impl ParallelWorkflowEngine {
                                                     .clone(),
                                             );
                                         }
-                                        serde_json::Value::Object(sub_outputs)
+                                        // Single-terminal collapse — matches the convention
+                                        // used by `collapse_subworkflow_output` for judge /
+                                        // ensemble / sub_workflow. Without this, the
+                                        // iter_result is a label-wrapped map (e.g.
+                                        // `{"step": {"finished": true}}`) and the
+                                        // finished-signal check at the top level misses
+                                        // the flag — the loop runs to max_iterations
+                                        // despite the body clearly signalling done.
+                                        if sub_outputs.len() == 1 {
+                                            sub_outputs
+                                                .into_values()
+                                                .next()
+                                                .unwrap_or(serde_json::Value::Null)
+                                        } else {
+                                            serde_json::Value::Object(sub_outputs)
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
