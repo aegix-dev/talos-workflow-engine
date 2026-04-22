@@ -38,13 +38,10 @@
 //!     .execution_timeout(Duration::from_secs(600))
 //!     .add_module("fetch", module_id, Some(json!({ "url": "https://example.com" })))
 //!     .add_system_node(
-//!         "split",
-//!         SystemNodeKind::ForEach {
-//!             input_path: "items".into(),
-//!             output_handle: "element".into(),
-//!         },
+//!         "aggregate",
+//!         SystemNodeKind::Collect,
 //!     )
-//!     .edge("fetch", "split")
+//!     .edge("fetch", "aggregate")
 //!     .build()
 //!     .expect("graph is well-formed");
 //!
@@ -460,16 +457,6 @@ impl WorkflowGraphBuilder {
 #[allow(clippy::too_many_lines)]
 fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue) {
     match kind {
-        SystemNodeKind::ForEach {
-            input_path,
-            output_handle,
-        } => (
-            "foreach",
-            json!({
-                "input_path": input_path,
-                "output_handle": output_handle,
-            }),
-        ),
         SystemNodeKind::Wait { message } => (
             "wait",
             match message {
@@ -734,26 +721,6 @@ mod tests {
         assert_eq!(node["id"].as_str(), Some("fetch"));
         assert_eq!(node["type"].as_str(), Some(module_id.to_string().as_str()));
         assert_eq!(node["data"]["url"].as_str(), Some("x"));
-    }
-
-    #[test]
-    fn add_system_node_foreach_emits_expected_shape() {
-        let g = WorkflowGraphBuilder::new()
-            .add_system_node(
-                "split",
-                SystemNodeKind::ForEach {
-                    input_path: "items".into(),
-                    output_handle: "element".into(),
-                },
-            )
-            .build()
-            .unwrap();
-        let node = &g["nodes"][0];
-        assert_eq!(node["id"].as_str(), Some("split"));
-        assert_eq!(node["type"].as_str(), Some("system:foreach"));
-        assert_eq!(node["kind"].as_str(), Some("foreach"));
-        assert_eq!(node["data"]["input_path"].as_str(), Some("items"));
-        assert_eq!(node["data"]["output_handle"].as_str(), Some("element"));
     }
 
     #[test]
@@ -1073,16 +1040,8 @@ mod tests {
         let graph = WorkflowGraphBuilder::new()
             .execution_timeout(Duration::from_secs(42))
             .add_module("fetch", module_id, Some(json!({ "url": "x" })))
-            .add_system_node(
-                "split",
-                SystemNodeKind::ForEach {
-                    input_path: "items".into(),
-                    output_handle: "element".into(),
-                },
-            )
             .add_system_node("aggregate", SystemNodeKind::Collect)
-            .edge("fetch", "split")
-            .edge("split", "aggregate")
+            .edge("fetch", "aggregate")
             .build()
             .unwrap();
 
@@ -1095,8 +1054,8 @@ mod tests {
             .expect("parser accepts builder output");
 
         // Both parsers read nodes + edges identically — assert on those.
-        assert_eq!(engine.graph().node_count(), 3);
-        assert_eq!(engine.graph().edge_count(), 2);
+        assert_eq!(engine.graph().node_count(), 2);
+        assert_eq!(engine.graph().edge_count(), 1);
     }
 
     #[test]
@@ -1135,15 +1094,9 @@ mod tests {
         use crate::ParallelWorkflowEngine;
 
         let graph = WorkflowGraphBuilder::new()
-            .add_system_node(
-                "split",
-                SystemNodeKind::ForEach {
-                    input_path: "items".into(),
-                    output_handle: "element".into(),
-                },
-            )
-            .add_system_node("collect", SystemNodeKind::Collect)
-            .edge("split", "collect")
+            .add_system_node("collect_a", SystemNodeKind::Collect)
+            .add_system_node("collect_b", SystemNodeKind::Collect)
+            .edge("collect_a", "collect_b")
             .build()
             .unwrap();
 

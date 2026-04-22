@@ -16,7 +16,7 @@ use uuid::Uuid;
 ///
 /// | Group | Variants | Use when |
 /// |---|---|---|
-/// | **Iteration** | [`ForEach`], [`Loop`], [`WhileLoop`], [`RepeatLoop`] | You need to fan out per element or repeat a body. |
+/// | **Iteration** | [`Loop`], [`WhileLoop`], [`RepeatLoop`] | You need to repeat a body with a condition or fixed count. |
 /// | **Coordination** | [`FanIn`], [`Collect`], [`Synthesize`] | Multiple branches converge and you need to join, gather, or transform their outputs. |
 /// | **Control flow** | [`Wait`], [`Verify`], [`ErrorHandler`] | You need to pause for input, assert a condition, or branch on an upstream error. |
 /// | **Sub-workflow** | [`SubWorkflow`] | Compose another workflow as a node. |
@@ -55,7 +55,6 @@ use uuid::Uuid;
 /// hashable discriminator should project onto a dedicated `&'static str`
 /// tag instead of hashing the whole value.
 ///
-/// [`ForEach`]: SystemNodeKind::ForEach
 /// [`Loop`]: SystemNodeKind::Loop
 /// [`WhileLoop`]: SystemNodeKind::WhileLoop
 /// [`RepeatLoop`]: SystemNodeKind::RepeatLoop
@@ -81,14 +80,6 @@ use uuid::Uuid;
 )]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SystemNodeKind {
-    /// Iterate over an array in the parent's output and fan out a branch
-    /// per element.
-    ForEach {
-        /// JSON pointer / path into the parent output locating the array.
-        input_path: String,
-        /// Handle name used for each element passed to the child branch.
-        output_handle: String,
-    },
     /// Pause execution until resumed externally.
     Wait {
         /// Optional human-readable message surfaced to the resumer.

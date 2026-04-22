@@ -102,13 +102,7 @@ pub(crate) fn read_node_retry_policy_with_actor_cap(
 /// annotation.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKind> {
-    if k == "foreach" {
-        let data = node.get("data")?;
-        Some(SystemNodeKind::ForEach {
-            input_path: data.get("input_path")?.as_str()?.to_string(),
-            output_handle: data.get("output_handle")?.as_str()?.to_string(),
-        })
-    } else if k == "wait" {
+    if k == "wait" {
         Some(SystemNodeKind::Wait {
             message: node
                 .get("data")

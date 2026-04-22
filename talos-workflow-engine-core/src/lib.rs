@@ -28,7 +28,7 @@
 //!   [`SystemNodeKind`]'s variants (`SubWorkflow`, `Judge`,
 //!   `Ensemble`, `AgentLoop`, `ReActLoop`, `ReflectiveRetry`,
 //!   `LlmDispatch`, `DynamicDispatch`, `CapabilityDispatch`,
-//!   `ConfidenceGate`, `Verify`, `Synthesize`, `Collect`, `ForEach`,
+//!   `ConfidenceGate`, `Verify`, `Synthesize`, `Collect`,
 //!   `FanIn`, `WhileLoop`, `RepeatLoop`, `Wait`, `ErrorHandler`) is
 //!   dispatched through a matching handler that composes
 //!   [`NodeDispatcher`] with engine-local state. Sub-workflow graphs

@@ -45,7 +45,6 @@ pub const SCHEMA_DOC: &str = include_str!("../../docs/graph-json-schema.md");
 /// module's tests round-trips every builder-emitted kind through
 /// [`known_system_kind`] so drift surfaces immediately.
 const KNOWN_SYSTEM_KINDS_BASE: &[&str] = &[
-    "foreach",
     "wait",
     "sub_workflow",
     "loop",
@@ -430,13 +429,13 @@ mod tests {
     fn known_system_kind_classified_correctly() {
         let g = json!({
             "nodes": [
-                { "id": "a", "kind": "foreach" },
+                { "id": "a", "kind": "wait" },
                 { "id": "b", "kind": "collect" },
             ],
         });
         let s = validate_value(&g).unwrap();
         assert_eq!(s.system_node_count, 2);
-        assert_eq!(s.system_node_kinds, vec!["collect", "foreach"]);
+        assert_eq!(s.system_node_kinds, vec!["collect", "wait"]);
     }
 
     #[test]

@@ -68,22 +68,6 @@ use talos_workflow_engine_core::SystemNodeKind;
 pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
     match kind {
         // ── Always-available variants ────────────────────────────
-        // ForEach is DEFINED in the core enum and PARSED by
-        // graph_parser.rs but has NO dispatcher in scheduler_handlers.rs
-        // or engine.rs. A hand-authored `kind: "foreach"` node in graph
-        // JSON falls through to the module loader at runtime and fails
-        // with "Module not found" — same drift pattern as the historic
-        // ReActLoop bug (fixed in commit 33eed2c). No MCP tool currently
-        // authors ForEach nodes, so the surface-area impact is low, but
-        // the gap should be closed by either (a) implementing
-        // `try_dispatch_for_each` with proper fan-out-per-element
-        // semantics, or (b) removing the variant from the core enum +
-        // parser + builder. Flagged as `<unimplemented>` so the
-        // classifications_match_known_dispatcher_names test accepts it
-        // and the _compile_time_dispatcher_method_references tripwire
-        // skips it. Surfaced by the tripwire itself — exactly the bug
-        // class this module exists to catch.
-        SystemNodeKind::ForEach { .. } => "<unimplemented:for_each>",
         SystemNodeKind::Wait { .. } => "try_dispatch_wait",
         SystemNodeKind::WhileLoop { .. } => "try_dispatch_while_loop",
         SystemNodeKind::RepeatLoop { .. } => "try_dispatch_repeat_loop",
@@ -134,10 +118,6 @@ mod tests {
     fn all_sample_variants() -> Vec<SystemNodeKind> {
         let wf_id = Uuid::new_v4();
         let mut v = vec![
-            SystemNodeKind::ForEach {
-                input_path: "$.items".into(),
-                output_handle: "item".into(),
-            },
             SystemNodeKind::Wait { message: None },
             SystemNodeKind::WhileLoop {
                 condition: "true".into(),
@@ -246,14 +226,10 @@ mod tests {
                 "missing dispatcher classification for variant {:?}",
                 variant
             );
-            // Accept either the try_dispatch_* naming convention or the
-            // explicit <unimplemented:*> marker for variants that are
-            // parsed but not yet wired to a dispatcher (see ForEach).
             assert!(
-                branch.starts_with("try_dispatch_") || branch.starts_with("<unimplemented:"),
+                branch.starts_with("try_dispatch_"),
                 "classification {:?} for variant {:?} should follow the \
-                 try_dispatch_* convention OR be explicitly marked \
-                 <unimplemented:*>",
+                 try_dispatch_* function naming convention",
                 branch,
                 variant
             );
@@ -268,16 +244,16 @@ mod tests {
     /// the constructor here. This test fails with a clear message if
     /// the count drifts.
     ///
-    /// Counts as of 2026-04-22:
-    ///   13 always-available (ForEach, Wait, WhileLoop, RepeatLoop,
+    /// Counts as of 2026-04-22 (after ForEach removal):
+    ///   12 always-available (Wait, WhileLoop, RepeatLoop,
     ///   ErrorHandler, FanIn, SubWorkflow, Loop, Collect, Synthesize,
     ///   Verify, DynamicDispatch, CapabilityDispatch)
     ///   + 8 llm-primitives (AgentLoop, Judge, InlineJudge, Ensemble,
     ///   ConfidenceGate, ReActLoop, ReflectiveRetry, LlmDispatch)
-    ///   = 21 total.
+    ///   = 20 total.
     #[test]
     fn sample_count_matches_known_enum_size() {
-        const ALWAYS_AVAILABLE: usize = 13;
+        const ALWAYS_AVAILABLE: usize = 12;
         #[cfg(feature = "llm-primitives")]
         const EXPECTED: usize = ALWAYS_AVAILABLE + 8;
         #[cfg(not(feature = "llm-primitives"))]
@@ -302,9 +278,6 @@ mod tests {
     #[test]
     fn classifications_match_known_dispatcher_names() {
         let known: &[&str] = &[
-            // Unimplemented placeholder for ForEach — see
-            // `dispatcher_branch_for` for the full gap explanation.
-            "<unimplemented:for_each>",
             "try_dispatch_wait",
             "try_dispatch_while_loop",
             "try_dispatch_repeat_loop",
@@ -378,8 +351,6 @@ mod tests {
         exists(ParallelWorkflowEngine::try_dispatch_verify);
         exists(ParallelWorkflowEngine::try_dispatch_dynamic_dispatch);
         exists(ParallelWorkflowEngine::try_dispatch_capability_dispatch);
-        // ForEach is intentionally absent — the dispatcher doesn't
-        // exist yet. See dispatcher_branch_for for the gap explanation.
         #[cfg(feature = "llm-primitives")]
         {
             exists(ParallelWorkflowEngine::try_dispatch_agent_loop);
