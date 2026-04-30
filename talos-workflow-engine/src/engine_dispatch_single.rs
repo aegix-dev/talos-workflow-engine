@@ -178,11 +178,23 @@ impl ParallelWorkflowEngine {
         };
 
         // Truncated input preview for the node-I/O inspector.
+        // Walk back from the requested byte cap to the nearest UTF-8
+        // char boundary — slicing by bytes alone panics when the cut
+        // lands inside a multi-byte character (e.g. an em-dash in an
+        // INJECT_CONTEXT actor-memory payload, real prod symptom
+        // 2026-04-29 hit by aegix-ceo's `/watch-semgrep` workflow).
+        // `is_char_boundary` is stable; `floor_char_boundary` would
+        // be cleaner but is still unstable as of Rust 1.95 nightly
+        // (issue #93743).
         {
             let input_preview = {
                 let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
                 if s.len() > 4096 {
-                    format!("{}...(truncated)", &s[..4096])
+                    let mut safe_end = 4096;
+                    while safe_end > 0 && !s.is_char_boundary(safe_end) {
+                        safe_end -= 1;
+                    }
+                    format!("{}...(truncated)", &s[..safe_end])
                 } else {
                     s
                 }
