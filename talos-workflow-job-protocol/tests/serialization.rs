@@ -2,8 +2,8 @@
 
 use serde_json::json;
 use talos_workflow_job_protocol::{
-    EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
-    PipelineStep, PipelineStepResult,
+    EncryptedSecrets, JobRequest, JobResult, JobStatus, LlmTier, PipelineJobRequest,
+    PipelineJobResult, PipelineStep, PipelineStepResult,
 };
 use uuid::Uuid;
 
@@ -34,6 +34,7 @@ fn job_request_roundtrip() {
         user_id: Uuid::nil(),
         max_fuel: 0,
         dry_run: false,
+        max_llm_tier: LlmTier::default(),
     };
     let ser = serde_json::to_string(&req).expect("serialize request");
     let de: JobRequest = serde_json::from_str(&ser).expect("deserialize request");
@@ -98,6 +99,7 @@ fn pipeline_job_request_roundtrip() {
         total_timeout_ms: 120_000,
         share_sandbox: true,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: "0:deadbeef".to_string(),
         user_id: Uuid::new_v4(),
     };
@@ -123,6 +125,7 @@ fn pipeline_job_request_sign_and_verify() {
         total_timeout_ms: 30_000,
         share_sandbox: false,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -145,6 +148,7 @@ fn pipeline_job_request_tampered_step_fails() {
         total_timeout_ms: 30_000,
         share_sandbox: false,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };

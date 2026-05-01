@@ -512,6 +512,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // at the boundary so the engine-side API is explicit while
             // preserving wire compat with existing workers.
             user_id: job.user_id.unwrap_or_else(uuid::Uuid::nil),
+            max_llm_tier: job.max_llm_tier,
         };
 
         // 2. Sign.
@@ -617,6 +618,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // `Uuid::nil()` at the boundary (same mapping as single-node
             // dispatch above).
             user_id: request.user_id.unwrap_or_else(uuid::Uuid::nil),
+            max_llm_tier: request.max_llm_tier,
         };
 
         // 3. Sign (chain-level HMAC, independent of any per-step signing).

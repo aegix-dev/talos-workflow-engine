@@ -47,6 +47,12 @@ pub(crate) async fn build_encrypted_secrets_for(
     vault_paths: &[String],
     extra_paths: &[String],
     worker_shared_key: &[u8],
+    // LLM tier ceiling — when `Tier1`, skips the LLM-provider key
+    // pre-fetch entirely. Defense in depth: the worker's `get_llm_api_key`
+    // and HTTP-host gates already refuse external providers, but bounding
+    // what crosses the wire (encrypted or not) tightens the blast radius
+    // if a future bypass slips through.
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
 ) -> talos_workflow_job_protocol::EncryptedSecrets {
     // 1. Module-grant secrets.
     let mut secrets_map = resolver
@@ -81,12 +87,25 @@ pub(crate) async fn build_encrypted_secrets_for(
 
     // 5. LLM-provider keys. Errors swallowed: a missing/broken LLM-key
     // vault shouldn't fail nodes that don't use llm::*.
-    match resolver.resolve_llm_keys(user_id).await {
-        Ok(keys) => secrets_map.extend(keys),
-        Err(e) => tracing::debug!(
-            error = %e,
-            "Failed to pre-fetch LLM vault keys — worker will fall back to env vars"
-        ),
+    //
+    // Tier-1 jobs SKIP this entirely — the keys would just sit in the
+    // worker's secret cache waiting to be (incorrectly) resolved by some
+    // future bypass. Skipping the prefetch means a hypothetical bypass
+    // ends at "no key available" instead of "key available but refused
+    // by tier check" — much narrower exploit surface.
+    if !matches!(max_llm_tier, talos_workflow_engine_core::LlmTier::Tier1) {
+        match resolver.resolve_llm_keys(user_id).await {
+            Ok(keys) => secrets_map.extend(keys),
+            Err(e) => tracing::debug!(
+                error = %e,
+                "Failed to pre-fetch LLM vault keys — worker will fall back to env vars"
+            ),
+        }
+    } else {
+        tracing::debug!(
+            %node_id,
+            "Tier-1 job — skipping LLM provider key pre-fetch (defense in depth)"
+        );
     }
 
     // 6. Seal via the pluggable envelope. Empty-map short-circuit

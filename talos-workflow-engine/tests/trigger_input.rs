@@ -120,9 +120,7 @@ fn trigger_node_count(engine: &ParallelWorkflowEngine) -> usize {
     engine
         .node_labels()
         .values()
-        .filter(|label| {
-            label.as_str() == talos_workflow_engine_core::reserved_keys::TRIGGER
-        })
+        .filter(|label| label.as_str() == talos_workflow_engine_core::reserved_keys::TRIGGER)
         .count()
 }
 
@@ -160,12 +158,7 @@ async fn single_root_receives_trigger_input() {
     let trigger = json!({ "event": "http.POST", "body": { "id": 42 } });
 
     engine
-        .run_with_trigger_input_transport(
-            dispatcher.clone(),
-            None,
-            trigger.clone(),
-            Uuid::new_v4(),
-        )
+        .run_with_trigger_input_transport(dispatcher.clone(), None, trigger.clone(), Uuid::new_v4())
         .await
         .expect("run succeeds");
 
@@ -201,12 +194,7 @@ async fn multiple_roots_all_receive_trigger_input() {
     let trigger = json!({ "shared": "payload" });
 
     engine
-        .run_with_trigger_input_transport(
-            dispatcher.clone(),
-            None,
-            trigger.clone(),
-            Uuid::new_v4(),
-        )
+        .run_with_trigger_input_transport(dispatcher.clone(), None, trigger.clone(), Uuid::new_v4())
         .await
         .expect("run succeeds");
 

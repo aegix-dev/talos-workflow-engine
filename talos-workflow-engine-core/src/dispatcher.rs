@@ -185,6 +185,12 @@ pub struct DispatchJob {
     /// When true, the worker mocks write-bearing calls (non-GET HTTP,
     /// webhooks, messaging) — used for dry-run previews.
     pub dry_run: bool,
+    /// LLM data-egress ceiling for this job. The worker enforces this
+    /// at `llm::*` host-function entry: a `Tier1` ceiling refuses to
+    /// resolve keys for Anthropic / `OpenAI` / Gemini and the call fails
+    /// closed. Default `Tier2` (no restriction) for backward compat.
+    /// Sourced from `actors.max_llm_tier` for actor-bound executions.
+    pub max_llm_tier: crate::LlmTier,
 
     // ── Retry policy ─────────────────────────────────────────────────
     /// Max retries for transient failures. Timeouts do not retry.
@@ -261,6 +267,7 @@ impl Default for DispatchJob {
             encrypted_secrets_nonce: Vec::new(),
             priority: 100,
             dry_run: false,
+            max_llm_tier: crate::LlmTier::Tier2,
             max_retries: 0,
             backoff_ms: 0,
             retry_condition: None,
@@ -460,6 +467,14 @@ impl DispatchJobBuilder {
         self
     }
 
+    /// LLM data-egress ceiling for the dispatched job. `Tier1`
+    /// restricts the worker to local Ollama; `Tier2` (default) allows
+    /// external providers. Sourced from `actors.max_llm_tier`.
+    pub fn max_llm_tier(mut self, tier: crate::LlmTier) -> Self {
+        self.inner.max_llm_tier = tier;
+        self
+    }
+
     /// Set the encrypted-secrets ciphertext + nonce together — the
     /// pair must always come from the same seal call. Use
     /// [`Self::encrypted_secrets`] rather than two independent
@@ -571,6 +586,7 @@ impl fmt::Debug for DispatchJob {
             )
             .field("priority", &self.priority)
             .field("dry_run", &self.dry_run)
+            .field("max_llm_tier", &self.max_llm_tier)
             .field("max_retries", &self.max_retries)
             .field("backoff_ms", &self.backoff_ms)
             .field("retry_condition", &self.retry_condition)
@@ -594,6 +610,7 @@ pub struct DispatchResult {
 /// reports completed results for steps `0..N` and an absent (or
 /// default) entry for later steps, depending on the impl.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StepStatus {
     /// Step ran to completion and produced an `output`.
     Success,
@@ -649,6 +666,12 @@ pub struct ChainDispatchRequest {
     /// across steps. Falls back to per-step isolation if the transport
     /// can't honor it.
     pub share_sandbox: bool,
+    /// LLM data-egress ceiling for the chain. Same enforcement as
+    /// `DispatchJob::max_llm_tier` — every step's `TalosContext` gets
+    /// stamped with this and refuses external providers when `Tier1`.
+    /// Default `Tier2` (no restriction) for backward compat. Sourced
+    /// from `actors.max_llm_tier` on the owning workflow's actor.
+    pub max_llm_tier: crate::LlmTier,
     /// Aggregate budget for the whole chain (sum of per-step budgets
     /// plus any slack the caller wants).
     pub total_timeout: Duration,

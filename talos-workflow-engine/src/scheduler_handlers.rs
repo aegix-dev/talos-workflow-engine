@@ -235,9 +235,7 @@ impl ParallelWorkflowEngine {
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| {
-                    format!(
-                        "Verification '{check_label}' failed (condition: {condition})"
-                    )
+                    format!("Verification '{check_label}' failed (condition: {condition})")
                 });
             Some(Err(err_msg))
         }
@@ -524,12 +522,36 @@ impl ParallelWorkflowEngine {
         )
     }
 
+    /// True iff `node_id` is a [`SystemNodeKind::SubWorkflow`] node.
+    /// Used by the reactor loop to drain ready sub-workflow siblings
+    /// for batched parallel dispatch (see the `SubWorkflow` handler in
+    /// `engine.rs::run_with_seed_with_transport_cancellable`).
+    pub(crate) fn is_sub_workflow_node(&self, node_id: Uuid) -> bool {
+        matches!(
+            self.node_meta
+                .get(&node_id)
+                .and_then(|(_, _, kind)| kind.as_ref()),
+            Some(SystemNodeKind::SubWorkflow { .. })
+        )
+    }
+
     /// [`SystemNodeKind::SubWorkflow`] — invoke another workflow by
     /// id, seeded with this node's gathered input.
+    ///
+    /// Emits `node_started` / `node_completed` (or `node_failed`) events on
+    /// the parent's `execution_id` so the per-node trace surfaces the
+    /// dispatch as a real node with measurable duration. Without these
+    /// events the parent trace showed only a wall-clock gap before
+    /// downstream nodes started — operators had to know the workflow
+    /// architecture to read the gap as "sub-workflow LLM latency."
+    /// `node_started` is fire-and-forget (matches regular module dispatch);
+    /// `node_completed` / `node_failed` are awaited so the parent trace
+    /// orders correctly relative to downstream `node_started` events.
     pub(crate) async fn try_dispatch_sub_workflow(
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -585,15 +607,67 @@ impl ParallelWorkflowEngine {
             sub_workflow_id = %sub_wf_id,
             "SubWorkflow node — executing sub-workflow"
         );
-        Some(
-            self.dispatch_subworkflow(
+        // Fire-and-forget node_started so downstream node_started events
+        // aren't held up by the event sink's network I/O.
+        crate::emit_event_spawn(
+            &self.event_sink,
+            talos_workflow_engine_core::NodeEventWrite {
+                execution_id,
+                event_type: "node_started".to_string(),
+                node_id: Some(node_id),
+                status: "Running".to_string(),
+                log_message: None,
+                iteration_index: None,
+                error_class: None,
+            },
+        );
+        let dispatch_started = std::time::Instant::now();
+        let output = self
+            .dispatch_subworkflow(
                 child_trigger,
                 sub_wf_id,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
             )
-            .await,
-        )
+            .await;
+        let elapsed_ms = dispatch_started.elapsed().as_millis() as u64;
+        // Awaited completion event preserves ordering with the next
+        // dispatch loop's node_started — without it, a fast downstream
+        // node could race ahead of this node_completed in the events
+        // table and the trace builder would show out-of-order activity.
+        let is_error = output
+            .get("__error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (event_type, status, log_message) = if is_error {
+            (
+                "node_failed",
+                "Failed",
+                output
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            )
+        } else {
+            (
+                "node_completed",
+                "Completed",
+                Some(format!("sub_workflow duration_ms={}", elapsed_ms)),
+            )
+        };
+        if let Some(ref sink) = self.event_sink {
+            sink.emit(talos_workflow_engine_core::NodeEventWrite {
+                execution_id,
+                event_type: event_type.to_string(),
+                node_id: Some(node_id),
+                status: status.to_string(),
+                log_message,
+                iteration_index: None,
+                error_class: None,
+            })
+            .await;
+        }
+        Some(output)
     }
 
     /// [`SystemNodeKind::FanIn`] — join parent-branch outputs per the
@@ -723,14 +797,14 @@ impl ParallelWorkflowEngine {
     /// sub-engine path.
     ///
     /// Returns:
-    ///   - `None` — not a DynamicDispatch node
+    ///   - `None` — not a `DynamicDispatch` node
     ///   - `Some(Ok(value))` — dispatch succeeded; caller stores and continues
     ///   - `Some(Err(message))` — dispatch target unresolved or sub-workflow
     ///     failed; caller should route through the normal completion-failure
-    ///     path so the workflow actually fails (respecting continue_on_error
+    ///     path so the workflow actually fails (respecting `continue_on_error`
     ///     + error edges). Prior versions stored the error envelope and let
     ///     the workflow return `completed` despite the dispatch failing —
-    ///     same class of bug as verify-node (b69aad5) and confidence_gate
+    ///     same class of bug as verify-node (b69aad5) and `confidence_gate`
     ///     (a7dd2b3); this commit is the third instance of the same fix.
     pub(crate) async fn try_dispatch_dynamic_dispatch(
         &self,
@@ -808,7 +882,9 @@ impl ParallelWorkflowEngine {
                              WorkflowGraphStore impl overrides `resolve_by_name` — \
                              the default trait impl returns None for every name."
                         );
-                        Err(format!("Could not resolve dispatch target: {target_id_or_name}"))
+                        Err(format!(
+                            "Could not resolve dispatch target: {target_id_or_name}"
+                        ))
                     }
                     Some(sub_wf_id) => {
                         tracing::info!(
@@ -822,7 +898,9 @@ impl ParallelWorkflowEngine {
                                 &inputs,
                                 dispatcher,
                                 worker_shared_key,
-                                DispatchedOrigin::DynamicDispatch,
+                                DispatchedOrigin::DynamicDispatch {
+                                    resolved_target: target_id_or_name.clone(),
+                                },
                             )
                             .await;
                         // `run_dispatched_subworkflow` returns a JsonValue that
@@ -1106,22 +1184,20 @@ impl ParallelWorkflowEngine {
                 (
                     _,
                     _,
-                    Some(SystemNodeKind::AgentLoop {
-                        body_workflow_id,
-                        max_iterations,
-                        inject_history,
-                        timeout_secs,
-                    }),
-                )
-                | (
-                    _,
-                    _,
-                    Some(SystemNodeKind::ReActLoop {
-                        body_workflow_id,
-                        max_iterations,
-                        inject_history,
-                        timeout_secs,
-                    }),
+                    Some(
+                        SystemNodeKind::AgentLoop {
+                            body_workflow_id,
+                            max_iterations,
+                            inject_history,
+                            timeout_secs,
+                        }
+                        | SystemNodeKind::ReActLoop {
+                            body_workflow_id,
+                            max_iterations,
+                            inject_history,
+                            timeout_secs,
+                        },
+                    ),
                 ) => (
                     *body_workflow_id,
                     *max_iterations,
@@ -1660,6 +1736,7 @@ impl ParallelWorkflowEngine {
                 encrypted_secrets_nonce: encrypted_secrets.nonce,
                 priority: 100,
                 dry_run: self.dry_run,
+                max_llm_tier: self.max_llm_tier,
                 max_retries: 2,
                 backoff_ms: 500,
                 retry_condition: None,
@@ -1865,7 +1942,13 @@ impl ParallelWorkflowEngine {
 /// `CapabilityDispatch` share the sub-engine-build machinery but need
 /// different `__`-prefixed metadata keys in the returned envelope.
 enum DispatchedOrigin {
-    DynamicDispatch,
+    DynamicDispatch {
+        /// The string the dispatch expression evaluated to (typically a
+        /// workflow id or name). Stamped on the output as
+        /// `__dispatch_branch__` so traces show which branch fired
+        /// without re-running with verbose logging.
+        resolved_target: String,
+    },
     CapabilityDispatch {
         workflow_name: String,
         matched_capabilities: Vec<String>,
@@ -1879,7 +1962,7 @@ enum DispatchedOrigin {
 impl DispatchedOrigin {
     fn not_found_error(&self, sub_wf_id: Uuid) -> JsonValue {
         match self {
-            Self::DynamicDispatch => serde_json::json!({
+            Self::DynamicDispatch { .. } => serde_json::json!({
                 "__error": true,
                 "error_message": format!("Dispatched workflow {sub_wf_id} not found"),
             }),
@@ -1892,7 +1975,7 @@ impl DispatchedOrigin {
 
     fn build_error(&self, e: impl std::fmt::Display) -> JsonValue {
         match self {
-            Self::DynamicDispatch => serde_json::json!({
+            Self::DynamicDispatch { .. } => serde_json::json!({
                 "__error": true,
                 "error_message": format!("Failed to build dispatched workflow engine: {e}"),
             }),
@@ -1905,7 +1988,7 @@ impl DispatchedOrigin {
 
     fn run_error(&self, sub_wf_id: Uuid, e: impl std::fmt::Display) -> JsonValue {
         match self {
-            Self::DynamicDispatch => {
+            Self::DynamicDispatch { .. } => {
                 tracing::error!(dispatched_workflow_id = %sub_wf_id, error = %e, "Dispatched workflow failed");
                 serde_json::json!({
                     "__error": true,
@@ -1924,34 +2007,62 @@ impl DispatchedOrigin {
 
     /// Seed the output envelope with origin-specific metadata keys
     /// before the labeled per-node outputs get folded in.
+    ///
+    /// Every dispatch origin stamps `__dispatched_by` and
+    /// `__dispatch_branch__` so callers can introspect dispatch
+    /// behaviour from the trace alone — no need to re-run with
+    /// verbose logging or correlate by workflow id.
     fn stamp_prelude(&self, out: &mut serde_json::Map<String, JsonValue>, sub_wf_id: Uuid) {
         out.insert(
             "__dispatched_workflow_id__".to_string(),
             serde_json::json!(sub_wf_id.to_string()),
         );
-        if let Self::CapabilityDispatch {
-            workflow_name,
-            matched_capabilities,
-            is_fallback,
-        } = self
-        {
-            out.insert(
-                "__dispatched_by".to_string(),
-                serde_json::json!("capability_dispatch"),
-            );
-            out.insert(
-                "__dispatched_workflow_name".to_string(),
-                serde_json::json!(workflow_name),
-            );
-            out.insert(
-                "__matched_capabilities".to_string(),
-                serde_json::json!(matched_capabilities),
-            );
-            if *is_fallback {
+        match self {
+            Self::DynamicDispatch { resolved_target } => {
                 out.insert(
-                    "__capability_dispatch_fallback".to_string(),
-                    serde_json::json!(true),
+                    "__dispatched_by".to_string(),
+                    serde_json::json!("expression_dispatch"),
                 );
+                out.insert(
+                    "__dispatch_branch__".to_string(),
+                    serde_json::json!(resolved_target),
+                );
+            }
+            Self::CapabilityDispatch {
+                workflow_name,
+                matched_capabilities,
+                is_fallback,
+            } => {
+                out.insert(
+                    "__dispatched_by".to_string(),
+                    serde_json::json!("capability_dispatch"),
+                );
+                out.insert(
+                    "__dispatched_workflow_name".to_string(),
+                    serde_json::json!(workflow_name),
+                );
+                out.insert(
+                    "__matched_capabilities".to_string(),
+                    serde_json::json!(matched_capabilities),
+                );
+                // The branch label: the first matched capability, or
+                // "<fallback>" when the lookup missed and the node's
+                // fallback_workflow_id ran instead.
+                let branch = if *is_fallback {
+                    "<fallback>".to_string()
+                } else {
+                    matched_capabilities
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "<unspecified>".to_string())
+                };
+                out.insert("__dispatch_branch__".to_string(), serde_json::json!(branch));
+                if *is_fallback {
+                    out.insert(
+                        "__capability_dispatch_fallback".to_string(),
+                        serde_json::json!(true),
+                    );
+                }
             }
         }
     }

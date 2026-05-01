@@ -538,6 +538,16 @@ pub struct ParallelWorkflowEngine {
     /// LLM-dispatch route, etc.) and needs to hydrate its body's
     /// `graph_json`. In production wraps `WorkflowRepository`.
     pub(crate) graph_store: Option<Arc<dyn WorkflowGraphStore>>,
+    /// Pluggable resolver that hands the engine the `__actor_context__`
+    /// payload for a sub-workflow about to be dispatched. Lets sub-workflows
+    /// bound to a different actor than the parent inherit their OWN actor's
+    /// memories under `__actor_context__` instead of running with no
+    /// context. When `None` (the default), sub-workflows behave as before:
+    /// no engine-set context, `INJECT_CONTEXT` degrades to whatever the
+    /// trigger input happens to carry. See
+    /// [`talos_workflow_engine_core::SubworkflowActorContextResolver`].
+    pub(crate) sub_actor_context_resolver:
+        Option<Arc<dyn talos_workflow_engine_core::SubworkflowActorContextResolver>>,
     /// Pluggable secret resolver. All module-secret, vault-path, and LLM-key
     /// lookups — plus the pre-resolution OAuth refresh hook — flow through
     /// this trait object, which in production wraps a `SecretsManager`.
@@ -586,6 +596,11 @@ pub struct ParallelWorkflowEngine {
     /// When true, non-GET HTTP requests are mocked in the worker (returns 200 with `dry_run` metadata).
     /// Propagated to each `JobRequest` so the worker can intercept side effects.
     pub(crate) dry_run: bool,
+    /// LLM data-egress tier ceiling. Controller stamps this from
+    /// `actors.max_llm_tier` before running. Propagated to every
+    /// `DispatchJob` and thus into every `JobRequest` the worker sees.
+    /// Default `Tier2` (no restriction).
+    pub(crate) max_llm_tier: talos_workflow_engine_core::LlmTier,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
     /// cost rollups attribute to the right workflow row, not the
@@ -724,6 +739,8 @@ pub struct AdapterSet {
     event_sink: Option<Arc<dyn EventSink>>,
     node_hook: Option<Arc<dyn NodeLifecycleHook>>,
     graph_store: Option<Arc<dyn WorkflowGraphStore>>,
+    sub_actor_context_resolver:
+        Option<Arc<dyn talos_workflow_engine_core::SubworkflowActorContextResolver>>,
     secrets_resolver: Option<Arc<dyn SecretsResolver>>,
     expression_evaluator: Option<Arc<dyn talos_workflow_engine_core::ExpressionEvaluator>>,
     output_sanitizer: Option<Arc<dyn talos_workflow_engine_core::OutputSanitizer>>,
@@ -734,6 +751,10 @@ pub struct AdapterSet {
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
     dry_run: bool,
+    /// LLM data-egress tier ceiling. Default `Tier2` (no restriction)
+    /// for backward compat; controller stamps in the actor's ceiling
+    /// (`actors.max_llm_tier`) via `set_max_llm_tier` before running.
+    max_llm_tier: talos_workflow_engine_core::LlmTier,
     sandbox_root: Option<std::path::PathBuf>,
     agent_loop_max_history: usize,
     max_prefetch_successors: usize,
@@ -786,6 +807,7 @@ impl AdapterSet {
         engine.event_sink = self.event_sink;
         engine.node_hook = self.node_hook;
         engine.graph_store = self.graph_store;
+        engine.sub_actor_context_resolver = self.sub_actor_context_resolver;
         engine.secrets_resolver = self.secrets_resolver;
         engine.expression_evaluator = self.expression_evaluator;
         engine.output_sanitizer = self.output_sanitizer;
@@ -843,6 +865,7 @@ impl ParallelWorkflowEngine {
             event_sink: None,
             node_hook: None,
             graph_store: None,
+            sub_actor_context_resolver: None,
             secrets_resolver: None,
             user_id: None,
             node_meta: HashMap::new(),
@@ -850,6 +873,7 @@ impl ParallelWorkflowEngine {
             rate_limits: HashMap::new(),
             node_timeouts: HashMap::new(),
             actor_id: None,
+            max_llm_tier: talos_workflow_engine_core::LlmTier::Tier2,
             actor_context: None,
             module_prefetch_cache: Arc::new(dashmap::DashMap::new()),
             sub_workflow_cache: HashMap::new(),
@@ -1278,6 +1302,7 @@ impl ParallelWorkflowEngine {
             event_sink: self.event_sink.clone(),
             node_hook: self.node_hook.clone(),
             graph_store: self.graph_store.clone(),
+            sub_actor_context_resolver: self.sub_actor_context_resolver.clone(),
             secrets_resolver: self.secrets_resolver.clone(),
             expression_evaluator: self.expression_evaluator.clone(),
             output_sanitizer: self.output_sanitizer.clone(),
@@ -1288,6 +1313,7 @@ impl ParallelWorkflowEngine {
             user_id: self.user_id,
             actor_id: self.actor_id,
             dry_run: self.dry_run,
+            max_llm_tier: self.max_llm_tier,
             sandbox_root: self.sandbox_root.clone(),
             agent_loop_max_history: self.agent_loop_max_history,
             max_prefetch_successors: self.max_prefetch_successors,
@@ -1359,6 +1385,20 @@ impl ParallelWorkflowEngine {
     /// method themselves.
     pub fn set_graph_store(&mut self, store: Arc<dyn WorkflowGraphStore>) {
         self.graph_store = Some(store);
+    }
+
+    /// Wire a [`talos_workflow_engine_core::SubworkflowActorContextResolver`]
+    /// so cross-actor sub-workflow dispatches inherit the
+    /// *sub-workflow's bound actor's* memories under
+    /// `__actor_context__`, instead of the sub-engine running with no
+    /// context (and silently degrading `INJECT_CONTEXT`-driven LLM nodes).
+    /// Optional — without it, sub-workflows behave as before this hook
+    /// existed.
+    pub fn set_sub_actor_context_resolver(
+        &mut self,
+        resolver: Arc<dyn talos_workflow_engine_core::SubworkflowActorContextResolver>,
+    ) {
+        self.sub_actor_context_resolver = Some(resolver);
     }
 
     /// Replace the default secrets resolver. Consumers that don't
@@ -1563,6 +1603,13 @@ impl ParallelWorkflowEngine {
         self.dry_run = v;
     }
 
+    /// Stamp the LLM tier ceiling on this engine. Propagated to every
+    /// `DispatchJob` built during execution. Callers should set this
+    /// from `actors.max_llm_tier` before calling `run()` / `run_with_seed()`.
+    pub fn set_max_llm_tier(&mut self, tier: talos_workflow_engine_core::LlmTier) {
+        self.max_llm_tier = tier;
+    }
+
     /// Build encrypted secrets for a node dispatch.
     ///
     /// Thin wrapper around [`build_encrypted_secrets_for`] that sources
@@ -1590,6 +1637,7 @@ impl ParallelWorkflowEngine {
             &vault_paths,
             &[],
             key.as_bytes(),
+            self.max_llm_tier,
         )
         .await
     }
@@ -2622,6 +2670,23 @@ impl ParallelWorkflowEngine {
                     "__dispatched_workflow_id__".to_string(),
                     serde_json::json!(target_wf_id.to_string()),
                 );
+                // Unified observability fields (parity with capability_dispatch
+                // / expression_dispatch) — readers can pivot on these without
+                // having to know the dispatcher kind ahead of time.
+                out.insert(
+                    "__dispatched_by".to_string(),
+                    serde_json::json!("llm_dispatch"),
+                );
+                out.insert(
+                    "__dispatch_branch__".to_string(),
+                    serde_json::json!(class_str),
+                );
+                if is_fallback {
+                    out.insert(
+                        "__llm_dispatch_fallback".to_string(),
+                        serde_json::json!(true),
+                    );
+                }
                 serde_json::Value::Object(out)
             }
             Err(e) => e.into_error_envelope(context_label),
@@ -3135,6 +3200,22 @@ impl ParallelWorkflowEngine {
             .into_engine_with_graph(&graph_json)
             .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
 
+        // Cross-actor isolation: when a parent dispatches a sub-workflow
+        // bound to a *different* actor, hydrate the sub-engine with that
+        // actor's `__actor_context__` so downstream LLM nodes with
+        // INJECT_CONTEXT=true see the sub-workflow's intended persona,
+        // not nothing. Without this hook, the freshly-built sub-engine
+        // has `actor_context = None` regardless of the sub-workflow's
+        // bound actor — which silently degrades cross-actor patterns
+        // (e.g. CEO calls VPE) to "second LLM call with the same parent
+        // context" instead of real cross-actor consultation. Returning
+        // `None` from the resolver keeps the pre-hook behaviour exactly.
+        if let Some(resolver) = self.sub_actor_context_resolver.as_ref() {
+            if let Some(ctx) = resolver.resolve(sub_wf_id, user_id).await {
+                sub_engine.set_actor_context(ctx);
+            }
+        }
+
         // Synthetic trigger node: seeded with the caller's input,
         // wired to every root so root-level modules actually execute.
         // Delegates to the shared helper so this path and the public
@@ -3462,6 +3543,9 @@ impl ParallelWorkflowEngine {
                 .unwrap_or(serde_json::json!(null)),
             JoinMode::Majority => serde_json::json!(parent_outputs),
             JoinMode::N(_) => serde_json::json!(parent_outputs),
+            // `JoinMode` is `#[non_exhaustive]`; default unknown future
+            // variants to the conservative `All`-shaped aggregation.
+            _ => serde_json::json!(parent_outputs),
         };
 
         let final_result = if let Some(expr) = aggregation_expr {
@@ -3503,9 +3587,7 @@ impl ParallelWorkflowEngine {
             .filter_map(|p| results.get(&self.graph[p]).cloned())
             .map(|v| {
                 if let JsonValue::Object(mut obj) = v {
-                    obj.retain(|k, _| {
-                        !k.starts_with("__") || k == "__error" || k == "__continued"
-                    });
+                    obj.retain(|k, _| !k.starts_with("__") || k == "__error" || k == "__continued");
                     JsonValue::Object(obj)
                 } else {
                     v
@@ -3588,9 +3670,7 @@ impl ParallelWorkflowEngine {
             .filter_map(|p| results.get(&self.graph[p]).cloned())
             .map(|v| {
                 if let JsonValue::Object(mut obj) = v {
-                    obj.retain(|k, _| {
-                        !k.starts_with("__") || k == "__error" || k == "__continued"
-                    });
+                    obj.retain(|k, _| !k.starts_with("__") || k == "__error" || k == "__continued");
                     JsonValue::Object(obj)
                 } else {
                     v
@@ -3828,6 +3908,11 @@ impl ParallelWorkflowEngine {
                                 "error_message": reason,
                             }))
                         }
+                        // Fail-closed for non_exhaustive future variants.
+                        Ok(_) => Ok(serde_json::json!({
+                            "__error": true,
+                            "error_message": "ConfidenceGate approval gate returned an unrecognized status",
+                        })),
                         Err(e) => Ok(serde_json::json!({
                             "__error": true,
                             "error_message": format!("ConfidenceGate approval error: {}", e),
@@ -3930,6 +4015,10 @@ impl ParallelWorkflowEngine {
                 }
             }
             JoinMode::All => {} // default: wait for everyone
+            // `JoinMode` is `#[non_exhaustive]`; default to `All`-style
+            // wait-for-everyone behavior for unknown variants until the
+            // engine adds explicit handling.
+            _ => {}
         }
     }
 
@@ -4663,8 +4752,14 @@ impl ParallelWorkflowEngine {
                         None
                     };
                     self.route_system_node_output(
-                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
-                        &mut results, &mut pending, &mut ready,
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
                     )
                     .await?;
                     continue;
@@ -4688,8 +4783,14 @@ impl ParallelWorkflowEngine {
                         None
                     };
                     self.route_system_node_output(
-                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
-                        &mut results, &mut pending, &mut ready,
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
                     )
                     .await?;
                     continue;
@@ -4713,8 +4814,14 @@ impl ParallelWorkflowEngine {
                         None
                     };
                     self.route_system_node_output(
-                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
-                        &mut results, &mut pending, &mut ready,
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
                     )
                     .await?;
                     continue;
@@ -4787,8 +4894,14 @@ impl ParallelWorkflowEngine {
                         None
                     };
                     self.route_system_node_output(
-                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
-                        &mut results, &mut pending, &mut ready,
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
                     )
                     .await?;
                     continue;
@@ -4812,8 +4925,14 @@ impl ParallelWorkflowEngine {
                         None
                     };
                     self.route_system_node_output(
-                        node_idx, output, execution_id, chains_ctx, &exec_ctx,
-                        &mut results, &mut pending, &mut ready,
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
                     )
                     .await?;
                     continue;
@@ -4850,19 +4969,60 @@ impl ParallelWorkflowEngine {
                     continue;
                 }
 
-                // ── SubWorkflow dispatch ─────────────────────────────────────
-                if let Some(output) = self
-                    .try_dispatch_sub_workflow(
-                        node_idx,
-                        node_id,
-                        &dispatcher,
-                        &worker_shared_key,
-                        &results,
-                    )
-                    .await
-                {
-                    results.insert(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                // ── SubWorkflow dispatch (parallel fan-out) ──────────────────
+                //
+                // When multiple sub_workflow nodes are ready at the same
+                // time (e.g. staff-meeting fans out 3 standup sub-workflows
+                // from a single trigger), this drains all sub_workflow
+                // entries from `ready` and dispatches them concurrently via
+                // `futures::future::join_all`.
+                //
+                // Pre-fix the inline `.await` blocked the inner reactor
+                // loop on each dispatch — 3 ready sub-workflows ran one
+                // after another (~60s wall-clock) instead of in parallel
+                // (~22s, gated by the slowest). Regular module nodes have
+                // always been concurrent via the `executing` futures pool;
+                // sub_workflows just lacked an analogous path because the
+                // dispatch needs `&self` and integrating with the pool
+                // requires lifetime gymnastics — `join_all` here keeps the
+                // borrow simple while delivering the same parallelism for
+                // the common fan-out case.
+                //
+                // try_dispatch_sub_workflow itself emits node_started /
+                // node_completed events per dispatch on the parent's
+                // execution_id, so the per-node trace shows each child
+                // with its own duration_ms.
+                if self.is_sub_workflow_node(node_id) {
+                    let mut sub_wf_batch: Vec<(NodeIndex, Uuid)> = vec![(node_idx, node_id)];
+                    let mut keep: VecDeque<NodeIndex> = VecDeque::with_capacity(ready.len());
+                    while let Some(other_idx) = ready.pop_front() {
+                        let other_id = self.graph[other_idx];
+                        if self.is_sub_workflow_node(other_id) {
+                            sub_wf_batch.push((other_idx, other_id));
+                        } else {
+                            keep.push_back(other_idx);
+                        }
+                    }
+                    ready = keep;
+
+                    let dispatch_futs = sub_wf_batch.iter().map(|(idx, id)| {
+                        self.try_dispatch_sub_workflow(
+                            *idx,
+                            *id,
+                            execution_id,
+                            &dispatcher,
+                            &worker_shared_key,
+                            &results,
+                        )
+                    });
+                    let outputs = futures::future::join_all(dispatch_futs).await;
+
+                    for ((idx, id), output) in sub_wf_batch.into_iter().zip(outputs) {
+                        if let Some(out) = output {
+                            results.insert(id, out);
+                            self.unblock_successors(idx, &mut pending, &mut ready);
+                        }
+                    }
                     continue;
                 }
 

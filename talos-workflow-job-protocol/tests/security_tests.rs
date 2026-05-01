@@ -5,7 +5,7 @@
 
 use serde_json::json;
 use talos_workflow_job_protocol::{
-    EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineStep,
+    EncryptedSecrets, JobRequest, JobResult, JobStatus, LlmTier, PipelineJobRequest, PipelineStep,
 };
 use uuid::Uuid;
 
@@ -30,6 +30,7 @@ fn make_job_request() -> JobRequest {
         deadline_unix_secs: 0,
         cancellation_token: None,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: String::new(),
         actor_id: None,
         wasm_bytes: None,
@@ -293,6 +294,7 @@ fn pipeline_tampered_step_count_fails() {
         total_timeout_ms: 30_000,
         share_sandbox: false,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -318,6 +320,7 @@ fn pipeline_tampered_share_sandbox_fails() {
         total_timeout_ms: 30_000,
         share_sandbox: false,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -502,6 +505,7 @@ fn tampered_pipeline_step_integration_name_fails() {
         total_timeout_ms: 60_000,
         share_sandbox: false,
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };

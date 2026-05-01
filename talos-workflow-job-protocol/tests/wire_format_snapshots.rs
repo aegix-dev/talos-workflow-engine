@@ -42,8 +42,8 @@
 
 use serde_json::json;
 use talos_workflow_job_protocol::{
-    EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
-    PipelineStep, PipelineStepResult,
+    EncryptedSecrets, JobRequest, JobResult, JobStatus, LlmTier, PipelineJobRequest,
+    PipelineJobResult, PipelineStep, PipelineStepResult,
 };
 use uuid::Uuid;
 
@@ -83,6 +83,7 @@ fn deterministic_job_request() -> JobRequest {
         // Fixed signature placeholder — overwritten below by
         // `sign_request_with_fixed_nonce`.
         signature: vec![],
+        max_llm_tier: LlmTier::default(),
         // Fixed nonce so the signing payload is deterministic.
         // The first segment is the unix timestamp; "0" pretends the
         // request was signed at the epoch. The second segment is
@@ -129,7 +130,7 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     };
     let integration_name = req.integration_name.as_deref().unwrap_or("-");
     let payload = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         req.job_id,
         req.workflow_execution_id,
         req.module_uri,
@@ -142,6 +143,7 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
         wasm_hash,
         integration_name,
         req.user_id,
+        req.max_llm_tier.as_signing_str(),
     );
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
@@ -158,7 +160,7 @@ fn job_request_json_snapshot() {
 
     // Captured 2026-04-20 against this crate's protocol shape.
     // Update verbatim when the wire format intentionally changes.
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[13,149,42,19,47,174,217,168,39,165,220,135,82,33,203,8,251,175,60,243,201,245,160,78,218,82,120,208,44,144,250,204],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","dry_run":false}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[255,69,30,24,103,166,160,158,209,157,187,62,170,135,45,25,138,88,48,87,250,196,66,133,168,42,104,52,240,25,109,58],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","dry_run":false}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted — see test docstring for resolution"
@@ -176,7 +178,7 @@ fn job_request_signature_snapshot() {
     // The signature field is the HMAC-SHA256 over the canonical
     // bytes; locking the hex digest pins the format implicitly.
     let actual_hex = hex::encode(&req.signature);
-    let expected_hex = "0d952a132faed9a827a5dc875221cb08fbaf3cf3c9f5a04eda5278d02c90facc";
+    let expected_hex = "ff451e1867a6a09ed19dbb3eaa872d198a583057fac44285a82a6834f0196d3a";
     assert_eq!(
         actual_hex, expected_hex,
         "JobRequest signing payload drifted — see test docstring for resolution"
@@ -240,9 +242,10 @@ fn pipeline_job_request_json_snapshot() {
         job_nonce: "0:00000000000000000000000000000000".into(),
         total_timeout_ms: 60_000,
         share_sandbox: false,
+        max_llm_tier: LlmTier::default(),
     };
     let actual = serde_json::to_string(&req).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","workflow_execution_id":"00000000-0000-0000-0000-000000000011","steps":[{"module_id":"00000000-0000-0000-0000-000000000013","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000013","wasm_bytes":[0,97,115,109],"config":{"setting":"value"},"allowed_hosts":["api.example.com"],"allowed_methods":["GET"],"allowed_secrets":[],"allowed_sql_operations":[],"allow_tier2_exposure":false,"encrypted_secrets":{"ciphertext":[170],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"max_fuel":1000000,"max_memory_mb":128,"timeout_ms":30000,"priority":100,"expected_wasm_hash":"deadbeef"}],"total_timeout_ms":60000,"share_sandbox":false,"signature":[202,254],"job_nonce":"0:00000000000000000000000000000000","user_id":"00000000-0000-0000-0000-000000000012"}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","workflow_execution_id":"00000000-0000-0000-0000-000000000011","steps":[{"module_id":"00000000-0000-0000-0000-000000000013","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000013","wasm_bytes":[0,97,115,109],"config":{"setting":"value"},"allowed_hosts":["api.example.com"],"allowed_methods":["GET"],"allowed_secrets":[],"allowed_sql_operations":[],"allow_tier2_exposure":false,"encrypted_secrets":{"ciphertext":[170],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"max_fuel":1000000,"max_memory_mb":128,"timeout_ms":30000,"priority":100,"expected_wasm_hash":"deadbeef"}],"total_timeout_ms":60000,"share_sandbox":false,"signature":[202,254],"job_nonce":"0:00000000000000000000000000000000","user_id":"00000000-0000-0000-0000-000000000012","max_llm_tier":"tier2"}"#;
     assert_eq!(
         actual, expected,
         "PipelineJobRequest wire format drifted — see test docstring for resolution"

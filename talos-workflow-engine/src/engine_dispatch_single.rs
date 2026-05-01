@@ -87,6 +87,20 @@ impl ParallelWorkflowEngine {
                     Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
                         return (node_idx, Err(reason));
                     }
+                    // Defensive `_` arm: ApprovalStatus is `#[non_exhaustive]`,
+                    // so adding a new variant in a minor bump shouldn't break
+                    // the build. Treat unknown variants as a hard failure
+                    // — fail-closed — so an upgrade can't silently let a
+                    // protected node through without explicit handling.
+                    Ok(_) => {
+                        return (
+                            node_idx,
+                            Err(format!(
+                                "Approval gate returned an unrecognized status \
+                                 for node {node_id}; refusing to dispatch"
+                            )),
+                        );
+                    }
                     Err(e) => {
                         tracing::error!(%node_id, "Approval gate check failed: {}", e);
                         return (node_idx, Err(format!("Approval gate check failed: {e}")));
@@ -262,6 +276,7 @@ impl ParallelWorkflowEngine {
                     &vault_paths,
                     &wasm_module.allowed_secrets,
                     key.as_bytes(),
+                    self.max_llm_tier,
                 )
                 .await
             }
@@ -319,6 +334,7 @@ impl ParallelWorkflowEngine {
             encrypted_secrets_nonce: encrypted_secrets.nonce,
             priority: 100,
             dry_run: self.dry_run,
+            max_llm_tier: self.max_llm_tier,
             max_retries: retry.max_retries,
             backoff_ms: retry.backoff_ms,
             retry_condition: retry.retry_condition.clone(),

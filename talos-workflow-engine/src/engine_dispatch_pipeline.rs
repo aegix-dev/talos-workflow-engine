@@ -146,6 +146,17 @@ impl ParallelWorkflowEngine {
                         Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
                             return (chain_tail, Err(reason));
                         }
+                        // Fail-closed for non_exhaustive future variants — see
+                        // engine_dispatch_single.rs for the rationale.
+                        Ok(_) => {
+                            return (
+                                chain_tail,
+                                Err(format!(
+                                    "Approval gate returned an unrecognized status \
+                                     for step {step_node_id}; refusing to dispatch"
+                                )),
+                            );
+                        }
                         Err(e) => {
                             return (chain_tail, Err(format!("Approval gate check failed: {e}")));
                         }
@@ -180,6 +191,7 @@ impl ParallelWorkflowEngine {
                         &vault_paths,
                         &[],
                         key.as_bytes(),
+                        self.max_llm_tier,
                     )
                     .await
                 }
@@ -254,6 +266,9 @@ impl ParallelWorkflowEngine {
                 encrypted_secrets_nonce: encrypted_secrets.nonce,
                 priority: 100,
                 dry_run: self.dry_run,
+                // Inherit the engine's tier ceiling (stamped from
+                // `actors.max_llm_tier` by the controller at dispatch time).
+                max_llm_tier: self.max_llm_tier,
                 max_retries: 0,
                 backoff_ms: 0,
                 retry_condition: None,
@@ -343,6 +358,10 @@ impl ParallelWorkflowEngine {
             job_id: None,
             steps: step_jobs,
             share_sandbox: true,
+            // Inherit the engine's tier ceiling (stamped from
+            // `actors.max_llm_tier`). Worker stamps every step's
+            // TalosContext with this value.
+            max_llm_tier: self.max_llm_tier,
             total_timeout: std::time::Duration::from_secs(timeout_secs),
             max_retries: chain_retry.max_retries,
             backoff_ms: chain_retry.backoff_ms,
@@ -365,6 +384,12 @@ impl ParallelWorkflowEngine {
                         talos_workflow_engine_core::StepStatus::Success => "completed",
                         talos_workflow_engine_core::StepStatus::TimedOut => "timeout",
                         talos_workflow_engine_core::StepStatus::Failed => "failed",
+                        // `StepStatus` is `#[non_exhaustive]`. Bucket
+                        // unknown future variants under `failed` so the
+                        // module-execution row is recorded with a
+                        // visible-but-non-success status until the
+                        // engine maintainer adds explicit handling.
+                        _ => "failed",
                     };
                     let error_msg = step_result.error.as_deref().map(|s| self.redact_str(s));
                     let duration = i32::try_from(step_result.execution_time_ms).unwrap_or(i32::MAX);

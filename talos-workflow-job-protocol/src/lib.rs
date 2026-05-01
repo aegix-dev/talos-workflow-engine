@@ -72,6 +72,72 @@ pub fn is_llm_provider_vault_path(path: &str) -> bool {
     LLM_PROVIDER_VAULT_PATHS.contains(&path)
 }
 
+/// Re-export so controller + worker can `use talos_workflow_job_protocol::LlmTier`
+/// without pulling engine-core directly. The underlying type lives in
+/// engine-core because `DispatchJob` carries it through the dispatch
+/// pipeline and engine-core sits below job-protocol in the dep graph.
+pub use talos_workflow_engine_core::LlmTier;
+
+/// Map a provider name (case-insensitive) to its data-egress tier.
+/// Anthropic / OpenAI / Gemini = Tier 2 (external). Ollama = Tier 1
+/// (local). Unknown providers default to Tier 2 (treat as external
+/// until proven local) — fail-closed against future providers that
+/// haven't been classified yet.
+pub fn provider_tier(provider_name: &str) -> LlmTier {
+    // The explicit Tier2 arm is intentional: it documents which
+    // providers we have classified. Unknown providers also fall
+    // through to Tier2 (fail-closed against unclassified entries).
+    // Removing the explicit arm would lose that documentation.
+    #[allow(clippy::match_same_arms)]
+    match provider_name.to_ascii_lowercase().as_str() {
+        "ollama" => LlmTier::Tier1,
+        "anthropic" | "openai" | "gemini" => LlmTier::Tier2,
+        _ => LlmTier::Tier2,
+    }
+}
+
+/// DNS hostnames that belong to external LLM providers. Tier-1 actors
+/// must not be allowed to reach these even via the generic
+/// `wit_http::fetch` host function — otherwise the `llm::*`-level
+/// refusal is trivially bypassed by a guest that writes its own
+/// `POST https://api.anthropic.com/v1/messages` + `vault://anthropic/api_key`
+/// header.
+///
+/// Matching is case-insensitive exact-match on the host portion of
+/// the URL + suffix match to catch region-specific subdomains (e.g.
+/// `generativelanguage.googleapis.com` → also `*.generativelanguage.googleapis.com`).
+///
+/// Extend this list whenever `LLM_PROVIDER_VAULT_PATHS` grows; the
+/// two are parallel (vault-path side deny-lists the key, host-side
+/// deny-lists the destination).
+pub const EXTERNAL_LLM_HOSTS: &[&str] = &[
+    // Anthropic — API endpoint.
+    "api.anthropic.com",
+    // OpenAI — primary + Azure mirror.
+    "api.openai.com",
+    // Google Gemini — current + legacy names.
+    "generativelanguage.googleapis.com",
+    "aiplatform.googleapis.com",
+];
+
+/// True iff `host` (already lowercased) matches one of the reserved
+/// external LLM hostnames. Uses exact + suffix match so region
+/// subdomains (`eu.api.openai.com`) also trigger.
+pub fn is_external_llm_host(host_lower: &str) -> bool {
+    EXTERNAL_LLM_HOSTS
+        .iter()
+        .any(|reserved| *reserved == host_lower || host_lower.ends_with(&format!(".{reserved}")))
+}
+
+/// True iff `vault_path` references a Tier-2 LLM provider's credentials.
+/// Used to block `vault://anthropic/api_key` substitution in HTTP headers
+/// for Tier-1 jobs — the tier gate on `llm::*` host fns doesn't help if
+/// the guest fetches directly and interpolates the key through
+/// `resolve_vault_header`.
+pub fn is_tier2_llm_vault_path(vault_path: &str) -> bool {
+    is_llm_provider_vault_path(vault_path)
+}
+
 /// True iff `path` is consumed by a controller-internal subsystem (LLM
 /// client cache, OAuth refresh loop) rather than by any WASM module's
 /// `allowed_secrets` grant. Used by the orphaned-secrets hygiene check
@@ -541,6 +607,21 @@ pub struct JobRequest {
     #[serde(default)]
     pub user_id: Uuid,
 
+    /// Maximum LLM data-egress tier this job is allowed to reach.
+    /// Sourced from `actors.max_llm_tier` for actor-bound executions,
+    /// `Tier2` (no restriction) for system jobs and pre-actor workflows.
+    ///
+    /// Worker enforcement: when this is `Tier1`, the worker's
+    /// `get_llm_api_key` refuses to resolve keys for Anthropic / OpenAI
+    /// / Gemini and the job fails closed with a clear "actor X is
+    /// tier-1, provider Y forbidden" error.
+    ///
+    /// HMAC-bound: included in the signing payload so an on-wire
+    /// attacker can't downgrade a tier-1 ceiling to tier-2 to redirect
+    /// a sensitive actor's data to an external provider.
+    #[serde(default)]
+    pub max_llm_tier: LlmTier,
+
     /// When true, non-GET HTTP requests are mocked (returns 200 with dry_run metadata).
     /// GET requests execute normally for data fetching.
     #[serde(default)]
@@ -607,7 +688,7 @@ impl JobRequest {
         let integration_name = self.integration_name.as_deref().unwrap_or("-");
 
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             self.module_uri,
@@ -625,6 +706,10 @@ impl JobRequest {
             // redirect a module's writes to a different user's
             // integration-state namespace.
             self.user_id,
+            // Appended AT THE END for the same reason. Tier-ceiling
+            // bound so an attacker can't downgrade a tier-1 actor's
+            // ceiling on the wire to redirect data to an external LLM.
+            self.max_llm_tier.as_signing_str(),
         )
         .into_bytes()
     }
@@ -878,6 +963,18 @@ pub struct PipelineJobRequest {
     pub job_nonce: String,
     /// User ID for global rate limiting and audit logging.
     pub user_id: Uuid,
+
+    /// LLM data-egress ceiling — MUST match the owning workflow's
+    /// actor's `max_llm_tier`. Worker stamps this into every step's
+    /// `TalosContext` before execution so each pipeline step enforces
+    /// the same tier gate as a single-node JobRequest.
+    ///
+    /// HMAC-bound via the signing payload (appended at end per the
+    /// wire-format stability rule). `#[serde(default)]` for backward
+    /// compat with older controllers — deserialized as Tier2 which
+    /// matches pre-feature behavior for unrestricted actors.
+    #[serde(default)]
+    pub max_llm_tier: LlmTier,
 }
 
 impl PipelineJobRequest {
@@ -922,7 +1019,7 @@ impl PipelineJobRequest {
             .collect();
 
         format!(
-            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             self.job_nonce,
@@ -932,6 +1029,11 @@ impl PipelineJobRequest {
             self.user_id,
             step_hashes.join(":"),
             step_integrations.join(","),
+            // Appended AT THE END per the wire-format stability rule
+            // (same reasoning as `JobRequest::signing_payload`). A
+            // tamperer on the wire can't downgrade a tier-1 pipeline
+            // to tier-2 without invalidating the signature.
+            self.max_llm_tier.as_signing_str(),
         )
         .into_bytes()
     }
@@ -1294,6 +1396,7 @@ mod tests {
             allowed_sql_operations: vec![],
             allow_tier2_exposure: false,
             signature: vec![],
+            max_llm_tier: LlmTier::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -1332,6 +1435,7 @@ mod tests {
             allowed_sql_operations: vec![],
             allow_tier2_exposure: false,
             signature: vec![],
+            max_llm_tier: LlmTier::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -1404,6 +1508,7 @@ mod tests {
             allowed_sql_operations: vec![],
             allow_tier2_exposure: false,
             signature: vec![],
+            max_llm_tier: LlmTier::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -1442,6 +1547,7 @@ mod tests {
             allowed_sql_operations: vec![],
             allow_tier2_exposure: false,
             signature: vec![],
+            max_llm_tier: LlmTier::default(),
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,

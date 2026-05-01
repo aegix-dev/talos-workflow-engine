@@ -1296,7 +1296,9 @@ mod tests {
         .await;
         assert!(matches!(
             no_expr,
-            SystemNodeKind::Synthesize { synthesis_expr: None }
+            SystemNodeKind::Synthesize {
+                synthesis_expr: None
+            }
         ));
     }
 

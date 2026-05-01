@@ -103,13 +103,12 @@ pub fn replace_vault_values(
     refs: &[VaultRef],
 ) -> Result<(), VaultResolverError> {
     for (config_key, vault_path) in refs {
-        let plaintext =
-            resolved
-                .get(vault_path.as_str())
-                .ok_or_else(|| VaultResolverError::SecretNotResolved {
-                    config_key: config_key.clone(),
-                    vault_path: vault_path.clone(),
-                })?;
+        let plaintext = resolved.get(vault_path.as_str()).ok_or_else(|| {
+            VaultResolverError::SecretNotResolved {
+                config_key: config_key.clone(),
+                vault_path: vault_path.clone(),
+            }
+        })?;
         let resolved_value = serde_json::Value::String(plaintext.clone());
 
         if let Some(obj) = payload.as_object_mut() {
