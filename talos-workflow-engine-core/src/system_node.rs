@@ -79,6 +79,12 @@ use uuid::Uuid;
            [`LlmDispatch`]: SystemNodeKind::LlmDispatch"
 )]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+// NOT marked `#[non_exhaustive]` — the dispatcher_coverage tripwire
+// pattern relies on exhaustive cross-crate matches to fail at compile
+// time when a new variant is added but a dispatcher / handler isn't
+// updated. Adding new variants is therefore a (minor-bump) breaking
+// change documented in RELEASING.md; downstream consumers must update
+// their match arms when they bump their dep on this crate.
 pub enum SystemNodeKind {
     /// Pause execution until resumed externally.
     Wait {
@@ -239,9 +245,9 @@ pub enum SystemNodeKind {
         /// Capability labels the target must all advertise.
         required_capabilities: Vec<String>,
         /// Optional fallback workflow id dispatched when
-        /// [`WorkflowGraphStore::resolve_by_capabilities`] returns
-        /// `None`. Without this, an unmatched capability dispatch
-        /// fails hard.
+        /// [`crate::WorkflowGraphStore::resolve_by_capabilities`]
+        /// returns `None`. Without this, an unmatched capability
+        /// dispatch fails hard.
         fallback_workflow_id: Option<Uuid>,
         /// Hard timeout for the dispatched target in seconds.
         timeout_secs: u64,
@@ -292,6 +298,7 @@ pub enum SystemNodeKind {
 
 /// Fan-in join semantics for [`SystemNodeKind::FanIn`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum JoinMode {
     /// Release only after every inbound branch completes.
     All,

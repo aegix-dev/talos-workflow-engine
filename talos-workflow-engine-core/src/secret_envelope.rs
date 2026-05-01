@@ -48,6 +48,7 @@ pub const MIN_SEAL_NONCE_LEN: usize = 12;
 /// [`validate_seal_output`] from their own dispatcher impls can map
 /// the variants onto their own error taxonomy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SealValidationError {
     /// One of `ciphertext` / `nonce` was empty while the other was
     /// non-empty. Impossible to decrypt; almost certainly a bug in the

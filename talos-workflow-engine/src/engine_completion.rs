@@ -56,8 +56,8 @@ impl ParallelWorkflowEngine {
     /// normal success/failure paths based on the `__error: true`
     /// marker on synthesized rejection envelopes.
     ///
-    /// System nodes (judge / ensemble / reflective_retry / llm_dispatch
-    /// / inline_judge / verify / confidence_gate / expression_dispatch)
+    /// System nodes (judge / ensemble / `reflective_retry` / `llm_dispatch`
+    /// / `inline_judge` / verify / `confidence_gate` / `expression_dispatch`)
     /// synthesize their "rejected" output as `{__error: true,
     /// error_message: "..."}` rather than bubbling a Rust `Err`. The
     /// reactor used to store these envelopes as "successful" node
@@ -73,8 +73,8 @@ impl ParallelWorkflowEngine {
     /// to the normal insert-and-unblock-successors path.
     ///
     /// Consolidates the fix pattern from three earlier single-site
-    /// commits (verify-node: b69aad5, confidence_gate: a7dd2b3,
-    /// expression_dispatch: a941df4) so every system-node caller in
+    /// commits (verify-node: b69aad5, `confidence_gate`: a7dd2b3,
+    /// `expression_dispatch`: a941df4) so every system-node caller in
     /// the reactor body uses one consistent mechanism.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn route_system_node_output(

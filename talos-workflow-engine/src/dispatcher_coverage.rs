@@ -34,14 +34,14 @@
 //! is grep-discoverable and forces the contributor to actually write
 //! (or at least name) the dispatcher.
 //!
-//! The companion test [`tests::every_variant_classified`] constructs
+//! The companion test `tests::every_variant_classified` constructs
 //! one sample of every variant and asserts each gets a non-empty
 //! classification. The constructor + count check
-//! ([`tests::sample_count_matches_known_enum_size`]) catches drift
+//! (`tests::sample_count_matches_known_enum_size`) catches drift
 //! between the enum's actual variant count and the constructor's
 //! coverage.
 //!
-//! ## When you add a new SystemNodeKind variant
+//! ## When you add a new `SystemNodeKind` variant
 //!
 //! 1. Add the variant to `system_node.rs` in the core crate.
 //! 2. Add an arm to [`dispatcher_branch_for`] naming the dispatcher
@@ -244,12 +244,12 @@ mod tests {
     /// the constructor here. This test fails with a clear message if
     /// the count drifts.
     ///
-    /// Counts as of 2026-04-22 (after ForEach removal):
-    ///   12 always-available (Wait, WhileLoop, RepeatLoop,
-    ///   ErrorHandler, FanIn, SubWorkflow, Loop, Collect, Synthesize,
-    ///   Verify, DynamicDispatch, CapabilityDispatch)
-    ///   + 8 llm-primitives (AgentLoop, Judge, InlineJudge, Ensemble,
-    ///   ConfidenceGate, ReActLoop, ReflectiveRetry, LlmDispatch)
+    /// Counts as of 2026-04-22 (after `ForEach` removal):
+    ///   12 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
+    ///   `ErrorHandler`, `FanIn`, `SubWorkflow`, `Loop`, `Collect`, `Synthesize`,
+    ///   `Verify`, `DynamicDispatch`, `CapabilityDispatch`)
+    ///   + 8 llm-primitives (`AgentLoop`, `Judge`, `InlineJudge`, `Ensemble`,
+    ///   `ConfidenceGate`, `ReActLoop`, `ReflectiveRetry`, `LlmDispatch`)
     ///   = 20 total.
     #[test]
     fn sample_count_matches_known_enum_size() {

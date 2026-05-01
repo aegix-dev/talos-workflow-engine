@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 /// Outcome of an approval check.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApprovalStatus {
     /// A human has approved this execution's node — dispatch proceeds.
     Approved,
