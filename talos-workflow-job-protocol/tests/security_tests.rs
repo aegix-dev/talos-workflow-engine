@@ -519,3 +519,127 @@ fn tampered_pipeline_step_integration_name_fails() {
         "Tampered step integration_name must invalidate the pipeline signature"
     );
 }
+
+// ------------------------------------------------------------------
+// verify_no_replay — passive-observer pattern (regression for the
+// dual-publish/dual-verify bug where a primary verify() and a
+// secondary subscriber verify() both racing on the shared
+// JOB_NONCE_CACHE caused "result_nonce already seen" on every job).
+// ------------------------------------------------------------------
+
+fn signed_job_result(key: &[u8]) -> JobResult {
+    let mut result = JobResult {
+        job_id: Uuid::new_v4(),
+        status: JobStatus::Success,
+        output_payload: json!({"ok": true}),
+        logs: vec![],
+        execution_time_ms: 42,
+        signature: vec![],
+        result_nonce: String::new(),
+    };
+    result.sign(key).unwrap();
+    result
+}
+
+#[test]
+fn verify_no_replay_accepts_repeated_calls() {
+    // The whole point of `verify_no_replay`: same nonce can be
+    // verified multiple times without tripping the replay cache.
+    // This is what unblocks the dispatcher + subscriber pattern.
+    let key = test_key();
+    let result = signed_job_result(&key);
+
+    assert!(result.verify_no_replay(&key, 300).is_ok());
+    assert!(result.verify_no_replay(&key, 300).is_ok());
+    assert!(result.verify_no_replay(&key, 300).is_ok());
+}
+
+#[test]
+fn verify_no_replay_rejects_tampered_signature() {
+    // HMAC enforcement is preserved — only the cache check is dropped.
+    let key = test_key();
+    let mut result = signed_job_result(&key);
+    result.execution_time_ms = 999_999; // tamper
+
+    assert!(result.verify_no_replay(&key, 300).is_err());
+}
+
+#[test]
+fn verify_no_replay_rejects_wrong_key() {
+    // HMAC under wrong key fails — forgery prevention preserved.
+    let result = signed_job_result(&test_key());
+    let wrong_key = vec![0x01u8; 32];
+
+    assert!(result.verify_no_replay(&wrong_key, 300).is_err());
+}
+
+#[test]
+fn verify_no_replay_rejects_malformed_nonce() {
+    let key = test_key();
+    let mut result = signed_job_result(&key);
+    result.result_nonce = "not-a-valid-nonce".to_string();
+
+    let err = result.verify_no_replay(&key, 300).unwrap_err();
+    assert!(
+        err.contains("malformed result_nonce") || err.contains("invalid"),
+        "expected nonce-shape error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn primary_verify_then_secondary_verify_no_replay_both_succeed() {
+    // The intended dispatcher (primary) + subscriber (secondary)
+    // call pattern. Pre-fix, the second call hit "already seen".
+    // Post-fix, the secondary uses verify_no_replay and succeeds.
+    let key = test_key();
+    let result = signed_job_result(&key);
+
+    // Primary verifier records the nonce in the cache.
+    result.verify(&key, 300).expect("primary verify must succeed");
+
+    // Secondary verifier (passive observer) must succeed even though
+    // the nonce is already in the cache — that is the whole point.
+    result
+        .verify_no_replay(&key, 300)
+        .expect("verify_no_replay must succeed after primary verify");
+}
+
+#[test]
+fn primary_verify_still_rejects_actual_replay() {
+    // Replay protection is still enforced on the PRIMARY path.
+    // Two distinct `verify()` calls on the same nonce — the second
+    // one (a real replay attempt) must be rejected. This guards
+    // against accidentally weakening the security invariant while
+    // splitting the API.
+    let key = test_key();
+    let result = signed_job_result(&key);
+
+    result.verify(&key, 300).expect("first verify must succeed");
+    let err = result
+        .verify(&key, 300)
+        .expect_err("second verify must be rejected as replay");
+    assert!(
+        err.contains("already seen"),
+        "expected replay rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn verify_no_replay_does_not_pollute_cache_for_subsequent_verify() {
+    // verify_no_replay must NOT record the nonce — otherwise a
+    // call site that uses verify_no_replay first would block a
+    // subsequent legitimate primary verify().
+    let key = test_key();
+    let result = signed_job_result(&key);
+
+    result
+        .verify_no_replay(&key, 300)
+        .expect("verify_no_replay must succeed");
+    // Primary verify() must still succeed: verify_no_replay didn't
+    // touch the cache.
+    result
+        .verify(&key, 300)
+        .expect("primary verify after verify_no_replay must succeed");
+}

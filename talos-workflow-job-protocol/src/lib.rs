@@ -960,12 +960,55 @@ impl JobResult {
         Ok(())
     }
 
-    /// Verify the HMAC signature and nonce freshness.
+    /// Verify the HMAC signature and nonce freshness, *and* record the
+    /// nonce in the process-local replay cache. Subsequent `verify()`
+    /// calls against the same nonce within the freshness window will
+    /// fail with `"result_nonce already seen"`.
     ///
-    /// Returns `Err` if the signature is invalid or the nonce is older than
-    /// `max_age_secs`.
+    /// Use this at the **primary action point** for a result — the
+    /// place where the message is converted into a side effect that
+    /// would be wrong to apply twice. There must be EXACTLY ONE
+    /// primary verifier per `JobResult` per controller process.
+    /// Passive observers (e.g. an audit/DB-update subscriber that
+    /// already runs downstream of the primary) MUST call
+    /// [`verify_no_replay`](Self::verify_no_replay) instead — calling
+    /// `verify()` from two consumers of the same signed result causes
+    /// the second one to fail with a spurious replay error.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
-        // 1. Verify nonce freshness to prevent replay attacks.
+        let ts = self.verify_no_replay(key, max_age_secs)?;
+        // Replay protection: refuse a nonce we have seen before within
+        // the freshness window. HMAC alone catches forgery; without
+        // this check, anyone with NATS-publish access can capture a
+        // signed JobResult and re-fire it any number of times until
+        // ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "result_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify HMAC signature and nonce freshness **without** recording
+    /// the nonce in the replay cache. Returns the parsed timestamp on
+    /// success, allowing the caller to chain a manual cache update if
+    /// desired.
+    ///
+    /// Use this at **passive observer** call sites that consume a
+    /// signed result already verified-with-replay-protection by some
+    /// other primary verifier in the same process — e.g. a
+    /// `talos.results.*` audit subscriber whose only side effect is an
+    /// idempotent DB write. HMAC continues to gate forgery and the
+    /// freshness window continues to gate stale-replay; replay
+    /// protection is the responsibility of the primary verifier.
+    ///
+    /// **Security invariant**: there must be at least one primary
+    /// `verify()` caller in the chain for any given result. If you're
+    /// adding a NEW result-consumer and it's the only verifier in its
+    /// chain, use `verify()` (not this method).
+    pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
+        // 1. Parse + freshness window check.
         let parts: Vec<&str> = self.result_nonce.splitn(2, ':').collect();
         if parts.len() != 2 {
             return Err("malformed result_nonce".to_string());
@@ -1002,18 +1045,7 @@ impl JobResult {
         mac.verify_slice(&self.signature)
             .map_err(|_| "HMAC signature verification failed".to_string())?;
 
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed JobRequest and re-fire it any number of
-        // times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "result_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        Ok(ts)
     }
 }
 
