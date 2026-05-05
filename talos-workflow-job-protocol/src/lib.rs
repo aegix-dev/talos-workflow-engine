@@ -11,7 +11,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use hmac::{Hmac, Mac};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -27,6 +27,104 @@ type HmacSha256 = Hmac<Sha256>;
 /// `FUTURE_SKEW + max_age_secs` total). A 5 s ≈ 5000 ms asymmetric
 /// window is a common choice for signed-NATS RPC.
 const MAX_FUTURE_SKEW_SECS: u64 = 5;
+
+// ============================================================================
+// Replay-resistant nonce cache (single-use within freshness window)
+// ============================================================================
+//
+// The freshness check on its own (now - ts <= max_age_secs) is necessary
+// but not sufficient — within that window, an attacker who captures a
+// signed JobRequest from NATS can replay it any number of times. The
+// nonce cache turns that into a single-use guarantee: each (nonce, ts)
+// pair is admitted exactly once; subsequent attempts return a "replay
+// detected" error.
+//
+// Implementation: std-only (`Mutex<HashMap<String, u64>>`) keyed on the
+// nonce string with the timestamp as value. On each insert we sweep
+// entries older than `2 × max_age_secs` (some slack for clock skew),
+// which keeps memory bounded at `rate × 2 × max_age_secs`. With
+// max_age_secs = 300 and 100 verify/sec that's ~60k entries — small.
+// A hard cap of 200k entries triggers a more aggressive sweep under
+// abnormal load to keep the worker from OOMing.
+//
+// Workspace consistency: this mirrors the two-generation pattern in
+// `talos-memory::rpc_auth` but uses a single Mutex<HashMap> rather than
+// rotating DashMaps because (a) this crate is published to crates.io
+// and we don't want to add `dashmap` + `arc-swap` as required deps,
+// and (b) under realistic load (sub-millisecond Mutex contention) the
+// simpler form is performant enough. Revisit if profiling shows the
+// Mutex becoming a hot spot.
+
+const NONCE_CACHE_HARD_CAP: usize = 200_000;
+
+struct JobNonceCache {
+    seen: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl JobNonceCache {
+    fn new() -> Self {
+        Self {
+            seen: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns `true` if the nonce is fresh (and atomically records it),
+    /// `false` if it's a replay within the freshness window.
+    fn check_and_record(&self, nonce: &str, ts: u64, max_age_secs: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(ts);
+        // Poison-tolerant: rebuild the lock state on poison rather than
+        // hard-failing every subsequent call. A poisoned mutex here only
+        // means a previous panic happened mid-update; the data itself is
+        // a HashMap that's safe to keep using.
+        let mut g = match self.seen.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Sweep entries older than 2× max_age_secs. The 2× slack absorbs
+        // clock skew and avoids an admitting-then-rejecting race when
+        // (now, ts) straddle the boundary.
+        let cutoff = now.saturating_sub(max_age_secs.saturating_mul(2));
+        if g.len() > 1024 {
+            // Skip the sweep at small sizes — pure overhead. Above 1k
+            // entries it's worth it.
+            g.retain(|_, t| *t > cutoff);
+        }
+        if g.contains_key(nonce) {
+            return false;
+        }
+        // Hard cap: if rate × 2× max_age_secs exceeds 200k entries,
+        // we're under abnormal load (or a flood). Drop everything older
+        // than the strict freshness window to free space.
+        if g.len() >= NONCE_CACHE_HARD_CAP {
+            let aggressive_cutoff = now.saturating_sub(max_age_secs);
+            g.retain(|_, t| *t > aggressive_cutoff);
+        }
+        g.insert(nonce.to_string(), ts);
+        true
+    }
+}
+
+static JOB_NONCE_CACHE: std::sync::LazyLock<JobNonceCache> =
+    std::sync::LazyLock::new(JobNonceCache::new);
+
+/// Check whether `nonce` (with stamped timestamp `ts`) has been seen
+/// within the freshness window. Returns `true` on first observation
+/// (and atomically records it), `false` on replay. Used by every
+/// `verify()` impl in this crate after HMAC verification succeeds.
+fn check_and_record_job_nonce(nonce: &str, ts: u64, max_age_secs: u64) -> bool {
+    JOB_NONCE_CACHE.check_and_record(nonce, ts, max_age_secs)
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // helper for future tests that exercise replay protection
+fn clear_job_nonce_cache_for_test() {
+    if let Ok(mut g) = JOB_NONCE_CACHE.seen.lock() {
+        g.clear();
+    }
+}
 
 fn default_priority() -> u8 {
     100
@@ -430,7 +528,14 @@ impl EncryptedSecrets {
 
         let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("create cipher: {e}"))?;
 
-        let nonce_bytes: [u8; 12] = rand::thread_rng().gen();
+        // OsRng (CSPRNG via getrandom) for nonce parity with the rest of
+        // the Talos signing surface — see talos-memory/src/rpc_auth.rs's
+        // random_nonce. thread_rng() (ChaCha-12) is practically safe at
+        // the per-message scale we hit, but using the same source
+        // workspace-wide makes audit easier and removes the ChaCha-12
+        // birthday-bound footnote from this primitive.
+        let mut nonce_bytes = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
@@ -774,7 +879,20 @@ impl JobRequest {
             <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.signing_payload());
         mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())
+            .map_err(|_| "HMAC signature verification failed".to_string())?;
+
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed JobRequest and re-fire it any number of
+        // times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "job_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -882,7 +1000,20 @@ impl JobResult {
             <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.signing_payload());
         mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())
+            .map_err(|_| "HMAC signature verification failed".to_string())?;
+
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed JobRequest and re-fire it any number of
+        // times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "result_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1089,7 +1220,20 @@ impl PipelineJobRequest {
             <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.signing_payload());
         mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())
+            .map_err(|_| "HMAC signature verification failed".to_string())?;
+
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed JobRequest and re-fire it any number of
+        // times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.job_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "job_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1190,7 +1334,20 @@ impl PipelineJobResult {
             <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.signing_payload());
         mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())
+            .map_err(|_| "HMAC signature verification failed".to_string())?;
+
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed JobRequest and re-fire it any number of
+        // times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "result_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1278,7 +1435,20 @@ impl WorkerHeartbeat {
             <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
         mac.update(&self.signing_payload());
         mac.verify_slice(&self.signature)
-            .map_err(|_| "HMAC signature verification failed".to_string())
+            .map_err(|_| "HMAC signature verification failed".to_string())?;
+
+        // 3. Replay protection: refuse a nonce we have seen before
+        // within the freshness window. HMAC alone catches forgery;
+        // without this check, anyone with NATS-publish access can
+        // capture a signed JobRequest and re-fire it any number of
+        // times until ts + max_age_secs expires.
+        if !check_and_record_job_nonce(&self.heartbeat_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "heartbeat_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1375,6 +1545,56 @@ mod tests {
         let encrypted = EncryptedSecrets::encrypt(&secrets, &key1).unwrap();
         let result = encrypted.decrypt(&key2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replay_within_window_is_rejected() {
+        // Sign a request, verify it once (admitted), then verify the
+        // same bytes again — the nonce cache should reject the second
+        // verify as a replay even though HMAC + freshness still pass.
+        let key = test_key();
+        let mut req = JobRequest {
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            module_uri: "wasm://module/v1".to_string(),
+            input_payload: serde_json::json!({"replay_test": true}),
+            encrypted_secrets: EncryptedSecrets::default(),
+            timeout_ms: 30000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            signature: vec![],
+            max_llm_tier: LlmTier::default(),
+            job_nonce: String::new(),
+            actor_id: None,
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            user_id: Uuid::nil(),
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            dry_run: false,
+        };
+        req.sign(&key).unwrap();
+
+        // First verification admits the nonce.
+        req.verify(&key, 300).expect("first verify should succeed");
+
+        // Second verification of the same JobRequest must now fail —
+        // the nonce was already recorded. Error message should mention
+        // replay so operators can correlate logs.
+        let err = req
+            .verify(&key, 300)
+            .expect_err("second verify should be rejected as replay");
+        assert!(
+            err.contains("replay"),
+            "replay rejection message should contain 'replay'; got: {err}"
+        );
     }
 
     #[test]
