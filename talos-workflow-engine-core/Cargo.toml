@@ -1,6 +1,6 @@
 [package]
 name = "talos-workflow-engine-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Core data model and traits for a portable workflow execution engine (DAG, edges, retry/join/system-node taxonomy)."

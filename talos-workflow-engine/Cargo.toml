@@ -1,6 +1,6 @@
 [package]
 name = "talos-workflow-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Parallel DAG-based workflow executor built on the talos-workflow-engine-core trait boundaries."
@@ -12,13 +12,13 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.2", default-features = false }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 cap-std = "3.4"
 dashmap = "6.1.0"
 futures = "0.3"
-talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.2" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
 petgraph = "0.6"
 regex = "1.12"
 rhai = { version = "1.19", features = ["serde"] }
@@ -37,7 +37,7 @@ uuid = { version = "1.20", features = ["v4", "serde"] }
 [dev-dependencies]
 # `examples/` use the test-utils crate to wire the engine with
 # in-memory / no-op adapters so the runnable example stays self-contained.
-talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils", version = "0.2" }
+talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils", version = "0.3" }
 # Property-based tests for the chain detector (graph topology
 # invariants that hand-rolled tests can't realistically cover). Held
 # to dev-deps only — the engine itself is property-test-free.

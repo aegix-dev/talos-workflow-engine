@@ -1,6 +1,6 @@
 [package]
 name = "talos-workflow-engine-test-utils"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "In-memory and capture implementations of every talos-workflow-engine-core trait, for unit-testing executors without a database, secrets manager, or transport."
@@ -12,8 +12,8 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
-talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.2", default-features = false }
-talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.2", default-features = false, optional = true }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.3", default-features = false, optional = true }
 async-trait = "0.1"
 dashmap = "6.1"
 serde_json = "1"
