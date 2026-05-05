@@ -643,3 +643,116 @@ fn verify_no_replay_does_not_pollute_cache_for_subsequent_verify() {
         .verify(&key, 300)
         .expect("primary verify after verify_no_replay must succeed");
 }
+
+// ------------------------------------------------------------------
+// PipelineJobResult — verify_no_replay parity with JobResult.
+// Pipeline results have only one verifier today (the engine
+// dispatcher). The worker dual-publishes pipeline results to the
+// reply inbox AND `talos.pipeline.results.{job_id}`, so adding a
+// future audit subscriber would silently re-introduce the JobResult
+// dual-verify bug. These tests + the API split fix the latent issue
+// before it becomes a production regression.
+// ------------------------------------------------------------------
+
+fn signed_pipeline_result(key: &[u8]) -> talos_workflow_job_protocol::PipelineJobResult {
+    let mut result = talos_workflow_job_protocol::PipelineJobResult {
+        job_id: Uuid::new_v4(),
+        overall_status: JobStatus::Success,
+        step_results: vec![],
+        final_output: json!({"ok": true}),
+        total_time_ms: 42,
+        signature: vec![],
+        result_nonce: String::new(),
+    };
+    result.sign(key).unwrap();
+    result
+}
+
+#[test]
+fn pipeline_verify_no_replay_accepts_repeated_calls() {
+    let key = test_key();
+    let result = signed_pipeline_result(&key);
+
+    assert!(result.verify_no_replay(&key, 300).is_ok());
+    assert!(result.verify_no_replay(&key, 300).is_ok());
+    assert!(result.verify_no_replay(&key, 300).is_ok());
+}
+
+#[test]
+fn pipeline_verify_no_replay_rejects_tampered_signature() {
+    let key = test_key();
+    let mut result = signed_pipeline_result(&key);
+    result.total_time_ms = 999_999; // tamper
+
+    assert!(result.verify_no_replay(&key, 300).is_err());
+}
+
+#[test]
+fn pipeline_verify_no_replay_rejects_wrong_key() {
+    let result = signed_pipeline_result(&test_key());
+    let wrong_key = vec![0x01u8; 32];
+
+    assert!(result.verify_no_replay(&wrong_key, 300).is_err());
+}
+
+#[test]
+fn pipeline_verify_no_replay_rejects_malformed_nonce() {
+    let key = test_key();
+    let mut result = signed_pipeline_result(&key);
+    result.result_nonce = "not-a-valid-nonce".to_string();
+
+    let err = result.verify_no_replay(&key, 300).unwrap_err();
+    assert!(
+        err.contains("malformed result_nonce") || err.contains("invalid"),
+        "expected nonce-shape error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn pipeline_primary_verify_then_secondary_verify_no_replay_both_succeed() {
+    // The future-proof guarantee: if a second pipeline-result
+    // consumer is added (audit subscriber, metrics emitter), it can
+    // use verify_no_replay() and won't collide with the dispatcher's
+    // primary verify().
+    let key = test_key();
+    let result = signed_pipeline_result(&key);
+
+    result.verify(&key, 300).expect("primary verify must succeed");
+    result
+        .verify_no_replay(&key, 300)
+        .expect("verify_no_replay must succeed after primary verify");
+}
+
+#[test]
+fn pipeline_primary_verify_still_rejects_actual_replay() {
+    // Replay protection invariant: same nonce, two distinct
+    // verify() calls — the second is a real replay attempt and
+    // must be rejected. Locks in that splitting the API didn't
+    // weaken the primary path.
+    let key = test_key();
+    let result = signed_pipeline_result(&key);
+
+    result.verify(&key, 300).expect("first verify must succeed");
+    let err = result
+        .verify(&key, 300)
+        .expect_err("second verify must be rejected as replay");
+    assert!(
+        err.contains("already seen"),
+        "expected replay rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn pipeline_verify_no_replay_does_not_pollute_cache() {
+    let key = test_key();
+    let result = signed_pipeline_result(&key);
+
+    result
+        .verify_no_replay(&key, 300)
+        .expect("verify_no_replay must succeed");
+    result
+        .verify(&key, 300)
+        .expect("primary verify after verify_no_replay must succeed");
+}

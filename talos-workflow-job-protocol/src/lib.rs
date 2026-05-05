@@ -1330,13 +1330,43 @@ impl PipelineJobResult {
         Ok(())
     }
 
-    /// Verify the HMAC signature and nonce freshness.
+    /// Verify the HMAC signature, nonce freshness, *and* record the
+    /// nonce in the process-local replay cache.
+    ///
+    /// See [`JobResult::verify`] for the full primary/observer
+    /// contract — same rules apply: exactly one primary verifier per
+    /// `PipelineJobResult` per controller process. Passive observers
+    /// (audit subscribers, metrics emitters) MUST use
+    /// [`PipelineJobResult::verify_no_replay`] to avoid the
+    /// dual-verify race that broke `JobResult` pre-r300. Today
+    /// pipeline results have only one verifier (the engine
+    /// dispatcher), so the bug is latent — this API split makes the
+    /// safe option available BEFORE a future second consumer is
+    /// added, not after the same regression hits production.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
+        let ts = self.verify_no_replay(key, max_age_secs)?;
+        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
+            return Err(format!(
+                "result_nonce already seen (replay attempt within {}-second window)",
+                max_age_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify HMAC signature and nonce freshness without recording the
+    /// nonce in the replay cache. Returns the parsed timestamp on
+    /// success.
+    ///
+    /// See [`JobResult::verify_no_replay`] for the security contract.
+    /// HMAC continues to gate forgery; freshness continues to gate
+    /// stale-replay; within-window-replay protection is the
+    /// responsibility of the primary `verify()` caller.
+    pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         let parts: Vec<&str> = self.result_nonce.splitn(2, ':').collect();
         if parts.len() != 2 {
             return Err("malformed result_nonce".to_string());
         }
-        // Validate hex portion to reject malformed nonces early.
         if hex::decode(parts[1]).is_err() {
             return Err("invalid hex in result_nonce".to_string());
         }
@@ -1368,18 +1398,7 @@ impl PipelineJobResult {
         mac.verify_slice(&self.signature)
             .map_err(|_| "HMAC signature verification failed".to_string())?;
 
-        // 3. Replay protection: refuse a nonce we have seen before
-        // within the freshness window. HMAC alone catches forgery;
-        // without this check, anyone with NATS-publish access can
-        // capture a signed JobRequest and re-fire it any number of
-        // times until ts + max_age_secs expires.
-        if !check_and_record_job_nonce(&self.result_nonce, ts, max_age_secs) {
-            return Err(format!(
-                "result_nonce already seen (replay attempt within {}-second window)",
-                max_age_secs
-            ));
-        }
-        Ok(())
+        Ok(ts)
     }
 }
 
