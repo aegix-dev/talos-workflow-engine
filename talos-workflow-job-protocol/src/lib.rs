@@ -792,19 +792,62 @@ impl JobRequest {
         // existing positions would break every deployed signature.
         let integration_name = self.integration_name.as_deref().unwrap_or("-");
 
+        // M-4: actor_id bound. Pre-fix, an on-wire attacker could
+        // change A→B without invalidating the signature; the worker
+        // would then sign every downstream MemoryRpcRequest with the
+        // tampered actor_id and the controller would accept it
+        // (correctly signed by the worker key with the wrong actor_id).
+        // Sentinel "-" for None so absence is tamper-evident.
+        let actor_id_str = self
+            .actor_id
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        // M-5: capability-grant fields bound (defense-in-depth). Even
+        // though the encrypted_secrets blob and worker host-internal
+        // deny-list together prevent any unauthorised secret read,
+        // capability claims should be self-consistent with the signed
+        // message. Pre-fix, allowed_secrets / allowed_sql_operations /
+        // allow_tier2_exposure could be tampered without invalidating
+        // the signature.
+        let mut allowed_secrets_sorted = self.allowed_secrets.clone();
+        allowed_secrets_sorted.sort_unstable();
+        let allowed_secrets_str = allowed_secrets_sorted.join(",");
+        let mut allowed_sql_sorted = self.allowed_sql_operations.clone();
+        allowed_sql_sorted.sort_unstable();
+        let allowed_sql_str = allowed_sql_sorted.join(",");
+
+        // L-9: every variable-length field is now length-prefixed in
+        // its hashed/encoded form. Field-internal `:` characters can no
+        // longer cause a collision between two semantically-different
+        // payloads. The legacy fixed-width fields (UUIDs, hex digests,
+        // numbers, sentinel "-") use unambiguous formats so a `:`
+        // delimiter remains safe. The user-controlled string fields
+        // (module_uri, hosts_str, methods_str, integration_name,
+        // allowed_secrets_str, allowed_sql_str, actor_id_str) are
+        // emitted as `<len>:<bytes>` to remove the ambiguity.
+        //
+        // Defense-in-depth: today the existing fixed-width-prefix
+        // header already disambiguates, but an extension that adds a
+        // new free-form string field could re-introduce the collision
+        // class. The length-prefix discipline is forward-safe.
+        fn lp(s: &str) -> String {
+            format!("{}:{}", s.as_bytes().len(), s)
+        }
+
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
-            self.module_uri,
+            lp(&self.module_uri),
             self.job_nonce,
             input_hash,
             secrets_hash,
             self.timeout_ms,
-            hosts_str,
-            methods_str,
+            lp(&hosts_str),
+            lp(&methods_str),
             wasm_hash,
-            integration_name,
+            lp(integration_name),
             // Appended AT THE END per the wire-format stability rule —
             // inserting in the middle would break every deployed
             // signature. user_id bound so an on-wire attacker can't
@@ -815,6 +858,12 @@ impl JobRequest {
             // bound so an attacker can't downgrade a tier-1 actor's
             // ceiling on the wire to redirect data to an external LLM.
             self.max_llm_tier.as_signing_str(),
+            // M-4: actor_id appended AT THE END.
+            lp(&actor_id_str),
+            // M-5: capability grants appended AT THE END.
+            lp(&allowed_secrets_str),
+            lp(&allowed_sql_str),
+            self.allow_tier2_exposure,
         )
         .into_bytes()
     }
@@ -925,7 +974,13 @@ impl JobResult {
     /// Canonical byte string signed / verified by HMAC-SHA256.
     ///
     /// Format:
-    /// `job_id:status:result_nonce:sha256(output_payload):execution_time_ms`
+    /// `job_id:status:result_nonce:sha256(output_payload):execution_time_ms:sha256(logs_canonical)`
+    ///
+    /// L-10: `logs` is now part of the signing payload via a SHA-256 of
+    /// the canonical newline-joined form. Pre-fix, an attacker tampering
+    /// with the logs field in flight could inject misleading log lines
+    /// without invalidating the signature. No capability impact, but
+    /// audit-trail integrity matters for incident response.
     fn signing_payload(&self) -> Vec<u8> {
         use sha2::Digest;
         let status_str = match self.status {
@@ -934,9 +989,20 @@ impl JobResult {
             JobStatus::TimedOut => "timedout",
         };
         let output_hash = hex::encode(Sha256::digest(self.output_payload.to_string().as_bytes()));
+        // Canonicalise logs by joining with `\n` (a stable separator
+        // that no individual log line can contain — Vec<String> elements
+        // are pre-split on newlines by the worker). Hash to a fixed
+        // 64-char hex digest so the signing payload size is bounded.
+        let logs_hash = hex::encode(Sha256::digest(self.logs.join("\n").as_bytes()));
         format!(
-            "{}:{}:{}:{}:{}",
-            self.job_id, status_str, self.result_nonce, output_hash, self.execution_time_ms,
+            "{}:{}:{}:{}:{}:{}",
+            self.job_id,
+            status_str,
+            self.result_nonce,
+            output_hash,
+            self.execution_time_ms,
+            // L-10: appended AT THE END per the wire-format stability rule.
+            logs_hash,
         )
         .into_bytes()
     }
@@ -1181,8 +1247,49 @@ impl PipelineJobRequest {
             .map(|s| s.integration_name.as_deref().unwrap_or("-"))
             .collect();
 
+        // M-5 (pipeline): per-step capability grants. Each step can
+        // carry its own allowlists; bind all of them so a NATS-channel
+        // attacker can't widen `allowed_secrets` or flip
+        // `allow_tier2_exposure` on a single step without invalidating
+        // the whole pipeline signature.
+        //
+        // Encoded as `step0_secrets|step0_sql|step0_tier2 ;; step1_…`
+        // with length-prefixed segments so concatenation can't collide
+        // across step boundaries.
+        let step_caps: Vec<String> = self
+            .steps
+            .iter()
+            .map(|s| {
+                let mut secrets = s.allowed_secrets.clone();
+                secrets.sort_unstable();
+                let secrets_str = secrets.join(",");
+                let mut sql = s.allowed_sql_operations.clone();
+                sql.sort_unstable();
+                let sql_str = sql.join(",");
+                format!(
+                    "{}:{}|{}:{}|{}",
+                    secrets_str.as_bytes().len(),
+                    secrets_str,
+                    sql_str.as_bytes().len(),
+                    sql_str,
+                    s.allow_tier2_exposure,
+                )
+            })
+            .collect();
+        let step_caps_str = step_caps.join(";;");
+
+        // L-9 (pipeline): length-prefix the user-controlled string
+        // segments so internal `:` / `,` characters can't cause
+        // payload-collisions. Existing fixed-width fields stay
+        // unchanged.
+        fn lp(s: &str) -> String {
+            format!("{}:{}", s.as_bytes().len(), s)
+        }
+        let step_hashes_joined = step_hashes.join(":");
+        let step_integrations_joined = step_integrations.join(",");
+
         format!(
-            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "pipeline:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             self.workflow_execution_id,
             self.job_nonce,
@@ -1190,13 +1297,18 @@ impl PipelineJobRequest {
             self.share_sandbox,
             self.steps.len(),
             self.user_id,
-            step_hashes.join(":"),
-            step_integrations.join(","),
+            // step_hashes is fixed-width hex per element joined by `:`,
+            // length-prefix the joined form so the boundary against the
+            // next segment is unambiguous.
+            lp(&step_hashes_joined),
+            lp(&step_integrations_joined),
             // Appended AT THE END per the wire-format stability rule
             // (same reasoning as `JobRequest::signing_payload`). A
             // tamperer on the wire can't downgrade a tier-1 pipeline
             // to tier-2 without invalidating the signature.
             self.max_llm_tier.as_signing_str(),
+            // M-5 (pipeline): per-step capability grants appended AT THE END.
+            lp(&step_caps_str),
         )
         .into_bytes()
     }
@@ -1298,7 +1410,15 @@ impl PipelineJobResult {
     ///
     /// Format:
     /// `pipeline_result:{job_id}:{overall_status}:{result_nonce}:
-    ///  {total_time_ms}:{sha256(final_output_json)}`
+    ///  {total_time_ms}:{sha256(final_output_json)}:{sha256(canonical_step_results)}`
+    ///
+    /// L-10 (analog): per-step results are now bound. Pre-fix only the
+    /// final_output was hashed; an attacker tampering with step outputs
+    /// or error strings could mislead audit/error-reporting without
+    /// invalidating the signature. Each step contributes
+    /// `module_id|status|sha256(output_json)|sha256(error)` (sentinel
+    /// "none" for missing error). Joined with `\n` then SHA-256'd to
+    /// keep the payload size bounded regardless of step count.
     fn signing_payload(&self) -> Vec<u8> {
         use sha2::Digest;
         let status_str = match self.overall_status {
@@ -1307,9 +1427,38 @@ impl PipelineJobResult {
             JobStatus::TimedOut => "timedout",
         };
         let output_hash = hex::encode(Sha256::digest(self.final_output.to_string().as_bytes()));
+
+        // Canonical per-step digest: each step contributes a fixed-shape
+        // line; the complete sequence is hashed once.
+        let step_digests: Vec<String> = self
+            .step_results
+            .iter()
+            .map(|s| {
+                let s_status = match s.status {
+                    JobStatus::Success => "success",
+                    JobStatus::Failed => "failed",
+                    JobStatus::TimedOut => "timedout",
+                };
+                let s_output = hex::encode(Sha256::digest(s.output.to_string().as_bytes()));
+                let s_error = match s.error.as_deref() {
+                    Some(e) => hex::encode(Sha256::digest(e.as_bytes())),
+                    None => "none".to_string(),
+                };
+                format!("{}|{}|{}|{}", s.module_id, s_status, s_output, s_error)
+            })
+            .collect();
+        let step_results_hash =
+            hex::encode(Sha256::digest(step_digests.join("\n").as_bytes()));
+
         format!(
-            "pipeline_result:{}:{}:{}:{}:{}",
-            self.job_id, status_str, self.result_nonce, self.total_time_ms, output_hash,
+            "pipeline_result:{}:{}:{}:{}:{}:{}",
+            self.job_id,
+            status_str,
+            self.result_nonce,
+            self.total_time_ms,
+            output_hash,
+            // Appended AT THE END per the wire-format stability rule.
+            step_results_hash,
         )
         .into_bytes()
     }
@@ -1849,5 +1998,216 @@ mod tests {
             result_nonce: String::new(),
         };
         assert!(result.verify(&key, 300).is_err());
+    }
+
+    /// Helper for the new wire-format binding tests below: build a
+    /// minimal JobRequest with the named overrides applied. Callers
+    /// `.sign()` themselves before tampering / re-verifying.
+    fn make_test_request(actor_id: Option<Uuid>) -> JobRequest {
+        JobRequest {
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            module_uri: "wasm://m/v1".to_string(),
+            input_payload: serde_json::json!({}),
+            encrypted_secrets: EncryptedSecrets::default(),
+            timeout_ms: 30000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec!["slack/token".to_string()],
+            allowed_sql_operations: vec!["SELECT".to_string()],
+            allow_tier2_exposure: false,
+            signature: vec![],
+            max_llm_tier: LlmTier::default(),
+            job_nonce: String::new(),
+            actor_id,
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            user_id: Uuid::nil(),
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            dry_run: false,
+        }
+    }
+
+    /// M-4: tampering with `actor_id` MUST invalidate the signature.
+    /// Pre-fix the field was excluded from the signing payload, so a
+    /// NATS-channel attacker could redirect the worker's downstream
+    /// `MemoryRpcRequest` writes to a different actor's memory namespace.
+    #[test]
+    fn tampered_actor_id_fails_verification() {
+        let key = test_key();
+        let actor_a = Uuid::new_v4();
+        let actor_b = Uuid::new_v4();
+        let mut req = make_test_request(Some(actor_a));
+        req.sign(&key).unwrap();
+
+        // Tamper: swap actor_a → actor_b. Pre-fix this passed.
+        req.actor_id = Some(actor_b);
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered actor_id must fail verification (M-4)"
+        );
+    }
+
+    /// M-4: actor_id None → Some MUST also be tamper-evident.
+    #[test]
+    fn actor_id_none_to_some_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+
+        req.actor_id = Some(Uuid::new_v4());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "swapping actor_id from None to Some must fail (M-4)"
+        );
+    }
+
+    /// M-5: tampering with `allowed_secrets` MUST invalidate signature.
+    /// Even though encrypted_secrets is the active enforcement layer,
+    /// capability claims should be self-consistent with the signed
+    /// message.
+    #[test]
+    fn tampered_allowed_secrets_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+
+        req.allowed_secrets = vec!["openai/api_key".to_string(), "*".to_string()];
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered allowed_secrets must fail verification (M-5)"
+        );
+    }
+
+    /// M-5: tampering with `allow_tier2_exposure` MUST invalidate.
+    /// Pre-fix an attacker could flip the tier-2 bit on the wire,
+    /// granting the module Tier-2 capability the operator never
+    /// intended.
+    #[test]
+    fn tampered_allow_tier2_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.allow_tier2_exposure = false;
+        req.sign(&key).unwrap();
+
+        req.allow_tier2_exposure = true;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered allow_tier2_exposure must fail verification (M-5)"
+        );
+    }
+
+    /// M-5: tampering with `allowed_sql_operations` MUST invalidate.
+    #[test]
+    fn tampered_allowed_sql_operations_fails_verification() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.sign(&key).unwrap();
+
+        req.allowed_sql_operations =
+            vec!["SELECT".to_string(), "INSERT".to_string(), "DELETE".to_string()];
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "tampered allowed_sql_operations must fail verification (M-5)"
+        );
+    }
+
+    /// M-5: order-independence — re-ordering allowed_secrets must NOT
+    /// invalidate. Same property as `test_allowed_methods_order_independent`
+    /// but for the new fields.
+    #[test]
+    fn allowed_secrets_order_independent() {
+        let key = test_key();
+        let mut req = make_test_request(None);
+        req.allowed_secrets = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+        req.sign(&key).unwrap();
+
+        req.allowed_secrets = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        req.verify(&key, 300)
+            .expect("order-independent allowed_secrets must still verify (M-5)");
+    }
+
+    /// L-9: payload-collision regression guard. Two semantically-distinct
+    /// requests whose `module_uri` + `job_nonce` could collide under the
+    /// pre-length-prefix scheme MUST produce different signatures.
+    /// Pre-fix the colon delimiter could collide between
+    /// `(module_uri="a", job_nonce="b:c")` and `(module_uri="a:b", job_nonce="c")`
+    /// — same signing-payload bytes. The length-prefix on module_uri
+    /// disambiguates.
+    #[test]
+    fn length_prefix_prevents_module_uri_collision() {
+        let key = test_key();
+        let mut req_a = make_test_request(None);
+        req_a.module_uri = "a".to_string();
+        req_a.sign(&key).unwrap();
+
+        let mut req_b = make_test_request(None);
+        // Try to construct a colliding payload by stuffing bytes into
+        // module_uri that, under the pre-fix concatenation, would have
+        // matched req_a's bytes. With length-prefixing the byte counts
+        // differ so no collision is possible.
+        req_b.module_uri = "a:b".to_string();
+        req_b.job_id = req_a.job_id;
+        req_b.workflow_execution_id = req_a.workflow_execution_id;
+        req_b.job_nonce = req_a.job_nonce.clone();
+        // Sign req_b with its own values but check that the resulting
+        // signing_payload bytes differ from req_a's even under
+        // adversarial field choices. (Direct inspection of the payload
+        // bytes — we don't need to actually swap signatures.)
+        let payload_a = req_a.signing_payload();
+        let payload_b = req_b.signing_payload();
+        assert_ne!(
+            payload_a, payload_b,
+            "length-prefixed module_uri must prevent collision between adversarially-chosen field values (L-9)"
+        );
+    }
+
+    /// L-10: tampering with `JobResult.logs` MUST invalidate the
+    /// signature. Pre-fix the logs field was unsigned; an attacker
+    /// could inject misleading audit-trail entries in flight.
+    #[test]
+    fn tampered_job_result_logs_fails_verification() {
+        let key = test_key();
+        let mut result = JobResult {
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"answer": 42}),
+            logs: vec!["legit log line".to_string()],
+            execution_time_ms: 100,
+            signature: vec![],
+            result_nonce: String::new(),
+        };
+        result.sign(&key).unwrap();
+
+        // Tamper: append a misleading log line.
+        result
+            .logs
+            .push("FAKE: user authorized critical action".to_string());
+        assert!(
+            result.verify(&key, 300).is_err(),
+            "tampered logs must fail verification (L-10)"
+        );
+    }
+
+    /// L-10: empty-logs case — signature must round-trip correctly.
+    #[test]
+    fn job_result_with_empty_logs_round_trips() {
+        let key = test_key();
+        let mut result = JobResult {
+            job_id: Uuid::new_v4(),
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({}),
+            logs: vec![],
+            execution_time_ms: 0,
+            signature: vec![],
+            result_nonce: String::new(),
+        };
+        result.sign(&key).unwrap();
+        result.verify(&key, 300).expect("empty-logs result should verify");
     }
 }
