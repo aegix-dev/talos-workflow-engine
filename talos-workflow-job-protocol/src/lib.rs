@@ -868,6 +868,23 @@ impl JobRequest {
         .into_bytes()
     }
 
+    /// Diagnostic snapshot of the per-field hashes that
+    /// [`Self::signing_payload`] consumes for `input_payload` and
+    /// `encrypted_secrets.ciphertext`, plus the input's serialized byte
+    /// length. Surfaced by the dispatcher's `signature_diag` WARN log
+    /// (controller side) and the worker's `signature verification failed`
+    /// `output_payload.diag` (worker side) so operators can field-by-field
+    /// compare what the two sides hashed when verification mismatched.
+    /// Cheap to compute; safe to call on production traffic. Not
+    /// security-sensitive (the same hashes already go into the signature).
+    pub fn diag_hashes(&self) -> (String, String, usize) {
+        use sha2::Digest;
+        let input_str = self.input_payload.to_string();
+        let input_hash = hex::encode(Sha256::digest(input_str.as_bytes()));
+        let secrets_hash = hex::encode(Sha256::digest(&self.encrypted_secrets.ciphertext));
+        (input_hash, secrets_hash, input_str.len())
+    }
+
     /// Sign the request using the pre-shared `key`.
     ///
     /// Sets `self.signature` and `self.job_nonce` (timestamp + random hex).

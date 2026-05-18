@@ -521,6 +521,36 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 .map_err(|e| -> BoxError { format!("Failed to sign job request: {e}").into() })?;
         }
 
+        // MCP-1212 (2026-05-18): controller-side signature diagnostic.
+        // Emits the per-field hashes / lengths consumed by `signing_payload()`
+        // at WARN level so operators investigating a worker-side
+        // "signature verification failed" can grep their controller logs
+        // for the same job_id and diff field-by-field against the worker's
+        // enriched failure JobResult.output_payload (see worker/src/main.rs
+        // verify-fail branch). WARN is loud enough to bypass default
+        // RUST_LOG=info filtering. Only fires when worker_shared_key is
+        // configured — dev installs without a key produce no diag.
+        // `diag_hashes()` is colocated with `signing_payload()` in
+        // job-protocol so the field formulas stay in sync.
+        {
+            let (controller_input_hash, controller_secrets_hash, controller_input_byte_len) =
+                req.diag_hashes();
+            tracing::warn!(
+                target: "signature_diag",
+                job_id = %req.job_id,
+                workflow_execution_id = %req.workflow_execution_id,
+                module_uri = %req.module_uri,
+                controller_input_hash = %controller_input_hash,
+                controller_secrets_hash = %controller_secrets_hash,
+                controller_input_byte_len,
+                signature_byte_len = req.signature.len(),
+                job_nonce = %req.job_nonce,
+                actor_id = ?req.actor_id,
+                user_id = %req.user_id,
+                "signature_diag: controller-side signed-field snapshot"
+            );
+        }
+
         // 3. Serialize.
         let payload = serde_json::to_vec(&req)
             .map_err(|e| -> BoxError { format!("Failed to serialize job request: {e}").into() })?;
