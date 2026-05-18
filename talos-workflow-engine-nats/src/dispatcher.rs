@@ -290,9 +290,22 @@ pub(crate) async fn execute_job_with_retry(
                             .and_then(|e| e.as_str())
                             .map(String::from)
                             .unwrap_or_else(|| job_result.output_payload.to_string());
+                        // MCP-1212 (2026-05-18): include the failure
+                        // payload's `diag` object (when present) in the
+                        // returned error so operators can identify the
+                        // diverged field from `get_execution_status`
+                        // without pod-shell access. The worker's
+                        // signature-verification-failure path enriches
+                        // output_payload.diag with worker-side hashes;
+                        // pre-fix this path only kept the opaque
+                        // "error" string and threw the diag away.
+                        let diag_suffix = match job_result.output_payload.get("diag") {
+                            Some(d) => format!(" | diag: {}", d),
+                            None => String::new(),
+                        };
                         return Err(format!(
-                            "Job failed after {} attempts: {}",
-                            attempts, err_msg
+                            "Job failed after {} attempts: {}{}",
+                            attempts, err_msg, diag_suffix
                         ));
                     }
 
