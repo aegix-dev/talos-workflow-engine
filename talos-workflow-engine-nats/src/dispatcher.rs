@@ -89,6 +89,13 @@ pub(crate) fn get_pipeline_job_topic(user_id: Option<Uuid>, priority: u8) -> Str
 ///
 /// Retries both NATS delivery errors and application-level job failures.
 /// Timeouts are **not** retried because they indicate the job ran but took too long.
+///
+/// MCP-1212: when `pipeline_resign_key` is provided, the payload is
+/// deserialized as a `PipelineJobRequest`, re-signed with a fresh
+/// nonce, and re-serialized before each retry. Without this, every
+/// retry re-sends the same `job_nonce` and the worker's nonce cache
+/// rejects it as replay (see `execute_job_with_retry` for the same
+/// fix on the single-node path).
 pub(crate) async fn dispatch_with_retry(
     transport: &dyn JobTransport,
     topic: String,
@@ -96,12 +103,14 @@ pub(crate) async fn dispatch_with_retry(
     timeout_secs: u64,
     max_retries: u32,
     base_backoff_ms: u64,
+    pipeline_resign_key: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let mut attempts: u32 = 0;
+    let mut current_payload = payload;
     loop {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            transport.request(&topic, payload.clone()),
+            transport.request(&topic, current_payload.clone()),
         )
         .await;
 
@@ -132,12 +141,56 @@ pub(crate) async fn dispatch_with_retry(
                     "Job dispatch failed, retrying: {}",
                     e
                 );
+                // MCP-1212: re-sign with a fresh nonce before retrying so
+                // the worker's nonce cache doesn't reject the retry as
+                // replay. See `execute_job_with_retry`.
+                if let Some(key) = pipeline_resign_key {
+                    current_payload =
+                        resign_pipeline_payload_for_retry(&current_payload, key)
+                            .unwrap_or(current_payload);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             Err(_timeout) => {
                 // Timeouts are NOT retried – they indicate the job ran but took too long.
                 return Err("Job execution timed out".to_string());
             }
+        }
+    }
+}
+
+/// MCP-1212: pipeline-path sibling of `resign_payload_for_retry`. Same
+/// shape, different concrete type. Returns None on parse/sign/serialize
+/// failure; caller falls back to the original payload.
+fn resign_pipeline_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    let mut req: PipelineJobRequest = match serde_json::from_slice(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "resign_pipeline_payload_for_retry: failed to deserialize \
+                 PipelineJobRequest; falling back to original payload"
+            );
+            return None;
+        }
+    };
+    if let Err(e) = req.sign(key) {
+        tracing::warn!(
+            error = %e,
+            job_id = %req.job_id,
+            "resign_pipeline_payload_for_retry: re-sign failed"
+        );
+        return None;
+    }
+    match serde_json::to_vec(&req) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                job_id = %req.job_id,
+                "resign_pipeline_payload_for_retry: re-serialize failed"
+            );
+            None
         }
     }
 }
@@ -180,10 +233,11 @@ pub(crate) async fn execute_job_with_retry(
     expression_evaluator: &dyn ExpressionEvaluator,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
+    let mut current_payload = payload;
     loop {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            transport.request(&topic, payload.clone()),
+            transport.request(&topic, current_payload.clone()),
         )
         .await;
 
@@ -369,6 +423,26 @@ pub(crate) async fn execute_job_with_retry(
                             error_class: None,
                         },
                     );
+                    // MCP-1212 (2026-05-18): re-sign the payload BEFORE
+                    // sleeping into the next retry. Pre-fix every retry
+                    // re-sent the SAME signed bytes (same job_nonce). The
+                    // worker's first attempt succeeded at signature verify
+                    // and inserted the nonce into JOB_NONCE_CACHE; the
+                    // retry then deterministically failed with
+                    // "job_nonce already seen (replay attempt within
+                    // 300-second window)" which masqueraded in the final
+                    // error as "signature verification failed" — hiding
+                    // the original attempt-1 failure (typically a
+                    // transient LLM/network issue). Re-signing generates
+                    // a fresh nonce + signature so the retry is a NEW
+                    // signed message from the cache's perspective. No
+                    // security impact: a fresh nonce + valid HMAC is
+                    // exactly what a non-retry dispatch would produce.
+                    if let Some(key) = worker_shared_key {
+                        current_payload =
+                            resign_payload_for_retry(&current_payload, key)
+                                .unwrap_or(current_payload);
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
             }
@@ -395,11 +469,63 @@ pub(crate) async fn execute_job_with_retry(
                     "NATS dispatch failed, retrying: {}",
                     e
                 );
+                // Re-sign on NATS-dispatch-failure retries too — same
+                // rationale as the application-error retry path above.
+                // NATS delivery failure means the worker may or may not
+                // have seen the original payload (e.g. ack-lost-on-the-
+                // wire). Fresh nonce protects against the partial-delivery
+                // edge case where the worker did receive it and cached
+                // the nonce before the controller's request timed out.
+                if let Some(key) = worker_shared_key {
+                    current_payload =
+                        resign_payload_for_retry(&current_payload, key)
+                            .unwrap_or(current_payload);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             Err(_timeout) => {
                 return Err("Job execution timed out".to_string());
             }
+        }
+    }
+}
+
+/// MCP-1212: deserialize a signed JobRequest payload, re-sign it with a
+/// fresh nonce, re-serialize. Used by the retry path to prevent
+/// nonce-replay rejection on retries. Returns None on parse/sign/serialize
+/// failure — caller falls back to the original payload (the worst case
+/// is the pre-fix behavior: retry deterministically fails nonce-replay,
+/// no worse than before). Cheap: serde_json over a JobRequest is fast
+/// and retries are not on the hot path.
+fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    let mut req: JobRequest = match serde_json::from_slice(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "resign_payload_for_retry: failed to deserialize JobRequest for re-sign; \
+                 falling back to original payload (retry will likely fail nonce-replay)"
+            );
+            return None;
+        }
+    };
+    if let Err(e) = req.sign(key) {
+        tracing::warn!(
+            error = %e,
+            job_id = %req.job_id,
+            "resign_payload_for_retry: re-sign failed; falling back to original payload"
+        );
+        return None;
+    }
+    match serde_json::to_vec(&req) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                job_id = %req.job_id,
+                "resign_payload_for_retry: re-serialize failed; falling back to original payload"
+            );
+            None
         }
     }
 }
@@ -696,6 +822,9 @@ impl NodeDispatcher for NatsNodeDispatcher {
             request.total_timeout.as_secs(),
             request.max_retries,
             request.backoff_ms,
+            self.worker_shared_key
+                .as_ref()
+                .map(WorkerSharedKey::as_bytes),
         )
         .await
         .map_err(|e| -> BoxError { e.into() })?;
